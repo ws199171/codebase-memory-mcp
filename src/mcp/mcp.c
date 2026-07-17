@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -38,6 +38,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
+#include "aosp/aosp.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -587,6 +588,16 @@ static const tool_def_t TOOLS[] = {
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
+    {"aosp_search_symbols", "Search AOSP symbols",
+     "Search definition symbols across all indexed repositories in an AOSP workspace. "
+     "This is a read-only Master-catalog query; use the CLI aosp init and aosp index "
+     "commands to create or refresh the workspace first.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Symbol name or qualified-name prefix\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":20,\"maximum\":200}},"
+     "\"required\":[\"workspace_root\",\"query\"]}"},
+
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
@@ -623,6 +634,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", false, true, true, false},
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
+    {"aosp_search_symbols", true, false, true, false},
     {"ingest_traces", false, false, false, false},
 };
 
@@ -672,11 +684,11 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "index_status",     "check_index_coverage", "detect_changes", "aosp_search_symbols",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
-        "list_projects", "index_status", "check_index_coverage",
+        "list_projects", "index_status", "check_index_coverage", "aosp_search_symbols",
     };
     if (!name) {
         return false;
@@ -5686,7 +5698,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
  * run it through index_run_supervised. Shared by the session auto-index (srv
  * present → its cached store is invalidated) and the watcher re-index (srv NULL).
  * Returns the worker's response string (caller frees) or NULL to degrade. */
-static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
+static char *index_run_supervised_named_path(cbm_mcp_server_t *srv, const char *root_path,
+                                             const char *project_name) {
     if (!root_path || !root_path[0]) {
         return NULL;
     }
@@ -5694,6 +5707,9 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path);
+    if (project_name && project_name[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "name", project_name);
+    }
     char *args = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     if (!args) {
@@ -5704,10 +5720,18 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     return resp;
 }
 
+static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
+    return index_run_supervised_named_path(srv, root_path, NULL);
+}
+
 /* Public entry (see mcp.h): the watcher re-index in main.c has no MCP server, so
  * it reaches the supervised runner through this srv-less wrapper. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path) {
     return index_run_supervised_path(NULL, root_path);
+}
+
+char *cbm_mcp_index_run_supervised_named_path(const char *root_path, const char *project_name) {
+    return index_run_supervised_named_path(NULL, root_path, project_name);
 }
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
@@ -7820,6 +7844,63 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+static char *handle_aosp_search_symbols(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 20);
+    if (!workspace_root || !workspace_root[0] || !query || !query[0]) {
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result("workspace_root and query are required", true);
+    }
+    cbm_aosp_workspace_t workspace;
+    cbm_aosp_symbol_t *symbols = NULL;
+    int count = 0;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0) {
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP discovery failed", true);
+    }
+    if (cbm_aosp_search_symbols(&workspace, query, limit, &symbols, &count,
+                                err, sizeof(err)) != 0) {
+        cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP symbol search failed", true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_int(doc, root, "count", count);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "repo", symbols[i].repo_path);
+        yyjson_mut_obj_add_strcpy(doc, item, "manifest_name", symbols[i].manifest_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "project", symbols[i].project_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "name", symbols[i].name);
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name", symbols[i].qualified_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "label", symbols[i].label);
+        yyjson_mut_obj_add_strcpy(doc, item, "file", symbols[i].file_path);
+        yyjson_mut_obj_add_int(doc, item, "start_line", symbols[i].start_line);
+        yyjson_mut_obj_add_int(doc, item, "end_line", symbols[i].end_line);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "results", items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_symbols_free(symbols, count);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(query);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -7876,6 +7957,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "manage_adr") == 0) {
         return handle_manage_adr(srv, args_json);
+    }
+    if (strcmp(tool_name, "aosp_search_symbols") == 0) {
+        return handle_aosp_search_symbols(args_json);
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);

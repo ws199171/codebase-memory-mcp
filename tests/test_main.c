@@ -201,6 +201,7 @@ extern void suite_gitignore(void);
 extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
+extern void suite_aosp(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
 extern void suite_index_resilience(void);
@@ -364,6 +365,9 @@ int main(int argc, char **argv) {
 
     /* Graph Buffer (M7) */
     RUN_SELECTED_SUITE(graph_buffer);
+
+    /* AOSP workspace federation */
+    RUN_SELECTED_SUITE(aosp);
 
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);

@@ -531,8 +531,41 @@ codebase-memory-mcp cli list_projects
 codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*", "label": "Function"}'
 codebase-memory-mcp cli trace_path '{"project": "my-project", "function_name": "Search", "direction": "both"}'
 codebase-memory-mcp cli query_graph '{"project": "my-project", "query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
-codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
+codebase-memory-mcp cli --json search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
 ```
+
+## AOSP Workspaces
+
+AOSP checkouts are indexed as a federated graph instead of one oversized
+database. The repo manifest defines the workspace: each present manifest
+project gets a stable graph shard, while a workspace Master database catalogs
+repositories and globally searchable definition symbols.
+
+```bash
+# Discover .repo/manifest.xml, includes, and local manifests.
+codebase-memory-mcp aosp init /path/to/aosp
+
+# Index every present manifest project, or one project by manifest path/name.
+codebase-memory-mcp aosp index /path/to/aosp
+codebase-memory-mcp aosp index /path/to/aosp --repo frameworks/base
+
+# Inspect coverage and search definitions across all indexed repositories.
+codebase-memory-mcp aosp status /path/to/aosp
+codebase-memory-mcp aosp repos /path/to/aosp
+codebase-memory-mcp aosp search AudioFlinger /path/to/aosp --limit 50
+```
+
+Workspace state is stored under
+`~/.cache/codebase-memory-mcp/workspaces/<workspace-id>/master.db`; repository
+graphs use stable `aosp-<repo-id>.db` shards in the normal cache directory.
+Re-running `aosp index` refreshes the shard and its Master symbol catalog.
+
+The shard contains the complete graph produced for that repository. The Master
+currently provides manifest topology, index state, and global definition-symbol
+lookup. Build-module, Binder/AIDL/JNI cross-repository edges, and workspace-level
+architecture queries use reserved Master tables but require the later AOSP
+linking passes; they are not inferred merely by completing the initial shard
+index run.
 
 ## MCP Tools
 
@@ -556,6 +589,7 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
+| `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |

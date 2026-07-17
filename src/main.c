@@ -22,6 +22,7 @@
 #include "store/store.h"
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
+#include "aosp/aosp.h"
 #include "foundation/constants.h"
 
 enum {
@@ -514,6 +515,7 @@ static void print_help(void) {
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp aosp <init|index|status|repos|search> ...\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nUI options:\n");
@@ -581,6 +583,9 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "config") == 0) {
             return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "aosp") == 0) {
+            return cbm_cmd_aosp(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
     }
     return CBM_NOT_FOUND;

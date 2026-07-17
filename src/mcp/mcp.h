@@ -148,6 +148,11 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
+/* Variant used by federated workspaces that need a stable shard name instead
+ * of the path-derived default. The name is passed through the same validation
+ * and normalization as index_repository's optional `name` argument. */
+char *cbm_mcp_index_run_supervised_named_path(const char *root_path, const char *project_name);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.
