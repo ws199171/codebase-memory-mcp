@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: none.
-- Next task: `F3` - resolve cross-repository calls and usages.
-- Worktree baseline: `d53eb01` on `codex/aosp-federated-graph`.
+- Current task: `F3` - resolve cross-repository calls and usages.
+- Next task: `F4` - add ambiguity handling, confidence scoring, and evidence retention.
+- Worktree baseline: `079c82c` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 

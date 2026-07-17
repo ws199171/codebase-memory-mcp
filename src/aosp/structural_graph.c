@@ -207,6 +207,12 @@ static void normalize_reference(const char *raw, bool include, char out[SG_REF_M
         char c = *raw++;
         if (c == '"' || c == '\'' || c == '(' || c == '<' || c == '[' ||
             (!include && (c == '*' || c == '&' || isspace((unsigned char)c)))) break;
+        if (!include && (c == ':' || (c == '-' && *raw == '>'))) {
+            if (c == '-' && *raw == '>') raw++;
+            while (*raw == ':') raw++;
+            if (n > 0 && out[n - 1] != '.') out[n++] = '.';
+            continue;
+        }
         out[n++] = c == '\\' ? '/' : c;
     }
     while (n > 0 && (out[n - 1] == ';' || out[n - 1] == ':' || isspace((unsigned char)out[n - 1]))) n--;
@@ -216,7 +222,7 @@ static void normalize_reference(const char *raw, bool include, char out[SG_REF_M
 static const char *short_reference(const char *reference) {
     const char *short_name = reference;
     for (const char *p = reference; *p; p++) {
-        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':') short_name = p + 1;
+        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':' || *p == '>') short_name = p + 1;
     }
     return short_name;
 }
@@ -236,6 +242,14 @@ static bool target_label_allowed(const char *edge_type, const char *label) {
     if (strcmp(edge_type, "IMPORTS") == 0) {
         return type_like(label) || strcmp(label, "File") == 0 ||
                strcmp(label, "Module") == 0 || strcmp(label, "Namespace") == 0;
+    }
+    if (strcmp(edge_type, "CALLS") == 0) {
+        return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0;
+    }
+    if (strcmp(edge_type, "USAGE") == 0) {
+        return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+               type_like(label) || strcmp(label, "Variable") == 0 ||
+               strcmp(label, "Field") == 0 || strcmp(label, "Macro") == 0;
     }
     return type_like(label);
 }
@@ -272,7 +286,8 @@ static char *lookup_source_id(collect_ctx_t *ctx, const char *qualified_name) {
 }
 
 static int collect_reference(collect_ctx_t *ctx, const char *source_qn, const char *raw_reference,
-                             const char *requested_type, const char *evidence) {
+                             const char *requested_type, const char *evidence,
+                             double confidence_hint) {
     bool include = strcmp(requested_type, "INCLUDES") == 0;
     char reference[SG_REF_MAX];
     normalize_reference(raw_reference, include, reference);
@@ -347,6 +362,10 @@ static int collect_reference(collect_ctx_t *ctx, const char *source_qn, const ch
                                                       ? CBM_AOSP_CROSS_EDGE_RESOLVED
                                                       : CBM_AOSP_CROSS_EDGE_AMBIGUOUS;
             double confidence = cross_best == 1 ? (best_score >= 100 ? 0.98 : 0.85) : 0.5;
+            if (cross_best == 1 && confidence_hint >= 0.0 && confidence_hint <= 1.0 &&
+                confidence_hint < confidence) {
+                confidence = confidence_hint;
+            }
             if (!candidate_vec_add(&ctx->candidates, source_id, match->global_id, reference,
                                    edge_type, status, confidence, evidence)) rc = -1;
         }
@@ -355,6 +374,49 @@ static int collect_reference(collect_ctx_t *ctx, const char *source_qn, const ch
     free(source_id);
     match_vec_free(&matches);
     return rc;
+}
+
+static const char *reference_leaf(const char *reference) {
+    const char *leaf = reference;
+    if (!reference) return NULL;
+    for (const char *p = reference; *p; p++) {
+        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':' || *p == '>') leaf = p + 1;
+    }
+    return leaf;
+}
+
+static const CBMResolvedCall *find_resolved_call(const CBMFileResult *result,
+                                                 const CBMCall *call) {
+    if (!call->enclosing_func_qn || !call->callee_name) return NULL;
+    const char *call_leaf = reference_leaf(call->callee_name);
+    const CBMResolvedCall *best = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (!resolved->caller_qn || !resolved->callee_qn || resolved->confidence < 0.6f ||
+            strcmp(resolved->caller_qn, call->enclosing_func_qn) != 0) continue;
+        const char *resolved_leaf = reference_leaf(resolved->callee_qn);
+        const char *original_leaf = reference_leaf(resolved->reason);
+        if (strcmp(resolved_leaf, call_leaf) != 0 &&
+            (!original_leaf || strcmp(original_leaf, call_leaf) != 0)) continue;
+        if (!best || resolved->confidence > best->confidence) best = resolved;
+    }
+    return best;
+}
+
+static bool resolved_call_has_ast_call(const CBMFileResult *result,
+                                       const CBMResolvedCall *resolved) {
+    if (!resolved->caller_qn || !resolved->callee_qn) return false;
+    const char *resolved_leaf = reference_leaf(resolved->callee_qn);
+    const char *original_leaf = reference_leaf(resolved->reason);
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !call->callee_name ||
+            strcmp(call->enclosing_func_qn, resolved->caller_qn) != 0) continue;
+        const char *call_leaf = reference_leaf(call->callee_name);
+        if (strcmp(call_leaf, resolved_leaf) == 0 ||
+            (original_leaf && strcmp(call_leaf, original_leaf) == 0)) return true;
+    }
+    return false;
 }
 
 static const char *find_definition_qn(const CBMFileResult *result, const char *name) {
@@ -375,7 +437,7 @@ static int collect_file_result(collect_ctx_t *ctx, const char *file_qn, CBMLangu
                                       ? "ast_include_path" : "ast_import_path";
     for (int i = 0; i < result->imports.count; i++) {
         if (collect_reference(ctx, file_qn, result->imports.items[i].module_path,
-                              import_type, import_evidence) != 0) return -1;
+                              import_type, import_evidence, -1.0) != 0) return -1;
     }
     for (int i = 0; i < result->defs.count; i++) {
         const CBMDefinition *def = &result->defs.items[i];
@@ -383,26 +445,46 @@ static int collect_file_result(collect_ctx_t *ctx, const char *file_qn, CBMLangu
         if (def->base_classes) {
             for (int j = 0; def->base_classes[j]; j++) {
                 if (collect_reference(ctx, def->qualified_name, def->base_classes[j],
-                                      "EXTENDS", "ast_base_class") != 0) return -1;
+                                      "EXTENDS", "ast_base_class", -1.0) != 0) return -1;
             }
         }
         if (def->decorators) {
             for (int j = 0; def->decorators[j]; j++) {
                 if (collect_reference(ctx, def->qualified_name, def->decorators[j],
-                                      "ANNOTATED_BY", "ast_annotation") != 0) return -1;
+                                      "ANNOTATED_BY", "ast_annotation", -1.0) != 0) return -1;
             }
         }
     }
     for (int i = 0; i < result->type_refs.count; i++) {
         const CBMTypeRef *ref = &result->type_refs.items[i];
         if (collect_reference(ctx, ref->enclosing_func_qn, ref->type_name,
-                              "USES_TYPE", "ast_type_reference") != 0) return -1;
+                              "USES_TYPE", "ast_type_reference", -1.0) != 0) return -1;
     }
     for (int i = 0; i < result->impl_traits.count; i++) {
         const CBMImplTrait *impl = &result->impl_traits.items[i];
         const char *source_qn = find_definition_qn(result, impl->struct_name);
         if (collect_reference(ctx, source_qn, impl->trait_name,
-                              "IMPLEMENTS", "ast_impl_trait") != 0) return -1;
+                              "IMPLEMENTS", "ast_impl_trait", -1.0) != 0) return -1;
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        const CBMResolvedCall *resolved = find_resolved_call(result, call);
+        const char *target = resolved ? resolved->callee_qn : call->callee_name;
+        const char *evidence = resolved ? "lsp_resolved_call" : "ast_call";
+        double confidence = resolved ? resolved->confidence : -1.0;
+        if (collect_reference(ctx, call->enclosing_func_qn, target,
+                              "CALLS", evidence, confidence) != 0) return -1;
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->confidence < 0.6f || resolved_call_has_ast_call(result, resolved)) continue;
+        if (collect_reference(ctx, resolved->caller_qn, resolved->callee_qn,
+                              "CALLS", "lsp_resolved_call", resolved->confidence) != 0) return -1;
+    }
+    for (int i = 0; i < result->usages.count; i++) {
+        const CBMUsage *usage = &result->usages.items[i];
+        if (collect_reference(ctx, usage->enclosing_func_qn, usage->ref_name,
+                              "USAGE", "ast_usage", -1.0) != 0) return -1;
     }
     return 0;
 }

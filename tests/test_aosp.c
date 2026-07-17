@@ -711,6 +711,18 @@ static int create_structural_shard(const char *path, const char *project, bool s
         rc |= insert_shard_node(stmt, 6, "LocalChild", qn, "Class", "src/app/Client.java");
         (void)snprintf(qn, sizeof(qn), "%s.client.NativeClient", project);
         rc |= insert_shard_node(stmt, 7, "NativeClient", qn, "Class", "client.cpp");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client.localOnly", project);
+        rc |= insert_shard_node(stmt, 8, "localOnly", qn, "Method", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.client.native_client", project);
+        rc |= insert_shard_node(stmt, 9, "native_client", qn, "Function", "client.cpp");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client.__file__", project);
+        rc |= insert_shard_node(stmt, 10, "Client.kt", qn, "File", "src/app/Client.kt");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client.kotlin_client", project);
+        rc |= insert_shard_node(stmt, 11, "kotlin_client", qn, "Function", "src/app/Client.kt");
+        (void)snprintf(qn, sizeof(qn), "%s.src.client.__file__", project);
+        rc |= insert_shard_node(stmt, 12, "client.rs", qn, "File", "src/client.rs");
+        (void)snprintf(qn, sizeof(qn), "%s.src.client.rust_client", project);
+        rc |= insert_shard_node(stmt, 13, "rust_client", qn, "Function", "src/client.rs");
     } else {
         (void)snprintf(qn, sizeof(qn), "%s.include.vendor.api.vendor.h.__file__", project);
         rc |= insert_shard_node(stmt, 1, "vendor.h", qn, "File", "include/vendor/api/vendor.h");
@@ -724,6 +736,26 @@ static int create_structural_shard(const char *path, const char *project, bool s
         rc |= insert_shard_node(stmt, 5, "VendorType", qn, "Class", "src/vendor/api/Types.java");
         (void)snprintf(qn, sizeof(qn), "%s.include.vendor.api.VendorNativeBase", project);
         rc |= insert_shard_node(stmt, 6, "VendorNativeBase", qn, "Class", "include/vendor/api/vendor.h");
+        (void)snprintf(qn, sizeof(qn), "%s.src.vendor.api.VendorApi.execute", project);
+        rc |= insert_shard_node(stmt, 7, "execute", qn, "Method", "src/vendor/api/Calls.java");
+        (void)snprintf(qn, sizeof(qn), "%s.native.vendor_run", project);
+        rc |= insert_shard_node(stmt, 8, "vendor_run", qn, "Function", "native/calls.cpp");
+        (void)snprintf(qn, sizeof(qn), "%s.kotlin.vendorKotlin", project);
+        rc |= insert_shard_node(stmt, 9, "vendorKotlin", qn, "Function", "kotlin/Calls.kt");
+        (void)snprintf(qn, sizeof(qn), "%s.rust.vendor.rust_run", project);
+        rc |= insert_shard_node(stmt, 10, "rust_run", qn, "Function", "rust/calls.rs");
+        (void)snprintf(qn, sizeof(qn), "%s.values.sharedValue", project);
+        rc |= insert_shard_node(stmt, 11, "sharedValue", qn, "Field", "src/vendor/api/Values.java");
+        (void)snprintf(qn, sizeof(qn), "%s.values.vendor_value", project);
+        rc |= insert_shard_node(stmt, 12, "vendor_value", qn, "Variable", "native/values.cpp");
+        (void)snprintf(qn, sizeof(qn), "%s.values.vendorValue", project);
+        rc |= insert_shard_node(stmt, 13, "vendorValue", qn, "Variable", "kotlin/Values.kt");
+        (void)snprintf(qn, sizeof(qn), "%s.values.RUST_VALUE", project);
+        rc |= insert_shard_node(stmt, 14, "RUST_VALUE", qn, "Variable", "rust/values.rs");
+        (void)snprintf(qn, sizeof(qn), "%s.overload.A.ambiguousCall", project);
+        rc |= insert_shard_node(stmt, 15, "ambiguousCall", qn, "Method", "src/vendor/api/A.java");
+        (void)snprintf(qn, sizeof(qn), "%s.overload.B.ambiguousCall", project);
+        rc |= insert_shard_node(stmt, 16, "ambiguousCall", qn, "Method", "src/vendor/api/B.java");
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -766,13 +798,26 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
         "import vendor.api.VendorType;\n"
         "@VendorAnnotation\n"
         "class Client extends VendorBase implements VendorInterface {\n"
-        "  VendorType convert(VendorType value) { return value; }\n"
+        "  VendorType convert(VendorType value) {\n"
+        "    VendorApi.execute();\n"
+        "    localOnly();\n"
+        "    ambiguousCall();\n"
+        "    missingJava();\n"
+        "    return sharedValue;\n"
+        "  }\n"
+        "  void localOnly() {}\n"
         "}\n"
         "class LocalBase {}\n"
         "class LocalChild extends LocalBase {}\n"), 0);
     ASSERT_EQ(write_relative(root, "frameworks/base/client.cpp",
         "#include \"vendor/api/vendor.h\"\n"
-        "class NativeClient : public VendorNativeBase {};\n"), 0);
+        "class NativeClient : public VendorNativeBase {};\n"
+        "void native_client() { vendor_run(); missing_cpp(); int x = vendor_value; }\n"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/src/app/Client.kt",
+        "package app\n"
+        "fun kotlin_client() { vendorKotlin(); missingKotlin(); val x = vendorValue }\n"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/src/client.rs",
+        "fn rust_client() { vendor::rust_run(); missing_rust(); let x = RUST_VALUE; }\n"), 0);
     ASSERT_EQ(write_relative(root, "vendor/acme/widgets/include/vendor/api/vendor.h",
         "class VendorNativeBase {};\n"), 0);
 
@@ -828,6 +873,64 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
     sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+
+    const char *resolved_targets[] = {
+        "VendorApi.execute", "vendor_run", "vendorKotlin", "vendor.rust_run",
+        "sharedValue", "vendorValue", "RUST_VALUE",
+    };
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT status,confidence,evidence FROM cross_symbol_edges "
+        "WHERE workspace_id=?1 AND target_name=?2 AND type=?3;",
+        -1, &stmt, NULL), SQLITE_OK);
+    for (size_t i = 0; i < sizeof(resolved_targets) / sizeof(resolved_targets[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, resolved_targets[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, i < 4 ? "CALLS" : "USAGE", -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "resolved");
+        ASSERT(sqlite3_column_double(stmt, 1) > 0.0);
+        ASSERT(sqlite3_column_text(stmt, 2) != NULL);
+    }
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND type='CALLS' "
+        "AND target_name='localOnly';", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*),min(status),max(status) FROM cross_symbol_edges "
+        "WHERE workspace_id=?1 AND type='CALLS' AND target_name='ambiguousCall';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "ambiguous");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "ambiguous");
+    sqlite3_finalize(stmt);
+
+    const char *unresolved_targets[] = {"missingJava", "missing_cpp", "missingKotlin", "missing_rust"};
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT status,target_global_id,confidence,evidence FROM cross_symbol_edges "
+        "WHERE workspace_id=?1 AND type='CALLS' AND target_name=?2;",
+        -1, &stmt, NULL), SQLITE_OK);
+    for (size_t i = 0; i < sizeof(unresolved_targets) / sizeof(unresolved_targets[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, unresolved_targets[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "unresolved");
+        ASSERT_EQ(sqlite3_column_type(stmt, 1), SQLITE_NULL);
+        ASSERT_EQ(sqlite3_column_double(stmt, 2), 0.0);
+        ASSERT(sqlite3_column_text(stmt, 3) != NULL);
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 

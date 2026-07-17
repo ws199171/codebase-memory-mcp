@@ -557,7 +557,7 @@ codebase-memory-mcp aosp modules /path/to/aosp --query libbinder
 codebase-memory-mcp aosp link /path/to/aosp
 codebase-memory-mcp aosp protocols /path/to/aosp --query IAudioFlinger
 
-# Collect structural cross-repository symbol edges after all shards are indexed.
+# Collect structural, call, and usage edges after all shards are indexed.
 codebase-memory-mcp aosp federate /path/to/aosp
 
 # Inspect coverage and search definitions across all indexed repositories.

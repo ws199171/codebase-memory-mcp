@@ -86,6 +86,13 @@ different manifest repository. A best local target suppresses Master edge creati
 that relationship remains owned by the repository shard. Run `aosp federate` only
 after all desired repository shards have been indexed or refreshed.
 
+Call collection prefers a type-aware `CBMResolvedCall` when it matches the AST call
+site and falls back to the textual AST callee otherwise. C++ `::`/`->` and Rust `::`
+qualified references are normalized to the catalog's dotted qualified-name form.
+`CALLS` targets are restricted to functions and methods; `USAGE` targets are
+restricted to callable, type-like, variable, field, and macro definitions. Calls
+and usages that have no supported catalog target remain explicit unresolved rows.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
