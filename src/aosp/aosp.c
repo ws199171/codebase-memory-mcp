@@ -1874,6 +1874,433 @@ done:
     return rc;
 }
 
+/* ── Q3: Cross-shard trace_path traversal ──────────────────────── */
+
+typedef struct {
+    char *global_id;
+    int depth;
+    char *edge_type;     /* NULL for start */
+    char *edge_evidence; /* NULL for start */
+    double confidence;
+    bool cross_repo;
+} trace_item_t;
+
+typedef struct {
+    trace_item_t *items;
+    int capacity;
+    int head;
+    int count;
+} trace_queue_t;
+
+typedef struct {
+    char **ids;
+    int count;
+    int capacity;
+} trace_visited_t;
+
+static void trace_queue_init(trace_queue_t *q) {
+    q->items = NULL;
+    q->capacity = 0;
+    q->head = 0;
+    q->count = 0;
+}
+
+static void trace_queue_free(trace_queue_t *q) {
+    if (!q->items) return;
+    for (int i = 0; i < q->count; i++) {
+        int idx = q->head + i;
+        if (idx >= q->capacity) idx -= q->capacity;
+        free(q->items[idx].global_id);
+        free(q->items[idx].edge_type);
+        free(q->items[idx].edge_evidence);
+    }
+    free(q->items);
+    q->items = NULL;
+    q->capacity = 0;
+    q->head = 0;
+    q->count = 0;
+}
+
+static int trace_queue_push(trace_queue_t *q, const char *global_id, int depth,
+                            const char *edge_type, const char *edge_evidence,
+                            double confidence, bool cross_repo) {
+    if (q->count >= q->capacity) {
+        int new_cap = q->capacity == 0 ? 64 : q->capacity * 2;
+        trace_item_t *new_items = calloc((size_t)new_cap, sizeof(*new_items));
+        if (!new_items) return -1;
+        for (int i = 0; i < q->count; i++) {
+            int idx = q->head + i;
+            if (idx >= q->capacity) idx -= q->capacity;
+            new_items[i] = q->items[idx];
+        }
+        free(q->items);
+        q->items = new_items;
+        q->capacity = new_cap;
+        q->head = 0;
+    }
+    int tail = q->head + q->count;
+    if (tail >= q->capacity) tail -= q->capacity;
+    q->items[tail].global_id = strdup(global_id);
+    q->items[tail].depth = depth;
+    q->items[tail].edge_type = edge_type ? strdup(edge_type) : NULL;
+    q->items[tail].edge_evidence = edge_evidence ? strdup(edge_evidence) : NULL;
+    q->items[tail].confidence = confidence;
+    q->items[tail].cross_repo = cross_repo;
+    if (!q->items[tail].global_id || (edge_type && !q->items[tail].edge_type) ||
+        (edge_evidence && !q->items[tail].edge_evidence)) {
+        free(q->items[tail].global_id);
+        free(q->items[tail].edge_type);
+        free(q->items[tail].edge_evidence);
+        return -1;
+    }
+    q->count++;
+    return 0;
+}
+
+static trace_item_t trace_queue_pop(trace_queue_t *q) {
+    trace_item_t item = q->items[q->head];
+    q->head++;
+    if (q->head >= q->capacity) q->head = 0;
+    q->count--;
+    return item;
+}
+
+static void trace_visited_free(trace_visited_t *v) {
+    if (!v->ids) return;
+    for (int i = 0; i < v->count; i++) free(v->ids[i]);
+    free(v->ids);
+    v->ids = NULL;
+    v->count = 0;
+    v->capacity = 0;
+}
+
+static bool trace_visited_contains(trace_visited_t *v, const char *id) {
+    for (int i = 0; i < v->count; i++) {
+        if (strcmp(v->ids[i], id) == 0) return true;
+    }
+    return false;
+}
+
+static int trace_visited_add(trace_visited_t *v, const char *id) {
+    if (v->count >= v->capacity) {
+        int new_cap = v->capacity == 0 ? 64 : v->capacity * 2;
+        char **new_ids = realloc(v->ids, (size_t)new_cap * sizeof(char *));
+        if (!new_ids) return -1;
+        v->ids = new_ids;
+        v->capacity = new_cap;
+    }
+    v->ids[v->count] = strdup(id);
+    if (!v->ids[v->count]) return -1;
+    v->count++;
+    return 0;
+}
+
+void cbm_aosp_trace_result_free(cbm_aosp_trace_result_t *result) {
+    if (!result) return;
+    for (int i = 0; i < result->node_count; i++) {
+        free(result->nodes[i].global_id);
+        free(result->nodes[i].repo_id);
+        free(result->nodes[i].qualified_name);
+        free(result->nodes[i].label);
+        free(result->nodes[i].file_path);
+        free(result->nodes[i].edge_type);
+        free(result->nodes[i].edge_evidence);
+    }
+    free(result->nodes);
+    memset(result, 0, sizeof(*result));
+}
+
+int cbm_aosp_trace_path(const cbm_aosp_workspace_t *workspace,
+                        const char *start_global_id,
+                        const cbm_aosp_trace_options_t *options,
+                        cbm_aosp_trace_result_t *out,
+                        char *err, size_t err_size) {
+    if (!workspace || !start_global_id || !out) {
+        set_error(err, err_size, "AOSP trace requires workspace and start symbol", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+
+    cbm_aosp_trace_options_t defaults;
+    if (!options) {
+        defaults.max_depth = -1;
+        defaults.direction = CBM_AOSP_TRACE_OUTGOING;
+        defaults.result_budget = 1000;
+        defaults.cancel_flag = NULL;
+        options = &defaults;
+    }
+
+    char master_path[AOSP_PATH_BUF];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) {
+        set_error(err, err_size, "AOSP workspace is not initialized", NULL);
+        return -1;
+    }
+    sqlite3 *master = NULL;
+    sqlite3_stmt *sym_lookup = NULL;
+    sqlite3_stmt *gid_lookup = NULL;
+    sqlite3_stmt *cross_out = NULL;
+    sqlite3_stmt *cross_in = NULL;
+    int rc = -1;
+
+    if (sqlite3_open_v2(master_path, &master, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP master database", master_path);
+        sqlite3_close(master);
+        return -1;
+    }
+    if (sqlite3_prepare_v2(master,
+            "SELECT repo_id, local_node_id, qualified_name, label, file_path, start_line "
+            "FROM symbols WHERE workspace_id=?1 AND global_id=?2;",
+            -1, &sym_lookup, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT global_id FROM symbols WHERE workspace_id=?1 AND repo_id=?2 "
+            "AND local_node_id=?3;",
+            -1, &gid_lookup, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT target_global_id, type, confidence, evidence "
+            "FROM cross_symbol_edges WHERE workspace_id=?1 AND source_global_id=?2 "
+            "AND status='resolved';",
+            -1, &cross_out, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT source_global_id, type, confidence, evidence "
+            "FROM cross_symbol_edges WHERE workspace_id=?1 AND target_global_id=?2 "
+            "AND status='resolved';",
+            -1, &cross_in, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP trace statements", sqlite3_errmsg(master));
+        goto done;
+    }
+
+    /* Verify start symbol exists */
+    sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(sym_lookup, 2, start_global_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(sym_lookup) != SQLITE_ROW) {
+        set_error(err, err_size, "AOSP start symbol not found", start_global_id);
+        goto done;
+    }
+    sqlite3_reset(sym_lookup);
+    sqlite3_clear_bindings(sym_lookup);
+
+    trace_queue_t queue;
+    trace_visited_t visited;
+    trace_queue_init(&queue);
+    memset(&visited, 0, sizeof(visited));
+
+    int result_cap = options->result_budget > 0 ? options->result_budget : 256;
+    cbm_aosp_trace_node_t *results = calloc((size_t)result_cap, sizeof(*results));
+    if (!results) {
+        set_error(err, err_size, "out of memory", NULL);
+        goto cleanup_queue;
+    }
+
+    /* Enqueue start node */
+    if (trace_queue_push(&queue, start_global_id, 0, NULL, NULL, 0.0, false) != 0 ||
+        trace_visited_add(&visited, start_global_id) != 0) {
+        set_error(err, err_size, "out of memory", NULL);
+        free(results);
+        goto cleanup_queue;
+    }
+
+    bool truncated = false;
+    int max_depth_reached = 0;
+
+    while (queue.count > 0) {
+        if (options->cancel_flag && *options->cancel_flag) {
+            truncated = true;
+            break;
+        }
+        trace_item_t item = trace_queue_pop(&queue);
+
+        /* Look up symbol info from Master */
+        sqlite3_reset(sym_lookup);
+        sqlite3_clear_bindings(sym_lookup);
+        sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sym_lookup, 2, item.global_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sym_lookup) != SQLITE_ROW) {
+            /* Symbol disappeared between enqueue and dequeue — skip */
+            free(item.global_id);
+            free(item.edge_type);
+            free(item.edge_evidence);
+            continue;
+        }
+
+        /* Add to results */
+        if (out->node_count >= result_cap) {
+            if (options->result_budget > 0) {
+                truncated = true;
+                free(item.global_id);
+                free(item.edge_type);
+                free(item.edge_evidence);
+                break;
+            }
+            int new_cap = result_cap * 2;
+            cbm_aosp_trace_node_t *new_results =
+                realloc(results, (size_t)new_cap * sizeof(*results));
+            if (!new_results) {
+                set_error(err, err_size, "out of memory", NULL);
+                free(item.global_id);
+                free(item.edge_type);
+                free(item.edge_evidence);
+                free(results);
+                results = NULL;
+                goto cleanup_queue;
+            }
+            memset(new_results + result_cap, 0,
+                   (size_t)(new_cap - result_cap) * sizeof(*new_results));
+            results = new_results;
+            result_cap = new_cap;
+        }
+
+        cbm_aosp_trace_node_t *node = &results[out->node_count];
+        memset(node, 0, sizeof(*node));
+        node->global_id = item.global_id;
+        node->repo_id = dup_column(sym_lookup, 0);
+        node->qualified_name = dup_column(sym_lookup, 2);
+        node->label = dup_column(sym_lookup, 3);
+        node->file_path = dup_column(sym_lookup, 4);
+        node->start_line = sqlite3_column_int(sym_lookup, 5);
+        node->edge_type = item.edge_type;
+        node->edge_evidence = item.edge_evidence;
+        node->confidence = item.confidence;
+        node->depth = item.depth;
+        node->cross_repo = item.cross_repo;
+        out->node_count++;
+        if (item.depth > max_depth_reached) max_depth_reached = item.depth;
+
+        /* Don't free item fields — they're now owned by the result node */
+        /* item.global_id, item.edge_type, item.edge_evidence moved to node */
+
+        /* Check depth limit */
+        if (options->max_depth >= 0 && item.depth >= options->max_depth) continue;
+
+        const char *repo_id = node->repo_id;
+        if (!repo_id || !repo_id[0]) continue;
+
+        /* Expand local edges via shard */
+        cbm_aosp_shard_route_t route;
+        if (cbm_aosp_shard_route(workspace, item.global_id, &route, NULL, 0) == 0) {
+            /* Outgoing local edges */
+            if (options->direction == CBM_AOSP_TRACE_OUTGOING ||
+                options->direction == CBM_AOSP_TRACE_BOTH) {
+                cbm_aosp_shard_edge_t *edges = NULL;
+                int ecount = 0;
+                if (cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_OUTGOING,
+                                               &edges, &ecount, NULL, 0) == 0) {
+                    for (int i = 0; i < ecount; i++) {
+                        /* Look up neighbor global_id from Master */
+                        sqlite3_reset(gid_lookup);
+                        sqlite3_clear_bindings(gid_lookup);
+                        sqlite3_bind_text(gid_lookup, 1, workspace->workspace_id, -1,
+                                          SQLITE_TRANSIENT);
+                        sqlite3_bind_text(gid_lookup, 2, repo_id, -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int64(gid_lookup, 3, edges[i].neighbor_id);
+                        if (sqlite3_step(gid_lookup) == SQLITE_ROW) {
+                            const char *nid = (const char *)sqlite3_column_text(gid_lookup, 0);
+                            if (nid && !trace_visited_contains(&visited, nid)) {
+                                if (trace_visited_add(&visited, nid) == 0 &&
+                                    trace_queue_push(&queue, nid, item.depth + 1,
+                                                     edges[i].type, "local", 1.0,
+                                                     false) != 0) {
+                                    /* OOM — best effort continue */
+                                }
+                            }
+                        }
+                    }
+                    cbm_aosp_shard_edges_free(edges, ecount);
+                }
+            }
+            /* Incoming local edges */
+            if (options->direction == CBM_AOSP_TRACE_INCOMING ||
+                options->direction == CBM_AOSP_TRACE_BOTH) {
+                cbm_aosp_shard_edge_t *edges = NULL;
+                int ecount = 0;
+                if (cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_INCOMING,
+                                               &edges, &ecount, NULL, 0) == 0) {
+                    for (int i = 0; i < ecount; i++) {
+                        sqlite3_reset(gid_lookup);
+                        sqlite3_clear_bindings(gid_lookup);
+                        sqlite3_bind_text(gid_lookup, 1, workspace->workspace_id, -1,
+                                          SQLITE_TRANSIENT);
+                        sqlite3_bind_text(gid_lookup, 2, repo_id, -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int64(gid_lookup, 3, edges[i].neighbor_id);
+                        if (sqlite3_step(gid_lookup) == SQLITE_ROW) {
+                            const char *nid = (const char *)sqlite3_column_text(gid_lookup, 0);
+                            if (nid && !trace_visited_contains(&visited, nid)) {
+                                if (trace_visited_add(&visited, nid) == 0 &&
+                                    trace_queue_push(&queue, nid, item.depth + 1,
+                                                     edges[i].type, "local", 1.0,
+                                                     false) != 0) {
+                                    /* OOM — best effort continue */
+                                }
+                            }
+                        }
+                    }
+                    cbm_aosp_shard_edges_free(edges, ecount);
+                }
+            }
+            cbm_aosp_shard_route_close(&route);
+        }
+
+        /* Expand cross-repository edges from Master */
+        if (options->direction == CBM_AOSP_TRACE_OUTGOING ||
+            options->direction == CBM_AOSP_TRACE_BOTH) {
+            sqlite3_reset(cross_out);
+            sqlite3_clear_bindings(cross_out);
+            sqlite3_bind_text(cross_out, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(cross_out, 2, item.global_id, -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(cross_out) == SQLITE_ROW) {
+                const char *tid = (const char *)sqlite3_column_text(cross_out, 0);
+                const char *etype = (const char *)sqlite3_column_text(cross_out, 1);
+                double conf = sqlite3_column_double(cross_out, 2);
+                const char *evid = (const char *)sqlite3_column_text(cross_out, 3);
+                if (tid && !trace_visited_contains(&visited, tid)) {
+                    if (trace_visited_add(&visited, tid) == 0 &&
+                        trace_queue_push(&queue, tid, item.depth + 1, etype,
+                                         evid ? evid : "cross_repo", conf,
+                                         true) != 0) {
+                        /* OOM — best effort continue */
+                    }
+                }
+            }
+        }
+        if (options->direction == CBM_AOSP_TRACE_INCOMING ||
+            options->direction == CBM_AOSP_TRACE_BOTH) {
+            sqlite3_reset(cross_in);
+            sqlite3_clear_bindings(cross_in);
+            sqlite3_bind_text(cross_in, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(cross_in, 2, item.global_id, -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(cross_in) == SQLITE_ROW) {
+                const char *sid = (const char *)sqlite3_column_text(cross_in, 0);
+                const char *etype = (const char *)sqlite3_column_text(cross_in, 1);
+                double conf = sqlite3_column_double(cross_in, 2);
+                const char *evid = (const char *)sqlite3_column_text(cross_in, 3);
+                if (sid && !trace_visited_contains(&visited, sid)) {
+                    if (trace_visited_add(&visited, sid) == 0 &&
+                        trace_queue_push(&queue, sid, item.depth + 1, etype,
+                                         evid ? evid : "cross_repo", conf,
+                                         true) != 0) {
+                        /* OOM — best effort continue */
+                    }
+                }
+            }
+        }
+    }
+
+    out->nodes = results;
+    out->truncated = truncated;
+    out->max_depth_reached = max_depth_reached;
+    rc = 0;
+
+cleanup_queue:
+    trace_queue_free(&queue);
+    trace_visited_free(&visited);
+done:
+    sqlite3_finalize(sym_lookup);
+    sqlite3_finalize(gid_lookup);
+    sqlite3_finalize(cross_out);
+    sqlite3_finalize(cross_in);
+    sqlite3_close(master);
+    return rc;
+}
+
 static void print_aosp_usage(FILE *stream) {
     (void)fprintf(stream,
         "Usage:\n"

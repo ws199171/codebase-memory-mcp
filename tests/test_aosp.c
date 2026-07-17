@@ -654,6 +654,224 @@ TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges) {
     PASS();
 }
 
+static int create_trace_shard(const char *path, int repo_index) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY,source_id INTEGER,target_id INTEGER,"
+        "type TEXT,properties TEXT);";
+    const char *repo_zero =
+        "INSERT INTO nodes VALUES"
+        "(1,'Start','alpha.Start','Class','alpha/Start.java',10,20,'{}'),"
+        "(2,'Mid','alpha.Mid','Class','alpha/Mid.java',30,40,'{}');"
+        "INSERT INTO edges VALUES(1,1,2,'CALLS','{}');";
+    const char *repo_one =
+        "INSERT INTO nodes VALUES"
+        "(1,'Target','beta.Target','Class','beta/Target.java',10,20,'{}'),"
+        "(2,'Deep','beta.Deep','Class','beta/Deep.java',30,40,'{}');"
+        "INSERT INTO edges VALUES(1,1,2,'CALLS','{}');";
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+             sqlite3_exec(db, repo_index == 0 ? repo_zero : repo_one,
+                          NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_close(db);
+    return rc;
+}
+
+static int insert_cross_edge(const cbm_aosp_workspace_t *workspace,
+                             const char *edge_id, const char *source_repo_id,
+                             const char *target_repo_id, const char *source_global_id,
+                             const char *target_global_id, const char *type,
+                             double confidence, const char *evidence) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO cross_symbol_edges(edge_id,workspace_id,source_repo_id,target_repo_id,"
+            "source_global_id,target_global_id,target_name,target_leaf,type,status,"
+            "confidence,evidence,source_generation,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,'','',?7,'resolved',?8,?9,'','{}');",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, edge_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, source_repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, target_repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, source_global_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, target_global_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 8, confidence);
+    sqlite3_bind_text(stmt, 9, evidence, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_trace_path_traverses_local_and_cross_repo_edges) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_paths[2][4096];
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/trace-%d.db", root, i);
+        ASSERT_EQ(create_trace_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+        ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[i].repo_id, shard_paths[i]), 0);
+    }
+
+    /* Resolve symbols to get global IDs */
+    cbm_aosp_symbol_resolution_t res;
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "alpha.Start", &res, err, sizeof(err)), 0);
+    ASSERT_EQ(res.candidate_count, 1);
+    char *start_gid = strdup(res.candidates[0].global_id);
+    cbm_aosp_symbol_resolution_free(&res);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "alpha.Mid", &res, err, sizeof(err)), 0);
+    char *mid_gid = strdup(res.candidates[0].global_id);
+    cbm_aosp_symbol_resolution_free(&res);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "beta.Target", &res, err, sizeof(err)), 0);
+    char *target_gid = strdup(res.candidates[0].global_id);
+    char *target_repo_id = strdup(res.candidates[0].repo_id);
+    cbm_aosp_symbol_resolution_free(&res);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "beta.Deep", &res, err, sizeof(err)), 0);
+    char *deep_gid = strdup(res.candidates[0].global_id);
+    cbm_aosp_symbol_resolution_free(&res);
+
+    /* Insert cross-repository edges:
+     *   alpha.Start --CALLS--> beta.Target (confidence 0.9)
+     *   alpha.Mid   --USES_TYPE--> beta.Deep (confidence 0.8) */
+    ASSERT_EQ(insert_cross_edge(&workspace, "edge1", workspace.repos[0].repo_id,
+                                target_repo_id, start_gid, target_gid, "CALLS", 0.9,
+                                "cross_calls"), 0);
+    ASSERT_EQ(insert_cross_edge(&workspace, "edge2", workspace.repos[0].repo_id,
+                                target_repo_id, mid_gid, deep_gid, "USES_TYPE", 0.8,
+                                "cross_uses"), 0);
+
+    /* Test: full outgoing traversal from alpha.Start
+     * Graph: Start -> Mid (local), Start -> Target (cross), Mid -> Deep (cross),
+     *        Target -> Deep (local, but Deep already visited via cross) */
+    cbm_aosp_trace_options_t opts = {0};
+    opts.max_depth = -1;
+    opts.direction = CBM_AOSP_TRACE_OUTGOING;
+    opts.result_budget = 0;
+    opts.cancel_flag = NULL;
+
+    cbm_aosp_trace_result_t result;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 4);
+    ASSERT_FALSE(result.truncated);
+    ASSERT_EQ(result.max_depth_reached, 2);
+    /* Start node */
+    ASSERT_STR_EQ(result.nodes[0].global_id, start_gid);
+    ASSERT_EQ(result.nodes[0].depth, 0);
+    ASSERT_FALSE(result.nodes[0].cross_repo);
+    ASSERT(result.nodes[0].edge_type == NULL);
+    /* Depth 1 nodes: Mid (local) and Target (cross) */
+    bool found_mid = false, found_target = false;
+    for (int i = 1; i <= 2; i++) {
+        if (strcmp(result.nodes[i].global_id, mid_gid) == 0) {
+            found_mid = true;
+            ASSERT_EQ(result.nodes[i].depth, 1);
+            ASSERT_FALSE(result.nodes[i].cross_repo);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "CALLS");
+            ASSERT_EQ(result.nodes[i].confidence, 1.0);
+        }
+        if (strcmp(result.nodes[i].global_id, target_gid) == 0) {
+            found_target = true;
+            ASSERT_EQ(result.nodes[i].depth, 1);
+            ASSERT(result.nodes[i].cross_repo);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "CALLS");
+            ASSERT_EQ(result.nodes[i].confidence, 0.9);
+        }
+    }
+    ASSERT(found_mid);
+    ASSERT(found_target);
+    /* Depth 2: Deep (reached via cross from Mid or local from Target) */
+    ASSERT_STR_EQ(result.nodes[3].global_id, deep_gid);
+    ASSERT_EQ(result.nodes[3].depth, 2);
+    cbm_aosp_trace_result_free(&result);
+
+    /* Test: max_depth=0 returns only start */
+    opts.max_depth = 0;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 1);
+    ASSERT_EQ(result.max_depth_reached, 0);
+    cbm_aosp_trace_result_free(&result);
+
+    /* Test: max_depth=1 returns start + depth 1 */
+    opts.max_depth = 1;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 3);
+    ASSERT_EQ(result.max_depth_reached, 1);
+    cbm_aosp_trace_result_free(&result);
+
+    /* Test: result_budget=2 truncates */
+    opts.max_depth = -1;
+    opts.result_budget = 2;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 2);
+    ASSERT(result.truncated);
+    cbm_aosp_trace_result_free(&result);
+
+    /* Test: incoming direction from beta.Deep finds:
+     *   Depth 0: Deep
+     *   Depth 1: Target (local CALLS), Mid (cross USES_TYPE)
+     *   Depth 2: Start (via Target cross Start→Target, or Mid local Start→Mid) */
+    opts.max_depth = -1;
+    opts.direction = CBM_AOSP_TRACE_INCOMING;
+    opts.result_budget = 0;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, deep_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 4);
+    /* Start: Deep */
+    ASSERT_STR_EQ(result.nodes[0].global_id, deep_gid);
+    ASSERT_EQ(result.nodes[0].depth, 0);
+    /* Depth 1: Target (local CALLS) and Mid (cross USES_TYPE) */
+    bool found_target_in = false, found_mid_in = false;
+    for (int i = 1; i <= 2; i++) {
+        if (strcmp(result.nodes[i].global_id, target_gid) == 0) {
+            found_target_in = true;
+            ASSERT_FALSE(result.nodes[i].cross_repo);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "CALLS");
+        }
+        if (strcmp(result.nodes[i].global_id, mid_gid) == 0) {
+            found_mid_in = true;
+            ASSERT(result.nodes[i].cross_repo);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "USES_TYPE");
+        }
+    }
+    ASSERT(found_target_in);
+    ASSERT(found_mid_in);
+    cbm_aosp_trace_result_free(&result);
+
+    /* Test: missing start symbol returns error */
+    opts.direction = CBM_AOSP_TRACE_OUTGOING;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, "nonexistent-id", &opts, &result, err, sizeof(err)),
+              -1);
+    ASSERT(strstr(err, "not found") != NULL);
+
+    free(start_gid);
+    free(mid_gid);
+    free(target_gid);
+    free(target_repo_id);
+    free(deep_gid);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_build_graph_resolves_cross_repo_modules) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1620,6 +1838,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_catalog_and_global_symbol_search);
     RUN_TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity);
     RUN_TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges);
+    RUN_TEST(aosp_trace_path_traverses_local_and_cross_repo_edges);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);

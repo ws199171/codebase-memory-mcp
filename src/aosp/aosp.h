@@ -185,6 +185,54 @@ int cbm_aosp_shard_read_edges(const cbm_aosp_shard_route_t *route,
                               char *err, size_t err_size);
 void cbm_aosp_shard_edges_free(cbm_aosp_shard_edge_t *edges, int count);
 
+/* Q3: Cross-shard trace_path traversal with depth, direction, cycle,
+ * result-budget, and cancellation controls. */
+
+typedef enum {
+    CBM_AOSP_TRACE_OUTGOING = 0,
+    CBM_AOSP_TRACE_INCOMING = 1,
+    CBM_AOSP_TRACE_BOTH = 2,
+} cbm_aosp_trace_direction_t;
+
+typedef struct {
+    int max_depth;                    /* max hops from start (0 = start only, -1 = unlimited) */
+    cbm_aosp_trace_direction_t direction;
+    int result_budget;                /* max nodes to return (0 = unlimited) */
+    const volatile bool *cancel_flag; /* if non-NULL, traversal stops when *flag is true */
+} cbm_aosp_trace_options_t;
+
+typedef struct {
+    char *global_id;
+    char *repo_id;
+    char *qualified_name;
+    char *label;
+    char *file_path;
+    int start_line;
+    char *edge_type;        /* edge type that led here, or NULL for start */
+    char *edge_evidence;    /* edge evidence, or NULL for start */
+    double confidence;      /* edge confidence (0.0 for start) */
+    int depth;              /* hop count from start (0 for start) */
+    bool cross_repo;        /* true if this hop crossed a repository boundary */
+} cbm_aosp_trace_node_t;
+
+typedef struct {
+    cbm_aosp_trace_node_t *nodes;
+    int node_count;
+    bool truncated;         /* true if result budget was hit before exhaustion */
+    int max_depth_reached;  /* deepest hop count in the result set */
+} cbm_aosp_trace_result_t;
+
+/* Traverse the federated graph starting from a Master global symbol ID.
+ * Follows local shard edges and resolved cross-repository edges up to
+ * max_depth hops. Cycle detection prevents revisiting nodes. The result
+ * budget and cancel flag provide early termination. */
+int cbm_aosp_trace_path(const cbm_aosp_workspace_t *workspace,
+                        const char *start_global_id,
+                        const cbm_aosp_trace_options_t *options,
+                        cbm_aosp_trace_result_t *out,
+                        char *err, size_t err_size);
+void cbm_aosp_trace_result_free(cbm_aosp_trace_result_t *result);
+
 /* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
 int cbm_cmd_aosp(int argc, char **argv);
 
