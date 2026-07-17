@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `F5` - implement cross-edge refresh and dependency invalidation.
+- Current task: none.
 - Next task: `F6` - report cross-edge coverage and resolution state.
-- Worktree baseline: `235fb25` on `codex/aosp-federated-graph`.
+- Worktree baseline: `c57883b` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -93,7 +93,7 @@ complete:
 - [x] `F4` Add ambiguity handling, confidence scoring, and evidence retention.
   Acceptance: duplicate-name fixtures never produce an unsupported name-only edge;
   ambiguous candidates remain queryable.
-- [ ] `F5` Implement per-repository cross-edge refresh and dependency invalidation.
+- [x] `F5` Implement per-repository cross-edge refresh and dependency invalidation.
   Acceptance: reindexing one repository updates affected edges without rebuilding
   unrelated workspace state.
 - [ ] `F6` Report cross-edge coverage, unresolved counts, and resolution errors.
@@ -229,3 +229,4 @@ unaccepted critical coverage gap.
 | `F2` | `d53eb01` | Six structural edge classes, local-edge exclusion, 177 focused tests, production `aosp federate` smoke |
 | `F3` | `0b1774e` | C/C++, Java, Kotlin, and Rust calls/usages; local, ambiguous, unresolved coverage; 177 focused tests; production two-repository federation smoke |
 | `F4` | `60dc77b` | Qualified/short-name confidence tiers, structured candidate evidence, qualifier-mismatch rejection, duplicate-name ambiguity fixture, 177 focused tests, production three-state smoke |
+| `F5` | `c57883b` | Schema v5 refresh queue/state and indexed dependency leaf, v3/v4 migrations, three-repository selective refresh, retry retention, 178 focused tests, production incremental federation smoke |
