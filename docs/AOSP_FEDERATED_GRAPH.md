@@ -141,6 +141,30 @@ ambiguity when a common short name has more matches. The resolver is the interna
 Q1 contract used by later shard routing and traversal tasks; public workspace-aware
 CLI and MCP compatibility is introduced by Q6.
 
+## Shard Routing
+
+`cbm_aosp_shard_route` routes a Master global symbol ID to the repository shard
+that owns it. The Master `symbols` table provides the `repo_id` and
+`local_node_id`; the Master `repos` table provides the shard `db_path` and
+`status`. A route is opened only when the source repository is `indexed` and
+has a non-empty `db_path`. The shard database is opened read-only and must be
+closed with `cbm_aosp_shard_route_close`.
+
+`cbm_aosp_shard_route_symbol` is a convenience entry point that accepts a Q1
+resolved `cbm_aosp_symbol_t` directly, skipping the Master global-ID lookup. It
+still queries the Master `repos` table for the shard path.
+
+`cbm_aosp_shard_read_node` reads the routed node from its shard's `nodes` table
+by `local_node_id`, returning name, qualified name, label, file path, and line
+range. The Master-level `global_id` and `repo_id` are carried from the route.
+
+`cbm_aosp_shard_read_edges` reads edges from the routed node's shard in a given
+direction (`OUTGOING` or `INCOMING`). For outgoing edges, the neighbor is the
+target node; for incoming edges, the neighbor is the source node. Each result
+carries the edge type, properties, and the neighbor's local node ID, name,
+qualified name, label, and file path. This is the internal Q2 contract used by
+later cross-shard traversal tasks (Q3).
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

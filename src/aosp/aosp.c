@@ -1576,6 +1576,304 @@ int cbm_aosp_resolve_symbol(const cbm_aosp_workspace_t *workspace, const char *r
     return 0;
 }
 
+void cbm_aosp_shard_route_close(cbm_aosp_shard_route_t *route) {
+    if (!route) return;
+    sqlite3_close(route->shard);
+    free(route->shard_path);
+    free(route->repo_id);
+    free(route->global_id);
+    memset(route, 0, sizeof(*route));
+}
+
+int cbm_aosp_shard_route(const cbm_aosp_workspace_t *workspace, const char *global_id,
+                         cbm_aosp_shard_route_t *out, char *err, size_t err_size) {
+    if (!workspace || !global_id || !global_id[0] || !out) {
+        set_error(err, err_size, "AOSP shard route requires workspace and global id", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    char master_path[AOSP_PATH_BUF];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) {
+        set_error(err, err_size, "AOSP workspace is not initialized", NULL);
+        return -1;
+    }
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open_v2(master_path, &master, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP master database", master_path);
+        sqlite3_close(master);
+        return -1;
+    }
+    if (sqlite3_prepare_v2(master,
+            "SELECT s.repo_id, s.local_node_id, r.db_path, r.status "
+            "FROM symbols s JOIN repos r ON r.repo_id = s.repo_id "
+            "WHERE s.workspace_id = ?1 AND s.global_id = ?2;",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP shard route lookup", sqlite3_errmsg(master));
+        goto done;
+    }
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, global_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        set_error(err, err_size, "AOSP symbol not found in workspace catalog", global_id);
+        goto done;
+    }
+    const char *repo_id_text = (const char *)sqlite3_column_text(stmt, 0);
+    const char *db_path_text = (const char *)sqlite3_column_text(stmt, 2);
+    const char *status_text = (const char *)sqlite3_column_text(stmt, 3);
+    if (!repo_id_text || !repo_id_text[0]) {
+        set_error(err, err_size, "AOSP symbol has no repository", global_id);
+        goto done;
+    }
+    if (!db_path_text || !db_path_text[0]) {
+        set_error(err, err_size, "AOSP repository shard is not indexed", repo_id_text);
+        goto done;
+    }
+    if (!status_text || strcmp(status_text, "indexed") != 0) {
+        set_error(err, err_size, "AOSP repository is not indexed", repo_id_text);
+        goto done;
+    }
+    out->repo_id = strdup(repo_id_text);
+    out->global_id = strdup(global_id);
+    out->shard_path = strdup(db_path_text);
+    out->local_node_id = sqlite3_column_int64(stmt, 1);
+    if (!out->repo_id || !out->global_id || !out->shard_path) {
+        set_error(err, err_size, "out of memory", NULL);
+        cbm_aosp_shard_route_close(out);
+        goto done;
+    }
+    if (sqlite3_open_v2(out->shard_path, &out->shard, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP repository shard", out->shard_path);
+        cbm_aosp_shard_route_close(out);
+        goto done;
+    }
+    rc = 0;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+    return rc;
+}
+
+int cbm_aosp_shard_route_symbol(const cbm_aosp_workspace_t *workspace,
+                                const cbm_aosp_symbol_t *symbol,
+                                cbm_aosp_shard_route_t *out, char *err, size_t err_size) {
+    if (!workspace || !symbol || !symbol->global_id || !symbol->repo_id || !out) {
+        set_error(err, err_size, "AOSP shard route requires a resolved symbol", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    char master_path[AOSP_PATH_BUF];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) {
+        set_error(err, err_size, "AOSP workspace is not initialized", NULL);
+        return -1;
+    }
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open_v2(master_path, &master, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP master database", master_path);
+        sqlite3_close(master);
+        return -1;
+    }
+    if (sqlite3_prepare_v2(master,
+            "SELECT db_path, status FROM repos "
+            "WHERE workspace_id = ?1 AND repo_id = ?2;",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP shard route lookup", sqlite3_errmsg(master));
+        goto done;
+    }
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, symbol->repo_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        set_error(err, err_size, "AOSP repository not found in workspace", symbol->repo_id);
+        goto done;
+    }
+    const char *db_path_text = (const char *)sqlite3_column_text(stmt, 0);
+    const char *status_text = (const char *)sqlite3_column_text(stmt, 1);
+    if (!db_path_text || !db_path_text[0]) {
+        set_error(err, err_size, "AOSP repository shard is not indexed", symbol->repo_id);
+        goto done;
+    }
+    if (!status_text || strcmp(status_text, "indexed") != 0) {
+        set_error(err, err_size, "AOSP repository is not indexed", symbol->repo_id);
+        goto done;
+    }
+    out->repo_id = strdup(symbol->repo_id);
+    out->global_id = strdup(symbol->global_id);
+    out->shard_path = strdup(db_path_text);
+    out->local_node_id = symbol->local_node_id;
+    if (!out->repo_id || !out->global_id || !out->shard_path) {
+        set_error(err, err_size, "out of memory", NULL);
+        cbm_aosp_shard_route_close(out);
+        goto done;
+    }
+    if (sqlite3_open_v2(out->shard_path, &out->shard, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP repository shard", out->shard_path);
+        cbm_aosp_shard_route_close(out);
+        goto done;
+    }
+    rc = 0;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+    return rc;
+}
+
+int cbm_aosp_shard_read_node(const cbm_aosp_shard_route_t *route, cbm_aosp_symbol_t *out,
+                             char *err, size_t err_size) {
+    if (!route || !route->shard || !out) {
+        set_error(err, err_size, "AOSP shard route is not open", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(route->shard,
+            "SELECT name, qualified_name, label, file_path, start_line, end_line "
+            "FROM nodes WHERE id = ?1;",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP shard node lookup",
+                  sqlite3_errmsg(route->shard));
+        goto done;
+    }
+    sqlite3_bind_int64(stmt, 1, route->local_node_id);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        set_error(err, err_size, "AOSP shard node not found", NULL);
+        goto done;
+    }
+    out->name = dup_column(stmt, 0);
+    out->qualified_name = dup_column(stmt, 1);
+    out->label = dup_column(stmt, 2);
+    out->file_path = dup_column(stmt, 3);
+    out->start_line = sqlite3_column_int(stmt, 4);
+    out->end_line = sqlite3_column_int(stmt, 5);
+    out->repo_id = route->repo_id ? strdup(route->repo_id) : NULL;
+    out->global_id = route->global_id ? strdup(route->global_id) : NULL;
+    out->local_node_id = route->local_node_id;
+    out->repo_path = strdup("");
+    out->manifest_name = strdup("");
+    out->language = strdup("");
+    if (out->repo_id) {
+        size_t project_len = strlen(out->repo_id) + 6;
+        out->project_name = malloc(project_len);
+        if (out->project_name) {
+            (void)snprintf(out->project_name, project_len, "aosp-%s", out->repo_id);
+        }
+    }
+    if (!out->name || !out->qualified_name || !out->label || !out->file_path ||
+        !out->repo_id || !out->global_id || !out->repo_path || !out->manifest_name ||
+        !out->language || (out->repo_id && !out->project_name)) {
+        set_error(err, err_size, "out of memory", NULL);
+        aosp_symbol_clear(out);
+        goto done;
+    }
+    rc = 0;
+done:
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+void cbm_aosp_shard_edges_free(cbm_aosp_shard_edge_t *edges, int count) {
+    if (!edges) return;
+    for (int i = 0; i < count; i++) {
+        free(edges[i].type);
+        free(edges[i].properties);
+        free(edges[i].neighbor_name);
+        free(edges[i].neighbor_qualified_name);
+        free(edges[i].neighbor_label);
+        free(edges[i].neighbor_file_path);
+    }
+    free(edges);
+}
+
+int cbm_aosp_shard_read_edges(const cbm_aosp_shard_route_t *route,
+                              cbm_aosp_shard_edge_direction_t direction,
+                              cbm_aosp_shard_edge_t **edges, int *count,
+                              char *err, size_t err_size) {
+    if (!route || !route->shard || !edges || !count) {
+        set_error(err, err_size, "AOSP shard route is not open", NULL);
+        return -1;
+    }
+    *edges = NULL;
+    *count = 0;
+    const char *sql;
+    if (direction == CBM_AOSP_SHARD_EDGE_OUTGOING) {
+        sql = "SELECT e.id, e.source_id, e.target_id, e.type, e.properties, "
+              "n.id, n.name, n.qualified_name, n.label, n.file_path "
+              "FROM edges e JOIN nodes n ON n.id = e.target_id "
+              "WHERE e.source_id = ?1 ORDER BY n.qualified_name, e.type;";
+    } else {
+        sql = "SELECT e.id, e.source_id, e.target_id, e.type, e.properties, "
+              "n.id, n.name, n.qualified_name, n.label, n.file_path "
+              "FROM edges e JOIN nodes n ON n.id = e.source_id "
+              "WHERE e.target_id = ?1 ORDER BY n.qualified_name, e.type;";
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(route->shard, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP shard edge lookup",
+                  sqlite3_errmsg(route->shard));
+        goto done;
+    }
+    sqlite3_bind_int64(stmt, 1, route->local_node_id);
+    int n = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        set_error(err, err_size, "cannot read AOSP shard edges", sqlite3_errmsg(route->shard));
+        goto done;
+    }
+    if (n == 0) {
+        rc = 0;
+        goto done;
+    }
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_int64(stmt, 1, route->local_node_id);
+    cbm_aosp_shard_edge_t *items = calloc((size_t)n, sizeof(*items));
+    if (!items) {
+        set_error(err, err_size, "out of memory", NULL);
+        goto done;
+    }
+    int stored = 0;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        cbm_aosp_shard_edge_t *item = &items[stored];
+        memset(item, 0, sizeof(*item));
+        item->edge_id = sqlite3_column_int64(stmt, 0);
+        item->source_id = sqlite3_column_int64(stmt, 1);
+        item->target_id = sqlite3_column_int64(stmt, 2);
+        item->type = dup_column(stmt, 3);
+        item->properties = dup_column(stmt, 4);
+        item->neighbor_id = sqlite3_column_int64(stmt, 5);
+        item->neighbor_name = dup_column(stmt, 6);
+        item->neighbor_qualified_name = dup_column(stmt, 7);
+        item->neighbor_label = dup_column(stmt, 8);
+        item->neighbor_file_path = dup_column(stmt, 9);
+        if (!item->type || !item->properties || !item->neighbor_name ||
+            !item->neighbor_qualified_name || !item->neighbor_label ||
+            !item->neighbor_file_path) {
+            cbm_aosp_shard_edges_free(items, stored + 1);
+            set_error(err, err_size, "out of memory", NULL);
+            goto done;
+        }
+        stored++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        set_error(err, err_size, "cannot collect AOSP shard edges", sqlite3_errmsg(route->shard));
+        cbm_aosp_shard_edges_free(items, stored);
+        goto done;
+    }
+    *edges = items;
+    *count = stored;
+    rc = 0;
+done:
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 static void print_aosp_usage(FILE *stream) {
     (void)fprintf(stream,
         "Usage:\n"

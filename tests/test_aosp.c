@@ -440,6 +440,220 @@ TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity) {
     PASS();
 }
 
+static int create_routing_shard(const char *path, int repo_index) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY,source_id INTEGER,target_id INTEGER,"
+        "type TEXT,properties TEXT);";
+    const char *repo_zero =
+        "INSERT INTO nodes VALUES"
+        "(1,'Unique','alpha.Unique','Class','alpha/Unique.java',10,30,'{}'),"
+        "(2,'Helper','alpha.Helper','Class','alpha/Helper.java',40,50,'{}'),"
+        "(3,'Service','alpha.Service','Class','alpha/Service.java',60,70,'{}');"
+        "INSERT INTO edges VALUES"
+        "(1,1,2,'CALLS','{}'),"
+        "(2,2,3,'USES_TYPE','{\"note\":\"test\"}'),"
+        "(3,3,1,'IMPLEMENTS','{}');";
+    const char *repo_one =
+        "INSERT INTO nodes VALUES"
+        "(1,'Other','beta.Other','Class','beta/Other.java',10,30,'{}'),"
+        "(2,'Consumer','beta.Consumer','Class','beta/Consumer.java',40,50,'{}');"
+        "INSERT INTO edges VALUES"
+        "(1,2,1,'CALLS','{}');";
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+             sqlite3_exec(db, repo_index == 0 ? repo_zero : repo_one,
+                          NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_close(db);
+    return rc;
+}
+
+static int mark_repo_indexed(const cbm_aosp_workspace_t *workspace, const char *repo_id,
+                             const char *db_path) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE repos SET status='indexed', db_path=?1 "
+            "WHERE workspace_id=?2 AND repo_id=?3;",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, db_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, repo_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_paths[2][4096];
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/routing-%d.db", root, i);
+        ASSERT_EQ(create_routing_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+        ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[i].repo_id, shard_paths[i]), 0);
+    }
+
+    /* Resolve a symbol to get its global_id via Q1 */
+    cbm_aosp_symbol_resolution_t resolution;
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "alpha.Unique", &resolution, err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.candidate_count, 1);
+    char *unique_global_id = strdup(resolution.candidates[0].global_id);
+    ASSERT_NOT_NULL(unique_global_id);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    /* Q2: Route by global_id to the owning shard */
+    cbm_aosp_shard_route_t route;
+    ASSERT_EQ(cbm_aosp_shard_route(&workspace, unique_global_id, &route, err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(route.shard);
+    ASSERT_STR_EQ(route.repo_id, workspace.repos[0].repo_id);
+    ASSERT_EQ(route.local_node_id, 1);
+    ASSERT_STR_EQ(route.global_id, unique_global_id);
+    ASSERT_NOT_NULL(route.shard_path);
+    ASSERT_STR_EQ(route.shard_path, shard_paths[0]);
+
+    /* Read the routed node from the shard */
+    cbm_aosp_symbol_t *node = calloc(1, sizeof(*node));
+    ASSERT_NOT_NULL(node);
+    ASSERT_EQ(cbm_aosp_shard_read_node(&route, node, err, sizeof(err)), 0);
+    ASSERT_STR_EQ(node->name, "Unique");
+    ASSERT_STR_EQ(node->qualified_name, "alpha.Unique");
+    ASSERT_STR_EQ(node->label, "Class");
+    ASSERT_STR_EQ(node->file_path, "alpha/Unique.java");
+    ASSERT_EQ(node->start_line, 10);
+    ASSERT_EQ(node->end_line, 30);
+    ASSERT_EQ(node->local_node_id, 1);
+    ASSERT_STR_EQ(node->repo_id, workspace.repos[0].repo_id);
+    ASSERT_STR_EQ(node->global_id, unique_global_id);
+    cbm_aosp_symbols_free(node, 1);
+
+    /* Read outgoing edges: Unique -> Helper (CALLS) */
+    cbm_aosp_shard_edge_t *out_edges = NULL;
+    int out_count = 0;
+    ASSERT_EQ(cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_OUTGOING,
+                                        &out_edges, &out_count, err, sizeof(err)), 0);
+    ASSERT_EQ(out_count, 1);
+    ASSERT_STR_EQ(out_edges[0].type, "CALLS");
+    ASSERT_EQ(out_edges[0].source_id, 1);
+    ASSERT_EQ(out_edges[0].target_id, 2);
+    ASSERT_EQ(out_edges[0].neighbor_id, 2);
+    ASSERT_STR_EQ(out_edges[0].neighbor_name, "Helper");
+    ASSERT_STR_EQ(out_edges[0].neighbor_qualified_name, "alpha.Helper");
+    ASSERT_STR_EQ(out_edges[0].neighbor_label, "Class");
+    cbm_aosp_shard_edges_free(out_edges, out_count);
+
+    /* Read incoming edges: Service -> Unique (IMPLEMENTS) */
+    cbm_aosp_shard_edge_t *in_edges = NULL;
+    int in_count = 0;
+    ASSERT_EQ(cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_INCOMING,
+                                        &in_edges, &in_count, err, sizeof(err)), 0);
+    ASSERT_EQ(in_count, 1);
+    ASSERT_STR_EQ(in_edges[0].type, "IMPLEMENTS");
+    ASSERT_EQ(in_edges[0].source_id, 3);
+    ASSERT_EQ(in_edges[0].target_id, 1);
+    ASSERT_EQ(in_edges[0].neighbor_id, 3);
+    ASSERT_STR_EQ(in_edges[0].neighbor_name, "Service");
+    ASSERT_STR_EQ(in_edges[0].neighbor_qualified_name, "alpha.Service");
+    cbm_aosp_shard_edges_free(in_edges, in_count);
+    cbm_aosp_shard_route_close(&route);
+
+    /* Q2: Route by resolved symbol (skips Master global_id lookup) */
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "alpha.Unique", &resolution, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_shard_route_symbol(&workspace, resolution.candidates, &route,
+                                          err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(route.shard);
+    ASSERT_EQ(route.local_node_id, 1);
+    ASSERT_STR_EQ(route.repo_id, workspace.repos[0].repo_id);
+    cbm_aosp_shard_route_close(&route);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    /* Q2: Route to repo 1 and verify cross-shard isolation */
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "beta.Consumer", &resolution, err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    char *consumer_global_id = strdup(resolution.candidates[0].global_id);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_shard_route(&workspace, consumer_global_id, &route, err, sizeof(err)), 0);
+    ASSERT_STR_EQ(route.repo_id, workspace.repos[1].repo_id);
+    ASSERT_EQ(route.local_node_id, 2);
+    ASSERT_STR_EQ(route.shard_path, shard_paths[1]);
+    node = calloc(1, sizeof(*node));
+    ASSERT_NOT_NULL(node);
+    ASSERT_EQ(cbm_aosp_shard_read_node(&route, node, err, sizeof(err)), 0);
+    ASSERT_STR_EQ(node->qualified_name, "beta.Consumer");
+    cbm_aosp_symbols_free(node, 1);
+
+    /* Consumer has outgoing CALLS to Other, no incoming edges */
+    ASSERT_EQ(cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_OUTGOING,
+                                        &out_edges, &out_count, err, sizeof(err)), 0);
+    ASSERT_EQ(out_count, 1);
+    ASSERT_STR_EQ(out_edges[0].type, "CALLS");
+    ASSERT_STR_EQ(out_edges[0].neighbor_qualified_name, "beta.Other");
+    cbm_aosp_shard_edges_free(out_edges, out_count);
+
+    ASSERT_EQ(cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_INCOMING,
+                                        &in_edges, &in_count, err, sizeof(err)), 0);
+    ASSERT_EQ(in_count, 0);
+    cbm_aosp_shard_route_close(&route);
+    free(consumer_global_id);
+
+    /* Q2: Missing global_id returns error */
+    ASSERT_EQ(cbm_aosp_shard_route(&workspace, "nonexistent-global-id-000000",
+                                   &route, err, sizeof(err)), -1);
+    ASSERT(strstr(err, "not found") != NULL);
+
+    /* Q2: Routing to a repo without indexed shard fails */
+    {
+        sqlite3 *master = NULL;
+        char master_path[4096];
+        ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+        ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+        sqlite3_stmt *ins = NULL;
+        ASSERT_EQ(sqlite3_prepare_v2(master,
+            "INSERT INTO symbols(global_id,workspace_id,repo_id,local_node_id,name,"
+            "qualified_name,label,qualified_leaf,file_path,start_line,end_line,properties) "
+            "VALUES('fake-orphan-id',?1,'orphan-repo',1,'Orphan','orphan.Orphan',"
+            "'Class','Orphan','orphan.java',1,2,'{}');",
+            -1, &ins, NULL), SQLITE_OK);
+        sqlite3_bind_text(ins, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(ins), SQLITE_DONE);
+        sqlite3_finalize(ins);
+        ASSERT_EQ(sqlite3_prepare_v2(master,
+            "INSERT OR IGNORE INTO repos(repo_id,workspace_id,manifest_name,path,abs_path,"
+            "status,generation) VALUES('orphan-repo',?1,'orphan','orphan','/orphan',"
+            "'discovered','g');",
+            -1, &ins, NULL), SQLITE_OK);
+        sqlite3_bind_text(ins, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(ins), SQLITE_DONE);
+        sqlite3_finalize(ins);
+        sqlite3_close(master);
+    }
+    ASSERT_EQ(cbm_aosp_shard_route(&workspace, "fake-orphan-id", &route, err, sizeof(err)), -1);
+    ASSERT(strstr(err, "not indexed") != NULL);
+
+    free(unique_global_id);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_build_graph_resolves_cross_repo_modules) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1405,6 +1619,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_master_sync_and_stats);
     RUN_TEST(aosp_catalog_and_global_symbol_search);
     RUN_TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity);
+    RUN_TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);

@@ -15,6 +15,8 @@
 #define CBM_AOSP_ID_LEN 32
 #define CBM_AOSP_HASH_LEN 64
 
+typedef struct sqlite3 sqlite3;
+
 typedef struct {
     char *name;      /* manifest project name, e.g. platform/frameworks/base */
     char *path;      /* workspace-relative checkout path, e.g. frameworks/base */
@@ -123,6 +125,65 @@ void cbm_aosp_symbols_free(cbm_aosp_symbol_t *results, int count);
 int cbm_aosp_resolve_symbol(const cbm_aosp_workspace_t *workspace, const char *reference,
                             cbm_aosp_symbol_resolution_t *out, char *err, size_t err_size);
 void cbm_aosp_symbol_resolution_free(cbm_aosp_symbol_resolution_t *resolution);
+
+/* Q2: Shard routing from Master symbol IDs to repository databases.
+ * A route owns an open read-only shard handle and must be closed with
+ * cbm_aosp_shard_route_close. */
+typedef struct {
+    sqlite3 *shard;        /* open read-only shard database, or NULL */
+    char *shard_path;      /* filesystem path of the shard database */
+    char *repo_id;         /* repository that owns this shard */
+    char *global_id;       /* Master global symbol id */
+    int64_t local_node_id; /* node id within the shard */
+} cbm_aosp_shard_route_t;
+
+typedef enum {
+    CBM_AOSP_SHARD_EDGE_OUTGOING = 0,
+    CBM_AOSP_SHARD_EDGE_INCOMING = 1,
+} cbm_aosp_shard_edge_direction_t;
+
+typedef struct {
+    int64_t edge_id;
+    int64_t source_id;
+    int64_t target_id;
+    char *type;
+    char *properties;
+    /* The neighbor is the node on the opposite end of the edge:
+     * target for outgoing edges, source for incoming edges. */
+    int64_t neighbor_id;
+    char *neighbor_name;
+    char *neighbor_qualified_name;
+    char *neighbor_label;
+    char *neighbor_file_path;
+} cbm_aosp_shard_edge_t;
+
+/* Route a Master global symbol id to its owning repository shard.
+ * The shard is opened read-only. Returns 0 on success, -1 on missing
+ * symbol, missing shard path, unreadable shard, or database error. */
+int cbm_aosp_shard_route(const cbm_aosp_workspace_t *workspace, const char *global_id,
+                         cbm_aosp_shard_route_t *out, char *err, size_t err_size);
+
+/* Route a resolved symbol directly, skipping the Master global_id lookup.
+ * Useful when the caller already has a Q1 resolution result. */
+int cbm_aosp_shard_route_symbol(const cbm_aosp_workspace_t *workspace,
+                                const cbm_aosp_symbol_t *symbol,
+                                cbm_aosp_shard_route_t *out, char *err, size_t err_size);
+
+void cbm_aosp_shard_route_close(cbm_aosp_shard_route_t *route);
+
+/* Read the routed node from its shard. The returned symbol owns all
+ * strings and must be freed with aosp_symbol_clear or cbm_aosp_symbols_free. */
+int cbm_aosp_shard_read_node(const cbm_aosp_shard_route_t *route, cbm_aosp_symbol_t *out,
+                             char *err, size_t err_size);
+
+/* Read edges from the routed node's shard in the given direction.
+ * For outgoing edges, the neighbor is the target; for incoming, the
+ * source. Results are owned by the caller and must be freed. */
+int cbm_aosp_shard_read_edges(const cbm_aosp_shard_route_t *route,
+                              cbm_aosp_shard_edge_direction_t direction,
+                              cbm_aosp_shard_edge_t **edges, int *count,
+                              char *err, size_t err_size);
+void cbm_aosp_shard_edges_free(cbm_aosp_shard_edge_t *edges, int count);
 
 /* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
 int cbm_cmd_aosp(int argc, char **argv);

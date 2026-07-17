@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `Q2` - implement Master-to-shard routing.
-- Next task: `Q3` - implement cross-shard `trace_path` traversal.
-- Worktree baseline: `552dca2` on `codex/aosp-federated-graph`.
+- Current task: `Q3` - implement cross-shard `trace_path` traversal.
+- Next task: `Q4` - implement a read-only federated `query_graph` surface.
+- Worktree baseline: Q2 shard routing commit on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -104,7 +104,7 @@ complete:
 
 - [x] `Q1` Implement a workspace-level symbol resolver with exact, qualified,
   suffix, and explicit ambiguity results.
-- [ ] `Q2` Implement shard routing from Master symbol IDs to repository databases.
+- [x] `Q2` Implement shard routing from Master symbol IDs to repository databases.
 - [ ] `Q3` Implement cross-shard `trace_path` traversal with depth, direction,
   cycle, result-budget, and cancellation controls.
 - [ ] `Q4` Implement a read-only federated `query_graph` surface for supported
@@ -232,3 +232,4 @@ unaccepted critical coverage gap.
 | `F5` | `c57883b` | Schema v5 refresh queue/state and indexed dependency leaf, v3/v4 migrations, three-repository selective refresh, retry retention, 178 focused tests, production incremental federation smoke |
 | `F6` | `4c3b29d` | Schema v6 refresh-failure retention, CLI/MCP coverage parity, stale edge reporting, failed-refresh retry cleanup, 178 focused tests, production `-Werror` build and dual-entry status smoke |
 | `Q1` | `552dca2` | Deterministic global-ID/QN/suffix/short-name resolver, explicit ambiguity and bounded candidate reporting, schema v7 indexed leaf migration, mixed C++/Rust separator normalization, 179 focused tests, production `-Werror` build and real C++ shard/index-plan smoke |
+| `Q2` | pending commit | Master-to-shard routing by global_id and resolved symbol, read-only shard node/edge reads with outgoing/incoming direction, missing-symbol and unindexed-repo error paths, 180 focused tests, production `-Werror` build |
