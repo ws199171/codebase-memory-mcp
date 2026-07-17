@@ -41,8 +41,8 @@ complete:
 ## Current Queue
 
 - Current task: none.
-- Next task: `F1` - define the cross-repository symbol-edge contract and lifecycle.
-- Worktree baseline: `d57b988` on `codex/aosp-federated-graph`.
+- Next task: `F2` - collect cross-repository structural relationship candidates.
+- Worktree baseline: `21e7483` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -79,7 +79,7 @@ complete:
 
 ### F - Federated Cross-Repository Code Graph
 
-- [ ] `F1` Define the `cross_symbol_edges` contract, identity rules, supported edge
+- [x] `F1` Define the `cross_symbol_edges` contract, identity rules, supported edge
   types, evidence fields, unresolved representation, and refresh lifecycle.
   Acceptance: schema/API tests prove deterministic IDs, workspace isolation,
   idempotent refresh, and stale-edge deletion for one refreshed repository.
@@ -225,3 +225,4 @@ unaccepted critical coverage gap.
 | `W1-W7` | `b998b08` | AOSP manifest, catalog, CLI, and MCP focused tests |
 | `B0.1-B0.6` | `f0863a6` | Cross-repository module fixture and sanitizer suite |
 | `P0.1-P0.7` | `d57b988` | Binder/JNI fixture, 173 focused tests, production smoke |
+| `F1` | `21e7483` | v3 migration, deterministic/isolated refresh tests, 176 focused tests, production schema v4 smoke |
