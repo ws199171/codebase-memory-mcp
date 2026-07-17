@@ -553,6 +553,10 @@ codebase-memory-mcp aosp index /path/to/aosp --repo frameworks/base
 codebase-memory-mcp aosp build /path/to/aosp
 codebase-memory-mcp aosp modules /path/to/aosp --query libbinder
 
+# Link and inspect Binder/AIDL/JNI protocol evidence after repository indexing.
+codebase-memory-mcp aosp link /path/to/aosp
+codebase-memory-mcp aosp protocols /path/to/aosp --query IAudioFlinger
+
 # Inspect coverage and search definitions across all indexed repositories.
 codebase-memory-mcp aosp status /path/to/aosp
 codebase-memory-mcp aosp repos /path/to/aosp
@@ -568,9 +572,11 @@ The shard contains the complete graph produced for that repository. The Master
 provides manifest topology, index state, global definition-symbol lookup, and a
 workspace build graph extracted from Soong `Android.bp`, `Android.mk`, and AIDL
 declarations. Declared dependencies are retained even when their target cannot
-be resolved, so architecture coverage remains visible. Binder transaction and
-JNI registration links between source symbols require the later protocol-linking
-pass; they are not inferred merely by completing shard and build indexing.
+be resolved, so architecture coverage remains visible. The protocol linker maps
+AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy`
+symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
+registration tables. Each protocol edge records its confidence and evidence;
+ambiguous name-only candidates are not linked.
 
 ## MCP Tools
 
@@ -596,6 +602,7 @@ pass; they are not inferred merely by completing shard and build indexing.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
 | `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules and workspace dependency coverage. |
+| `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |

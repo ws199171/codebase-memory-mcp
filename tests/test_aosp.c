@@ -4,6 +4,7 @@
 
 #include "aosp/aosp.h"
 #include "aosp/build_graph.h"
+#include "aosp/protocol_graph.h"
 #include "foundation/compat_fs.h"
 #include "mcp/mcp.h"
 
@@ -63,6 +64,12 @@ static int create_workspace_fixture(char **root_out) {
             "aidl_interface { name: \"android.media.audio\", imports: [\"vendor.acme.audio\"] }\n") != 0 ||
         write_relative(root, "frameworks/base/media/IAudioService.aidl",
             "package android.media;\ninterface IAudioService { void start(); }\n") != 0 ||
+        write_relative(root, "frameworks/base/media/jni.cpp",
+            "static void nativeClose() {}\n"
+            "static const JNINativeMethod gMethods[] = {\n"
+            "  {\"nativeClose\", \"()V\", (void*) nativeClose},\n"
+            "};\n"
+            "registerNativeMethods(env, \"android/media/AudioSystem\", gMethods, 1);\n") != 0 ||
         write_relative(root, "vendor/acme/widgets/Android.bp",
             "aidl_interface { name: \"vendor.acme.audio\" }\n") != 0 ||
         write_relative(root, "vendor/acme/widgets/Android.mk",
@@ -289,6 +296,66 @@ TEST(aosp_build_graph_resolves_cross_repo_modules) {
     PASS();
 }
 
+TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_path[4096];
+    (void)snprintf(shard_path, sizeof(shard_path), "%s/protocol-shard.db", root);
+    sqlite3 *shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_path, &shard), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(shard,
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "INSERT INTO nodes VALUES"
+        "(1,'start','aosp.media.BnAudioService.start','Method','media/BnAudioService.cpp',1,3,'{}'),"
+        "(2,'start','aosp.media.BpAudioService.start','Method','media/BpAudioService.cpp',1,3,'{}'),"
+        "(3,'nativeOpen','aosp.android.media.AudioSystem.nativeOpen','Method','media/AudioSystem.java',4,4,'{}'),"
+        "(4,'Java_android_media_AudioSystem_nativeOpen','aosp.jni.Java_android_media_AudioSystem_nativeOpen','Function','media/jni.cpp',5,5,'{}'),"
+        "(5,'nativeClose','aosp.android.media.AudioSystem.nativeClose','Method','media/AudioSystem.java',6,6,'{}'),"
+        "(6,'nativeClose','aosp.jni.nativeClose','Function','media/jni.cpp',1,1,'{}'),"
+        "(7,'nativeClose','aosp.other.nativeClose','Function','media/other.cpp',1,1,'{}');",
+        NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(shard);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[0], shard_path,
+                                       err, sizeof(err)), 0);
+
+    cbm_aosp_protocol_stats_t stats;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.aidl_interfaces, 1);
+    ASSERT_EQ(stats.aidl_methods, 1);
+    ASSERT_EQ(stats.binder_server_edges, 1);
+    ASSERT_EQ(stats.binder_client_edges, 1);
+    ASSERT_EQ(stats.jni_static_edges, 1);
+    ASSERT_EQ(stats.jni_dynamic_edges, 1);
+
+    cbm_aosp_protocol_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_aosp_search_protocols(&workspace, "IAudioService", 20, &nodes,
+                                        &count, err, sizeof(err)), 0);
+    ASSERT(count >= 2);
+    cbm_aosp_protocol_nodes_free(nodes, count);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"IAudioService\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_trace_protocol", args);
+    ASSERT(response != NULL);
+    ASSERT(strstr(response, "\"isError\":false") != NULL);
+    ASSERT(strstr(response, "binder_server_edges") != NULL);
+    ASSERT(strstr(response, "aidl_method_generated_owner") != NULL);
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(aosp) {
     RUN_TEST(aosp_manifest_include_and_local_override);
     RUN_TEST(aosp_manifest_rejects_parent_path);
@@ -297,4 +364,5 @@ SUITE(aosp) {
     RUN_TEST(aosp_master_sync_and_stats);
     RUN_TEST(aosp_catalog_and_global_symbol_search);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
+    RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
 }

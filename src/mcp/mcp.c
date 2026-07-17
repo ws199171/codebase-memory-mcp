@@ -40,6 +40,7 @@ enum {
 #include "mcp/mcp.h"
 #include "aosp/aosp.h"
 #include "aosp/build_graph.h"
+#include "aosp/protocol_graph.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -608,6 +609,15 @@ static const tool_def_t TOOLS[] = {
      "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500}},"
      "\"required\":[\"workspace_root\"]}"},
 
+    {"aosp_trace_protocol", "Trace AOSP protocol",
+     "Read Binder/AIDL/JNI protocol nodes and link coverage from an AOSP workspace. "
+     "Run the CLI aosp link command after shard indexing to refresh protocol evidence.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Optional interface, method, class, or kind filter\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500}},"
+     "\"required\":[\"workspace_root\"]}"},
+
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
@@ -646,6 +656,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"manage_adr", false, true, false, false},
     {"aosp_search_symbols", true, false, true, false},
     {"aosp_get_architecture", true, false, true, false},
+    {"aosp_trace_protocol", true, false, true, false},
     {"ingest_traces", false, false, false, false},
 };
 
@@ -697,11 +708,13 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
         "index_status",     "check_index_coverage", "detect_changes", "aosp_search_symbols",
         "aosp_get_architecture",
+        "aosp_trace_protocol",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
         "list_projects", "index_status", "check_index_coverage", "aosp_search_symbols",
         "aosp_get_architecture",
+        "aosp_trace_protocol",
     };
     if (!name) {
         return false;
@@ -7918,6 +7931,8 @@ static char *handle_aosp_get_architecture(const char *args) {
     char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
     char *query = cbm_mcp_get_string_arg(args, "query");
     int limit = cbm_mcp_get_int_arg(args, "limit", 50);
+    if (limit <= 0) limit = 50;
+    if (limit > 500) limit = 500;
     if (!workspace_root || !workspace_root[0]) {
         free(workspace_root);
         free(query);
@@ -7960,6 +7975,87 @@ static char *handle_aosp_get_architecture(const char *args) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     cbm_aosp_modules_free(modules, count);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(query);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static char *handle_aosp_trace_protocol(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 50);
+    if (limit <= 0) limit = 50;
+    if (limit > 500) limit = 500;
+    if (!workspace_root || !workspace_root[0]) {
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result("workspace_root is required", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    cbm_aosp_protocol_stats_t stats;
+    cbm_aosp_protocol_node_t *nodes = NULL;
+    cbm_aosp_protocol_edge_t *edges = NULL;
+    int count = 0;
+    int edge_count = 0;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        cbm_aosp_protocol_stats(&workspace, &stats, err, sizeof(err)) != 0 ||
+        cbm_aosp_search_protocols(&workspace, query, limit, &nodes, &count,
+                                  err, sizeof(err)) != 0 ||
+        cbm_aosp_search_protocol_edges(&workspace, query, limit * 2, &edges, &edge_count,
+                                       err, sizeof(err)) != 0) {
+        cbm_aosp_protocol_nodes_free(nodes, count);
+        cbm_aosp_protocol_edges_free(edges, edge_count);
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP protocol query failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_int(doc, root, "nodes_total", stats.node_count);
+    yyjson_mut_obj_add_int(doc, root, "edges_total", stats.edge_count);
+    yyjson_mut_obj_add_int(doc, root, "aidl_interfaces", stats.aidl_interfaces);
+    yyjson_mut_obj_add_int(doc, root, "aidl_methods", stats.aidl_methods);
+    yyjson_mut_obj_add_int(doc, root, "binder_server_edges", stats.binder_server_edges);
+    yyjson_mut_obj_add_int(doc, root, "binder_client_edges", stats.binder_client_edges);
+    yyjson_mut_obj_add_int(doc, root, "jni_static_edges", stats.jni_static_edges);
+    yyjson_mut_obj_add_int(doc, root, "jni_dynamic_edges", stats.jni_dynamic_edges);
+    yyjson_mut_obj_add_int(doc, root, "count", count);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "repo", nodes[i].repo_path);
+        yyjson_mut_obj_add_strcpy(doc, item, "kind", nodes[i].kind);
+        yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name);
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name", nodes[i].qualified_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "file", nodes[i].file_path);
+        yyjson_mut_obj_add_int(doc, item, "outgoing_edges", nodes[i].outgoing_edges);
+        yyjson_mut_obj_add_int(doc, item, "incoming_edges", nodes[i].incoming_edges);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "nodes", items);
+    yyjson_mut_obj_add_int(doc, root, "edge_count", edge_count);
+    yyjson_mut_val *edge_items = yyjson_mut_arr(doc);
+    for (int i = 0; i < edge_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "source", edges[i].source_qualified_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "target", edges[i].target_qualified_name);
+        yyjson_mut_obj_add_strcpy(doc, item, "type", edges[i].type);
+        yyjson_mut_obj_add_real(doc, item, "confidence", edges[i].confidence);
+        yyjson_mut_obj_add_strcpy(doc, item, "evidence", edges[i].evidence);
+        yyjson_mut_arr_add_val(edge_items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "edges", edge_items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_protocol_nodes_free(nodes, count);
+    cbm_aosp_protocol_edges_free(edges, edge_count);
     cbm_aosp_workspace_free(&workspace);
     free(workspace_root);
     free(query);
@@ -8030,6 +8126,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "aosp_get_architecture") == 0) {
         return handle_aosp_get_architecture(args_json);
+    }
+    if (strcmp(tool_name, "aosp_trace_protocol") == 0) {
+        return handle_aosp_trace_protocol(args_json);
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);

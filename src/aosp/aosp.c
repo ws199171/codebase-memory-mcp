@@ -8,6 +8,7 @@
  */
 #include "aosp/aosp.h"
 #include "aosp/build_graph.h"
+#include "aosp/protocol_graph.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -683,6 +684,7 @@ static const char *AOSP_SCHEMA =
     "CREATE TABLE IF NOT EXISTS schema_versions(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(1,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(3,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -728,6 +730,15 @@ static const char *AOSP_SCHEMA =
     " source_global_id TEXT NOT NULL, target_global_id TEXT NOT NULL, type TEXT NOT NULL,"
     " confidence REAL NOT NULL DEFAULT 0, evidence TEXT DEFAULT '', properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_global_id,target_global_id,type));"
+    "CREATE TABLE IF NOT EXISTS protocol_nodes("
+    " protocol_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
+    " kind TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL, file_path TEXT DEFAULT '',"
+    " symbol_global_id TEXT, properties TEXT DEFAULT '{}');"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_protocol_nodes_name ON protocol_nodes(workspace_id,name);"
+    "CREATE TABLE IF NOT EXISTS protocol_edges("
+    " source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL, confidence REAL NOT NULL,"
+    " evidence TEXT NOT NULL, properties TEXT DEFAULT '{}',"
+    " PRIMARY KEY(source_id,target_id,type,evidence));"
     "CREATE TABLE IF NOT EXISTS architecture_summaries("
     " scope_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, scope_type TEXT NOT NULL,"
     " summary TEXT NOT NULL, source_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
@@ -1214,6 +1225,8 @@ static void print_aosp_usage(FILE *stream) {
         "  codebase-memory-mcp aosp index [root] [--repo manifest-path]\n"
         "  codebase-memory-mcp aosp build [root]\n"
         "  codebase-memory-mcp aosp modules [root] [--query text] [--limit N]\n"
+        "  codebase-memory-mcp aosp link [root]\n"
+        "  codebase-memory-mcp aosp protocols [root] [--query text] [--limit N]\n"
         "  codebase-memory-mcp aosp status [root]\n"
         "  codebase-memory-mcp aosp repos [root]\n"
         "  codebase-memory-mcp aosp search <query> [root] [--limit N]\n");
@@ -1256,7 +1269,7 @@ int cbm_cmd_aosp(int argc, char **argv) {
                 return 1;
             }
         }
-    } else if (strcmp(action, "modules") == 0) {
+    } else if (strcmp(action, "modules") == 0 || strcmp(action, "protocols") == 0) {
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--query") == 0 && i + 1 < argc) {
                 search_query = argv[++i];
@@ -1358,6 +1371,37 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("%d module%s\n", count, count == 1 ? "" : "s");
         }
         cbm_aosp_modules_free(modules, count);
+    } else if (strcmp(action, "link") == 0) {
+        cbm_aosp_protocol_stats_t stats;
+        if (cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP protocol link failed");
+            exit_code = 1;
+        } else {
+            printf("AOSP protocol graph complete\n");
+            printf("  AIDL: %d interfaces, %d methods\n",
+                   stats.aidl_interfaces, stats.aidl_methods);
+            printf("  Binder: %d server, %d client edges\n",
+                   stats.binder_server_edges, stats.binder_client_edges);
+            printf("  JNI: %d static, %d dynamic edges\n",
+                   stats.jni_static_edges, stats.jni_dynamic_edges);
+            printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);
+        }
+    } else if (strcmp(action, "protocols") == 0) {
+        cbm_aosp_protocol_node_t *nodes = NULL;
+        int count = 0;
+        if (cbm_aosp_search_protocols(&workspace, search_query, search_limit, &nodes, &count,
+                                      err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP protocol search failed");
+            exit_code = 1;
+        } else {
+            for (int i = 0; i < count; i++) {
+                printf("%s\t%s\t%s\t%s\tout:%d\tin:%d\n", nodes[i].repo_path,
+                       nodes[i].kind, nodes[i].qualified_name, nodes[i].file_path,
+                       nodes[i].outgoing_edges, nodes[i].incoming_edges);
+            }
+            printf("%d protocol node%s\n", count, count == 1 ? "" : "s");
+        }
+        cbm_aosp_protocol_nodes_free(nodes, count);
     } else if (strcmp(action, "status") == 0) {
         cbm_aosp_master_stats_t stats;
         if (cbm_aosp_master_stats(&workspace, &stats, err, sizeof(err)) != 0) {
