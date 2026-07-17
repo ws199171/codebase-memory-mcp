@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `F3` - resolve cross-repository calls and usages.
+- Current task: none.
 - Next task: `F4` - add ambiguity handling, confidence scoring, and evidence retention.
-- Worktree baseline: `079c82c` on `codex/aosp-federated-graph`.
+- Worktree baseline: `0b1774e` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -87,7 +87,7 @@ complete:
   implementation, and annotation candidates from repository shards.
   Acceptance: a multi-repository fixture produces each supported candidate class
   without creating edges for local-only relationships.
-- [ ] `F3` Resolve cross-repository calls and usages to definition symbols.
+- [x] `F3` Resolve cross-repository calls and usages to definition symbols.
   Acceptance: C/C++, Java, Kotlin, and Rust fixtures cover direct, qualified, and
   unresolved references across repositories.
 - [ ] `F4` Add ambiguity handling, confidence scoring, and evidence retention.
@@ -227,3 +227,4 @@ unaccepted critical coverage gap.
 | `P0.1-P0.7` | `d57b988` | Binder/JNI fixture, 173 focused tests, production smoke |
 | `F1` | `21e7483` | v3 migration, deterministic/isolated refresh tests, 176 focused tests, production schema v4 smoke |
 | `F2` | `d53eb01` | Six structural edge classes, local-edge exclusion, 177 focused tests, production `aosp federate` smoke |
+| `F3` | `0b1774e` | C/C++, Java, Kotlin, and Rust calls/usages; local, ambiguous, unresolved coverage; 177 focused tests; production two-repository federation smoke |
