@@ -848,7 +848,17 @@ int cbm_aosp_master_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_master
     }
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "SELECT count(*),sum(status<>'missing'),sum(status='missing'),sum(status='indexed'),sum(status='error') "
+        "SELECT count(*),coalesce(sum(status<>'missing'),0),coalesce(sum(status='missing'),0),"
+        "coalesce(sum(status='indexed'),0),coalesce(sum(status='error'),0),"
+        "(SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND status='resolved'),"
+        "(SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND status='ambiguous'),"
+        "(SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND status='unresolved'),"
+        "(SELECT count(*) FROM cross_edge_refresh_queue WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM cross_symbol_edges e WHERE e.workspace_id=?1 AND EXISTS("
+        "SELECT 1 FROM cross_edge_refresh_queue q WHERE q.workspace_id=e.workspace_id "
+        "AND q.source_repo_id=e.source_repo_id)),"
+        "(SELECT count(*) FROM cross_edge_refresh_failures WHERE workspace_id=?1) "
         "FROM repos WHERE workspace_id=?1;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         set_error(err, err_size, "cannot read AOSP master database", sqlite3_errmsg(db));
@@ -863,6 +873,13 @@ int cbm_aosp_master_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_master
         out->missing_count = sqlite3_column_int(stmt, 2);
         out->indexed_count = sqlite3_column_int(stmt, 3);
         out->error_count = sqlite3_column_int(stmt, 4);
+        out->cross_edge_count = sqlite3_column_int(stmt, 5);
+        out->resolved_edge_count = sqlite3_column_int(stmt, 6);
+        out->ambiguous_edge_count = sqlite3_column_int(stmt, 7);
+        out->unresolved_edge_count = sqlite3_column_int(stmt, 8);
+        out->stale_repo_count = sqlite3_column_int(stmt, 9);
+        out->stale_edge_count = sqlite3_column_int(stmt, 10);
+        out->refresh_failed_count = sqlite3_column_int(stmt, 11);
         rc = 0;
     }
     sqlite3_finalize(stmt);
@@ -1480,6 +1497,12 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("  repositories: %d\n  present: %d\n  missing: %d\n  indexed: %d\n  errors: %d\n",
                    stats.repo_count, stats.existing_count, stats.missing_count,
                    stats.indexed_count, stats.error_count);
+            printf("  cross edges: %d\n  resolved: %d\n  ambiguous: %d\n  unresolved: %d\n",
+                   stats.cross_edge_count, stats.resolved_edge_count,
+                   stats.ambiguous_edge_count, stats.unresolved_edge_count);
+            printf("  stale repositories: %d\n  stale edges: %d\n  refresh failures: %d\n",
+                   stats.stale_repo_count, stats.stale_edge_count,
+                   stats.refresh_failed_count);
         }
     } else if (strcmp(action, "repos") == 0) {
         for (int i = 0; i < workspace.repo_count; i++) {

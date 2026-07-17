@@ -45,7 +45,10 @@ static const char *CROSS_EDGE_REFRESH_SQL =
     " queued_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));"
     "CREATE TABLE IF NOT EXISTS cross_edge_refresh_state("
     " workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,source_generation TEXT NOT NULL,"
-    " refreshed_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));";
+    " refreshed_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));"
+    "CREATE TABLE IF NOT EXISTS cross_edge_refresh_failures("
+    " workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,error_message TEXT NOT NULL,"
+    " failed_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));";
 
 static void fg_error(char *err, size_t err_size, const char *message, const char *detail) {
     if (!err || err_size == 0) return;
@@ -125,7 +128,9 @@ static int insert_schema_versions(sqlite3 *db) {
         "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
         "VALUES(4,strftime('%s','now'));"
         "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
-        "VALUES(5,strftime('%s','now'));", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+        "VALUES(5,strftime('%s','now'));"
+        "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
+        "VALUES(6,strftime('%s','now'));", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
 static int migrate_legacy_edges(sqlite3 *db, char *err, size_t err_size) {
@@ -322,6 +327,52 @@ int cbm_aosp_cross_edge_stats(const cbm_aosp_workspace_t *workspace,
     return rc;
 }
 
+int cbm_aosp_cross_edge_refresh_failed(const cbm_aosp_workspace_t *workspace,
+                                       const cbm_aosp_repo_t *source_repo,
+                                       const char *message, char *err, size_t err_size) {
+    if (!workspace || !source_repo || !message || !message[0]) return -1;
+    if (cbm_aosp_master_sync(workspace, err, err_size) != 0) return -1;
+    char path[FG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *queue_stmt = NULL;
+    sqlite3_stmt *failure_stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(path, &db) != SQLITE_OK ||
+        fg_exec(db, "BEGIN IMMEDIATE;", err, err_size) != 0 ||
+        sqlite3_prepare_v2(db,
+            "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+            "VALUES(?1,?2,'refresh_failed',strftime('%s','now')) "
+            "ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "reason=excluded.reason,queued_at=excluded.queued_at;",
+            -1, &queue_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT INTO cross_edge_refresh_failures(workspace_id,source_repo_id,error_message,"
+            "failed_at) VALUES(?1,?2,?3,strftime('%s','now')) "
+            "ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "error_message=excluded.error_message,failed_at=excluded.failed_at;",
+            -1, &failure_stmt, NULL) != SQLITE_OK) {
+        fg_error(err, err_size, "cannot prepare AOSP refresh failure", sqlite3_errmsg(db));
+        goto done;
+    }
+    sqlite3_bind_text(queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(queue_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(failure_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(failure_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(failure_stmt, 3, message, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(queue_stmt) != SQLITE_DONE || sqlite3_step(failure_stmt) != SQLITE_DONE ||
+        fg_exec(db, "COMMIT;", err, err_size) != 0) {
+        goto done;
+    }
+    rc = 0;
+done:
+    if (rc != 0 && db) (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_finalize(queue_stmt);
+    sqlite3_finalize(failure_stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
 int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
                                  const cbm_aosp_repo_t *source_repo,
                                  const cbm_aosp_cross_edge_candidate_t *candidates,
@@ -344,6 +395,7 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
     sqlite3_stmt *insert_stmt = NULL;
     sqlite3_stmt *state_stmt = NULL;
     sqlite3_stmt *queue_stmt = NULL;
+    sqlite3_stmt *failure_stmt = NULL;
     char *generation = NULL;
     int rc = -1;
     if (sqlite3_open(path, &db) != SQLITE_OK) {
@@ -400,7 +452,10 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
             -1, &state_stmt, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
             "DELETE FROM cross_edge_refresh_queue WHERE workspace_id=?1 AND source_repo_id=?2;",
-            -1, &queue_stmt, NULL) != SQLITE_OK) {
+            -1, &queue_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "DELETE FROM cross_edge_refresh_failures WHERE workspace_id=?1 AND source_repo_id=?2;",
+            -1, &failure_stmt, NULL) != SQLITE_OK) {
         fg_error(err, err_size, "cannot prepare AOSP cross-edge refresh", sqlite3_errmsg(db));
         goto rollback;
     }
@@ -513,7 +568,10 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
     sqlite3_bind_text(state_stmt, 3, generation, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(queue_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(state_stmt) != SQLITE_DONE || sqlite3_step(queue_stmt) != SQLITE_DONE) {
+    sqlite3_bind_text(failure_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(failure_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(state_stmt) != SQLITE_DONE || sqlite3_step(queue_stmt) != SQLITE_DONE ||
+        sqlite3_step(failure_stmt) != SQLITE_DONE) {
         fg_error(err, err_size, "cannot finalize AOSP cross-edge refresh", sqlite3_errmsg(db));
         goto rollback;
     }
@@ -535,6 +593,7 @@ done:
     sqlite3_finalize(insert_stmt);
     sqlite3_finalize(state_stmt);
     sqlite3_finalize(queue_stmt);
+    sqlite3_finalize(failure_stmt);
     sqlite3_close(db);
     return rc;
 }

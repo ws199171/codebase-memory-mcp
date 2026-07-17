@@ -185,6 +185,9 @@ TEST(aosp_master_sync_and_stats) {
     ASSERT_EQ(stats.existing_count, 2);
     ASSERT_EQ(stats.missing_count, 0);
     ASSERT_EQ(stats.indexed_count, 0);
+    ASSERT_EQ(stats.cross_edge_count, 0);
+    ASSERT_EQ(stats.stale_repo_count, 0);
+    ASSERT_EQ(stats.refresh_failed_count, 0);
 
     char db_path[4096];
     ASSERT_EQ(cbm_aosp_master_path(&workspace, db_path, sizeof(db_path), false), 0);
@@ -1124,6 +1127,29 @@ TEST(aosp_federation_refreshes_only_invalidated_repositories) {
     ASSERT_EQ(create_refresh_shard(shard_paths[1], projects[1], 3), 0);
     ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[1], shard_paths[1],
                                        err, sizeof(err)), 0);
+    cbm_aosp_master_stats_t status;
+    ASSERT_EQ(cbm_aosp_master_stats(&workspace, &status, err, sizeof(err)), 0);
+    ASSERT_EQ(status.cross_edge_count, 2);
+    ASSERT_EQ(status.resolved_edge_count, 1);
+    ASSERT_EQ(status.unresolved_edge_count, 1);
+    ASSERT_EQ(status.stale_repo_count, 2);
+    ASSERT_EQ(status.stale_edge_count, 1);
+    ASSERT_EQ(status.refresh_failed_count, 0);
+    ASSERT_EQ(cbm_aosp_cross_edge_refresh_failed(&workspace, &workspace.repos[0],
+                                                  "fixture refresh failure",
+                                                  err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_stats(&workspace, &status, err, sizeof(err)), 0);
+    ASSERT_EQ(status.refresh_failed_count, 1);
+    char status_args[8192];
+    (void)snprintf(status_args, sizeof(status_args),
+                   "{\"workspace_root\":\"%s\"}", root);
+    char *status_response = cbm_mcp_handle_tool(NULL, "aosp_get_status", status_args);
+    ASSERT_NOT_NULL(status_response);
+    ASSERT_NOT_NULL(strstr(status_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(status_response, "stale_repositories"));
+    ASSERT_NOT_NULL(strstr(status_response, "stale_edges"));
+    ASSERT_NOT_NULL(strstr(status_response, "refresh_failures"));
+    free(status_response);
     ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
     ASSERT_EQ(stats.repos_scanned, 2);
     ASSERT_EQ(sqlite3_open(master_path, &db), SQLITE_OK);
@@ -1152,8 +1178,38 @@ TEST(aosp_federation_refreshes_only_invalidated_repositories) {
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 
+    ASSERT_EQ(cbm_aosp_master_stats(&workspace, &status, err, sizeof(err)), 0);
+    ASSERT_EQ(status.cross_edge_count, 2);
+    ASSERT_EQ(status.resolved_edge_count, 0);
+    ASSERT_EQ(status.ambiguous_edge_count, 0);
+    ASSERT_EQ(status.unresolved_edge_count, 2);
+    ASSERT_EQ(status.stale_repo_count, 0);
+    ASSERT_EQ(status.stale_edge_count, 0);
+    ASSERT_EQ(status.refresh_failed_count, 0);
+
     ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
     ASSERT_EQ(stats.repos_scanned, 0);
+    ASSERT_EQ(sqlite3_open(master_path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "UPDATE repos SET db_path='/missing/federation-shard.db' "
+        "WHERE workspace_id=?1 AND repo_id=?2;", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[0].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+        "VALUES(?1,?2,'failure_probe',strftime('%s','now'));", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[0].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    err[0] = '\0';
+    ASSERT_NEQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_stats(&workspace, &status, err, sizeof(err)), 0);
+    ASSERT_EQ(status.stale_repo_count, 1);
+    ASSERT_EQ(status.refresh_failed_count, 1);
     free(unrelated_edge_id);
     cbm_aosp_workspace_free(&workspace);
     th_rmtree(root);

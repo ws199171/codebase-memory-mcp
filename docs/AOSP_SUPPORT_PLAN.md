@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: none.
-- Next task: `F6` - report cross-edge coverage and resolution state.
-- Worktree baseline: `c57883b` on `codex/aosp-federated-graph`.
+- Current task: `F6` - report cross-edge coverage and resolution state.
+- Next task: `Q1` - implement the workspace-level symbol resolver.
+- Worktree baseline: `3731d5c` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 

@@ -88,7 +88,16 @@ reindexed source itself, sources with edges targeting it, and sources whose
 unresolved names may match its new catalog. `aosp federate` scans queued or
 never-refreshed repositories only. A successful per-repository refresh records
 refresh state and clears its queue entry in the same transaction; failures retain
-the entry for retry. Unqueued repository edges and refresh state remain unchanged.
+the entry for retry and record the latest error. A later successful refresh clears
+both the queue entry and failure record atomically. Unqueued repository edges and
+refresh state remain unchanged.
+
+`aosp status` and the read-only MCP `aosp_get_status` tool expose the same coverage
+dimensions: total/present/missing/indexed/failed repositories; total/resolved/
+ambiguous/unresolved cross edges; queued stale repositories; edges owned by those
+stale repositories; and repositories whose latest refresh failed. A stale edge is
+the previously committed edge of a queued source repository. It remains queryable
+until that repository refresh succeeds and atomically replaces its outgoing edges.
 
 `source_generation` records the repository generation observed for the refresh.
 Content-aware invalidation and dependency propagation are implemented by later
@@ -118,3 +127,7 @@ Master schema v5 adds the indexed `target_leaf`, per-source refresh queue, and
 refresh state. Existing v4 databases gain the leaf column in place; legacy rows
 use the compatibility matcher until their source repository is refreshed, after
 which the indexed leaf is populated.
+
+Master schema v6 adds `cross_edge_refresh_failures`, keyed by workspace and source
+repository. The row retains the latest error and failure timestamp for status
+reporting while the refresh queue remains the source of retry work.

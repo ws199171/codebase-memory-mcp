@@ -36,6 +36,13 @@ typedef struct {
     int missing_count;
     int indexed_count;
     int error_count;
+    int cross_edge_count;
+    int resolved_edge_count;
+    int ambiguous_edge_count;
+    int unresolved_edge_count;
+    int stale_repo_count;
+    int stale_edge_count;
+    int refresh_failed_count;
 } cbm_aosp_master_stats_t;
 
 typedef struct {

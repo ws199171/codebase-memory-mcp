@@ -668,6 +668,12 @@ int cbm_aosp_structural_link(const cbm_aosp_workspace_t *workspace,
         int repo_rc = collect_repo(&ctx, db_path, &repo_edges);
         free(db_path);
         if (repo_rc != 0) {
+            char failure_message[SG_REF_MAX];
+            char mark_err[SG_REF_MAX] = {0};
+            (void)snprintf(failure_message, sizeof(failure_message), "%s",
+                           err && err[0] ? err : "repository federation failed");
+            (void)cbm_aosp_cross_edge_refresh_failed(workspace, repo, failure_message,
+                                                     mark_err, sizeof(mark_err));
             candidate_vec_free(&ctx.candidates);
             goto done;
         }

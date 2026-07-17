@@ -49,4 +49,9 @@ int cbm_aosp_cross_edge_stats(const cbm_aosp_workspace_t *workspace,
                               cbm_aosp_cross_edge_stats_t *stats,
                               char *err, size_t err_size);
 
+/* Retain a failed per-repository refresh for status reporting and retry. */
+int cbm_aosp_cross_edge_refresh_failed(const cbm_aosp_workspace_t *workspace,
+                                       const cbm_aosp_repo_t *source_repo,
+                                       const char *message, char *err, size_t err_size);
+
 #endif

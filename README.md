@@ -572,6 +572,8 @@ graphs use stable `aosp-<repo-id>.db` shards in the normal cache directory.
 Re-running `aosp index` refreshes the shard and its Master symbol catalog.
 It also queues only source repositories affected by that catalog change;
 `aosp federate` consumes that queue without rescanning unrelated shards.
+`aosp status` reports repository index failures, resolved/ambiguous/unresolved
+cross-edge coverage, queued stale repositories and edges, and refresh failures.
 
 The shard contains the complete graph produced for that repository. The Master
 provides manifest topology, index state, global definition-symbol lookup, and a
@@ -588,8 +590,7 @@ evidence are tracked in [`docs/AOSP_SUPPORT_PLAN.md`](docs/AOSP_SUPPORT_PLAN.md)
 The workspace-level cross-repository edge identity, status, evidence, and refresh
 rules are defined in [`docs/AOSP_FEDERATED_GRAPH.md`](docs/AOSP_FEDERATED_GRAPH.md).
 The current federation pass collects import/include, type, inheritance,
-implementation, and annotation relationships. Call and usage federation is tracked
-as the next milestone in the execution plan.
+implementation, annotation, call, and usage relationships.
 
 ## MCP Tools
 
@@ -613,6 +614,7 @@ as the next milestone in the execution plan.
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
+| `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
 | `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules and workspace dependency coverage. |
 | `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |

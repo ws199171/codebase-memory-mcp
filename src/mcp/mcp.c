@@ -590,6 +590,13 @@ static const tool_def_t TOOLS[] = {
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
+    {"aosp_get_status", "Get AOSP status",
+     "Read repository indexing, federated edge resolution, stale refresh queue, and failure "
+     "coverage for an AOSP workspace.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"}},"
+     "\"required\":[\"workspace_root\"]}"},
+
     {"aosp_search_symbols", "Search AOSP symbols",
      "Search definition symbols across all indexed repositories in an AOSP workspace. "
      "This is a read-only Master-catalog query; use the CLI aosp init and aosp index "
@@ -654,6 +661,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", false, true, true, false},
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
+    {"aosp_get_status", true, false, true, false},
     {"aosp_search_symbols", true, false, true, false},
     {"aosp_get_architecture", true, false, true, false},
     {"aosp_trace_protocol", true, false, true, false},
@@ -706,13 +714,15 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes", "aosp_search_symbols",
+        "index_status",     "check_index_coverage", "detect_changes", "aosp_get_status",
+        "aosp_search_symbols",
         "aosp_get_architecture",
         "aosp_trace_protocol",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
-        "list_projects", "index_status", "check_index_coverage", "aosp_search_symbols",
+        "list_projects", "index_status", "check_index_coverage", "aosp_get_status",
+        "aosp_search_symbols",
         "aosp_get_architecture",
         "aosp_trace_protocol",
     };
@@ -7927,6 +7937,46 @@ static char *handle_aosp_search_symbols(const char *args) {
     return result;
 }
 
+static char *handle_aosp_get_status(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    if (!workspace_root || !workspace_root[0]) {
+        free(workspace_root);
+        return cbm_mcp_text_result("workspace_root is required", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    cbm_aosp_master_stats_t stats;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        cbm_aosp_master_stats(&workspace, &stats, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP status query failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_int(doc, root, "repositories_total", stats.repo_count);
+    yyjson_mut_obj_add_int(doc, root, "repositories_present", stats.existing_count);
+    yyjson_mut_obj_add_int(doc, root, "repositories_missing", stats.missing_count);
+    yyjson_mut_obj_add_int(doc, root, "repositories_indexed", stats.indexed_count);
+    yyjson_mut_obj_add_int(doc, root, "repositories_failed", stats.error_count);
+    yyjson_mut_obj_add_int(doc, root, "edges_total", stats.cross_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "edges_resolved", stats.resolved_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "edges_ambiguous", stats.ambiguous_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "edges_unresolved", stats.unresolved_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "stale_repositories", stats.stale_repo_count);
+    yyjson_mut_obj_add_int(doc, root, "stale_edges", stats.stale_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "refresh_failures", stats.refresh_failed_count);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
 static char *handle_aosp_get_architecture(const char *args) {
     char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
     char *query = cbm_mcp_get_string_arg(args, "query");
@@ -8123,6 +8173,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "aosp_search_symbols") == 0) {
         return handle_aosp_search_symbols(args_json);
+    }
+    if (strcmp(tool_name, "aosp_get_status") == 0) {
+        return handle_aosp_get_status(args_json);
     }
     if (strcmp(tool_name, "aosp_get_architecture") == 0) {
         return handle_aosp_get_architecture(args_json);
