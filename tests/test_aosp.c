@@ -240,6 +240,9 @@ TEST(aosp_catalog_and_global_symbol_search) {
     ASSERT_STR_EQ(results[0].name, "HandleAudio");
     ASSERT_STR_EQ(results[0].label, "Function");
     ASSERT_STR_EQ(results[0].repo_path, "frameworks/base");
+    ASSERT_EQ((int)strlen(results[0].global_id), CBM_AOSP_HASH_LEN);
+    ASSERT_STR_EQ(results[0].repo_id, workspace.repos[0].repo_id);
+    ASSERT_EQ(results[0].local_node_id, 7);
     ASSERT(strncmp(results[0].project_name, "aosp-", 5) == 0);
     ASSERT_EQ(results[0].start_line, 42);
     cbm_aosp_symbols_free(results, count);
@@ -253,6 +256,183 @@ TEST(aosp_catalog_and_global_symbol_search) {
     ASSERT(strstr(response, "HandleAudio") != NULL);
     ASSERT(strstr(response, "frameworks/base") != NULL);
     free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
+static int create_resolver_shard(const char *path, int repo_index) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);";
+    const char *repo_zero =
+        "INSERT INTO nodes VALUES"
+        "(1,'Unique','alpha.Unique','Class','alpha/Unique.java',10,30,'{}'),"
+        "(2,'run','common.Service.run','Method','common/Service.java',40,50,'{}'),"
+        "(3,'AliasExecute','vendor.deep.Service.execute','Method','vendor/Service.java',60,70,'{}'),"
+        "(4,'Duplicate','one.Duplicate','Class','one/Duplicate.java',80,90,'{}'),"
+        "(5,'ExactDuplicate','shared.ExactDuplicate','Class','shared/Exact.java',100,110,'{}'),"
+        "(6,'call','native.api.Dispatch.call','Function','native/dispatch.cpp',120,130,'{}'),"
+        "(7,'resolveSymbol','mixed.android::query.WorkspaceResolver.resolveSymbol',"
+        "'Method','mixed/resolver.cpp',140,150,'{}');";
+    const char *repo_one =
+        "INSERT INTO nodes VALUES"
+        "(1,'Other','beta.Other','Class','beta/Other.java',10,30,'{}'),"
+        "(2,'run','vendor.common.Service.run','Method','vendor/Service.java',40,50,'{}'),"
+        "(3,'Duplicate','two.Duplicate','Class','two/Duplicate.java',60,70,'{}'),"
+        "(4,'ExactDuplicate','shared.ExactDuplicate','Class','shared/Exact.java',80,90,'{}');";
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+             sqlite3_exec(db, repo_index == 0 ? repo_zero : repo_one,
+                          NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_stmt *stmt = NULL;
+    if (rc == 0 && repo_index == 1 &&
+        sqlite3_prepare_v2(db,
+            "INSERT INTO nodes VALUES(?1,'Crowded',?2,'Function','crowded.cpp',1,2,'{}');",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        for (int i = 0; i < 205 && rc == 0; i++) {
+            char qualified_name[128];
+            (void)snprintf(qualified_name, sizeof(qualified_name),
+                           "crowded.%03d.Crowded", i);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            sqlite3_bind_int(stmt, 1, 100 + i);
+            sqlite3_bind_text(stmt, 2, qualified_name, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+        }
+    } else if (rc == 0 && repo_index == 1) {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    char shard_paths[2][4096];
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/resolver-%d.db", root, i);
+        ASSERT_EQ(create_resolver_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+    }
+    char master_path[4096];
+    sqlite3 *master = NULL;
+    sqlite3_stmt *schema_stmt = NULL;
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(master,
+        "UPDATE symbols SET qualified_leaf='' "
+        "WHERE qualified_name='vendor.deep.Service.execute';"
+        "DELETE FROM schema_versions WHERE version=7;",
+        NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(master);
+    master = NULL;
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(sqlite3_open_v2(master_path, &master, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT (SELECT count(*) FROM schema_versions WHERE version=7),"
+        "(SELECT count(*) FROM symbols WHERE qualified_name='vendor.deep.Service.execute' "
+        "AND qualified_leaf='execute');",
+        -1, &schema_stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(schema_stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(schema_stmt, 0), 1);
+    ASSERT_EQ(sqlite3_column_int(schema_stmt, 1), 1);
+    sqlite3_finalize(schema_stmt);
+    sqlite3_close(master);
+
+    cbm_aosp_symbol_resolution_t resolution;
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "Unique", &resolution, err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_NAME);
+    ASSERT_EQ(resolution.candidate_count, 1);
+    ASSERT_EQ(resolution.total_candidate_count, 1);
+    ASSERT_FALSE(resolution.truncated);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "alpha.Unique");
+    ASSERT_STR_EQ(resolution.candidates[0].repo_id, workspace.repos[0].repo_id);
+    ASSERT_EQ(resolution.candidates[0].local_node_id, 1);
+    char *unique_global_id = strdup(resolution.candidates[0].global_id);
+    ASSERT_NOT_NULL(unique_global_id);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, unique_global_id, &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_GLOBAL_ID);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "alpha.Unique");
+    cbm_aosp_symbol_resolution_free(&resolution);
+    free(unique_global_id);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "common.Service.run", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "common.Service.run");
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "native::api::Dispatch::call", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "native.api.Dispatch.call");
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(
+        &workspace, "android::query::WorkspaceResolver::resolveSymbol", &resolution,
+        err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name,
+                  "mixed.android::query.WorkspaceResolver.resolveSymbol");
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "Service.execute", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_RESOLVED);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "vendor.deep.Service.execute");
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "Duplicate", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_AMBIGUOUS);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_NAME);
+    ASSERT_EQ(resolution.candidate_count, 2);
+    ASSERT_EQ(resolution.total_candidate_count, 2);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "shared.ExactDuplicate", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_AMBIGUOUS);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME);
+    ASSERT_EQ(resolution.candidate_count, 2);
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "Crowded", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_AMBIGUOUS);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_EXACT_NAME);
+    ASSERT_EQ(resolution.candidate_count, 200);
+    ASSERT_EQ(resolution.total_candidate_count, 205);
+    ASSERT_TRUE(resolution.truncated);
+    ASSERT_STR_EQ(resolution.candidates[0].qualified_name, "crowded.000.Crowded");
+    cbm_aosp_symbol_resolution_free(&resolution);
+
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "wrong.Duplicate", &resolution,
+                                      err, sizeof(err)), 0);
+    ASSERT_EQ(resolution.status, CBM_AOSP_SYMBOL_NOT_FOUND);
+    ASSERT_EQ(resolution.match_kind, CBM_AOSP_SYMBOL_MATCH_NONE);
+    ASSERT_EQ(resolution.candidate_count, 0);
+    cbm_aosp_symbol_resolution_free(&resolution);
 
     cbm_aosp_workspace_free(&workspace);
     th_rmtree(root);
@@ -1224,6 +1404,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_workspace_ids_are_root_scoped);
     RUN_TEST(aosp_master_sync_and_stats);
     RUN_TEST(aosp_catalog_and_global_symbol_search);
+    RUN_TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);

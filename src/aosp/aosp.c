@@ -21,6 +21,7 @@
 
 #include <sqlite3.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +37,8 @@ enum {
     AOSP_MAX_INCLUDE_DEPTH = 64,
     AOSP_PATH_BUF = 4096,
     AOSP_DIR_MODE = 0755,
+    AOSP_SYMBOL_REF_BUF = 1024,
+    AOSP_RESOLVE_LIMIT = 200,
 };
 
 typedef struct {
@@ -711,9 +714,11 @@ static const char *AOSP_SCHEMA =
     "CREATE TABLE IF NOT EXISTS symbols("
     " id INTEGER PRIMARY KEY, global_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " local_node_id INTEGER, name TEXT NOT NULL, qualified_name TEXT NOT NULL, label TEXT NOT NULL,"
+    " qualified_leaf TEXT NOT NULL DEFAULT '',"
     " language TEXT DEFAULT '', file_path TEXT NOT NULL, start_line INTEGER DEFAULT 0, end_line INTEGER DEFAULT 0,"
     " visibility TEXT DEFAULT '', signature TEXT DEFAULT '', docstring TEXT DEFAULT '', properties TEXT DEFAULT '{}');"
     "CREATE INDEX IF NOT EXISTS idx_aosp_symbols_name ON symbols(workspace_id,name);"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_symbols_qn ON symbols(workspace_id,qualified_name);"
     "CREATE INDEX IF NOT EXISTS idx_aosp_symbols_repo ON symbols(repo_id);"
     "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5("
     " name,qualified_name,signature,docstring,content='symbols',content_rowid='id');"
@@ -744,6 +749,88 @@ static const char *AOSP_SCHEMA =
     " workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT DEFAULT '',"
     " PRIMARY KEY(workspace_id,repo_id,kind));";
 
+static bool aosp_table_has_column(sqlite3 *db, const char *table, const char *column) {
+    char sql[256];
+    (void)snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *stmt = NULL;
+    bool found = false;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(stmt, 1);
+            if (name && strcmp(name, column) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static const char *aosp_symbol_leaf(const char *qualified_name) {
+    const char *leaf = qualified_name ? qualified_name : "";
+    for (const char *p = leaf; *p; p++) {
+        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':' || *p == '>') leaf = p + 1;
+    }
+    return leaf;
+}
+
+static int ensure_symbol_resolver_schema(sqlite3 *db, char *err, size_t err_size) {
+    if (!aosp_table_has_column(db, "symbols", "qualified_leaf") &&
+        exec_sql(db, "ALTER TABLE symbols ADD COLUMN qualified_leaf TEXT NOT NULL DEFAULT '';",
+                 err, err_size) != 0) return -1;
+    if (exec_sql(db, "CREATE INDEX IF NOT EXISTS idx_aosp_symbols_leaf "
+                     "ON symbols(workspace_id,qualified_leaf);", err, err_size) != 0) return -1;
+    sqlite3_stmt *needs_backfill = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT EXISTS(SELECT 1 FROM symbols WHERE qualified_leaf='');",
+            -1, &needs_backfill, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot inspect AOSP symbol resolver schema", sqlite3_errmsg(db));
+        return -1;
+    }
+    bool backfill = sqlite3_step(needs_backfill) == SQLITE_ROW &&
+                    sqlite3_column_int(needs_backfill, 0) != 0;
+    sqlite3_finalize(needs_backfill);
+    if (backfill) {
+        sqlite3_stmt *read_stmt = NULL;
+        sqlite3_stmt *update_stmt = NULL;
+        int rc = -1;
+        if (exec_sql(db, "BEGIN IMMEDIATE;", err, err_size) != 0 ||
+            sqlite3_prepare_v2(db,
+                "SELECT id,qualified_name FROM symbols WHERE qualified_leaf='';",
+                -1, &read_stmt, NULL) != SQLITE_OK ||
+            sqlite3_prepare_v2(db,
+                "UPDATE symbols SET qualified_leaf=?1 WHERE id=?2;",
+                -1, &update_stmt, NULL) != SQLITE_OK) {
+            set_error(err, err_size, "cannot prepare AOSP symbol leaf migration", sqlite3_errmsg(db));
+            goto backfill_done;
+        }
+        int step_rc;
+        while ((step_rc = sqlite3_step(read_stmt)) == SQLITE_ROW) {
+            const char *qualified_name = (const char *)sqlite3_column_text(read_stmt, 1);
+            sqlite3_reset(update_stmt);
+            sqlite3_clear_bindings(update_stmt);
+            sqlite3_bind_text(update_stmt, 1, aosp_symbol_leaf(qualified_name), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(update_stmt, 2, sqlite3_column_int64(read_stmt, 0));
+            if (sqlite3_step(update_stmt) != SQLITE_DONE) break;
+        }
+        if (step_rc == SQLITE_DONE && exec_sql(db, "COMMIT;", err, err_size) == 0) rc = 0;
+backfill_done:
+        sqlite3_finalize(read_stmt);
+        sqlite3_finalize(update_stmt);
+        if (rc != 0) {
+            (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            if (err && err_size && !err[0]) {
+                set_error(err, err_size, "cannot migrate AOSP symbol leaves", sqlite3_errmsg(db));
+            }
+            return -1;
+        }
+    }
+    return exec_sql(db,
+        "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
+        "VALUES(7,strftime('%s','now'));", err, err_size);
+}
+
 int cbm_aosp_master_sync(const cbm_aosp_workspace_t *workspace, char *err, size_t err_size) {
     char db_path[AOSP_PATH_BUF];
     if (cbm_aosp_master_path(workspace, db_path, sizeof(db_path), true) != 0) {
@@ -759,6 +846,7 @@ int cbm_aosp_master_sync(const cbm_aosp_workspace_t *workspace, char *err, size_
     sqlite3_busy_timeout(db, 10000);
     if (exec_sql(db, "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;", err, err_size) != 0 ||
         exec_sql(db, AOSP_SCHEMA, err, err_size) != 0 ||
+        ensure_symbol_resolver_schema(db, err, err_size) != 0 ||
         cbm_aosp_cross_edges_ensure_schema(db, err, err_size) != 0 ||
         exec_sql(db, "BEGIN IMMEDIATE;", err, err_size) != 0) {
         sqlite3_close(db);
@@ -1024,7 +1112,8 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
         "SELECT id,name,qualified_name,label,file_path,start_line,end_line,properties FROM nodes;";
     const char *insert_sql =
         "INSERT INTO symbols(global_id,workspace_id,repo_id,local_node_id,name,qualified_name,label,"
-        "file_path,start_line,end_line,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11);";
+        "qualified_leaf,file_path,start_line,end_line,properties) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12);";
     if (sqlite3_prepare_v2(shard, read_sql, -1, &read_stmt, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(master, insert_sql, -1, &insert_stmt, NULL) != SQLITE_OK) {
         set_error(err, err_size, "cannot prepare AOSP symbol catalog", sqlite3_errmsg(master));
@@ -1050,10 +1139,11 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
         sqlite3_bind_text(insert_stmt, 5, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(insert_stmt, 6, qualified_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(insert_stmt, 7, label, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 8, file_path ? file_path : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(insert_stmt, 9, sqlite3_column_int(read_stmt, 5));
-        sqlite3_bind_int(insert_stmt, 10, sqlite3_column_int(read_stmt, 6));
-        sqlite3_bind_text(insert_stmt, 11, properties ? properties : "{}", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 8, aosp_symbol_leaf(qualified_name), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 9, file_path ? file_path : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(insert_stmt, 10, sqlite3_column_int(read_stmt, 5));
+        sqlite3_bind_int(insert_stmt, 11, sqlite3_column_int(read_stmt, 6));
+        sqlite3_bind_text(insert_stmt, 12, properties ? properties : "{}", -1, SQLITE_TRANSIENT);
         if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
             set_error(err, err_size, "cannot write AOSP symbol catalog", sqlite3_errmsg(master));
             goto rollback;
@@ -1168,15 +1258,62 @@ static char *dup_column(sqlite3_stmt *stmt, int column) {
 void cbm_aosp_symbols_free(cbm_aosp_symbol_t *results, int count) {
     if (!results) return;
     for (int i = 0; i < count; i++) {
+        free(results[i].global_id);
+        free(results[i].repo_id);
         free(results[i].repo_path);
         free(results[i].manifest_name);
         free(results[i].project_name);
         free(results[i].name);
         free(results[i].qualified_name);
         free(results[i].label);
+        free(results[i].language);
         free(results[i].file_path);
     }
     free(results);
+}
+
+static void aosp_symbol_clear(cbm_aosp_symbol_t *symbol) {
+    if (!symbol) return;
+    free(symbol->global_id);
+    free(symbol->repo_id);
+    free(symbol->repo_path);
+    free(symbol->manifest_name);
+    free(symbol->project_name);
+    free(symbol->name);
+    free(symbol->qualified_name);
+    free(symbol->label);
+    free(symbol->language);
+    free(symbol->file_path);
+    memset(symbol, 0, sizeof(*symbol));
+}
+
+static int aosp_symbol_from_row(sqlite3_stmt *stmt, cbm_aosp_symbol_t *item) {
+    memset(item, 0, sizeof(*item));
+    item->global_id = dup_column(stmt, 0);
+    item->repo_id = dup_column(stmt, 1);
+    item->local_node_id = sqlite3_column_int64(stmt, 2);
+    item->repo_path = dup_column(stmt, 3);
+    item->manifest_name = dup_column(stmt, 4);
+    size_t project_len = strlen(item->repo_id ? item->repo_id : "") + 6;
+    item->project_name = malloc(project_len);
+    if (item->project_name) {
+        (void)snprintf(item->project_name, project_len, "aosp-%s",
+                       item->repo_id ? item->repo_id : "");
+    }
+    item->name = dup_column(stmt, 5);
+    item->qualified_name = dup_column(stmt, 6);
+    item->label = dup_column(stmt, 7);
+    item->language = dup_column(stmt, 8);
+    item->file_path = dup_column(stmt, 9);
+    item->start_line = sqlite3_column_int(stmt, 10);
+    item->end_line = sqlite3_column_int(stmt, 11);
+    if (!item->global_id || !item->repo_id || !item->repo_path || !item->manifest_name ||
+        !item->project_name || !item->name || !item->qualified_name || !item->label ||
+        !item->language || !item->file_path) {
+        aosp_symbol_clear(item);
+        return -1;
+    }
+    return 0;
 }
 
 static int build_fts_query(const char *query, char *out, size_t out_size) {
@@ -1223,8 +1360,8 @@ int cbm_aosp_search_symbols(const cbm_aosp_workspace_t *workspace, const char *q
         return -1;
     }
     const char *sql =
-        "SELECT r.path,r.manifest_name,r.repo_id,s.name,s.qualified_name,s.label,s.file_path,"
-        "s.start_line,s.end_line FROM symbols_fts "
+        "SELECT s.global_id,s.repo_id,s.local_node_id,r.path,r.manifest_name,s.name,"
+        "s.qualified_name,s.label,s.language,s.file_path,s.start_line,s.end_line FROM symbols_fts "
         "JOIN symbols s ON s.id=symbols_fts.rowid JOIN repos r ON r.repo_id=s.repo_id "
         "WHERE symbols_fts MATCH ?1 AND s.workspace_id=?2 "
         "ORDER BY bm25(symbols_fts),s.name,r.path LIMIT ?3;";
@@ -1248,23 +1385,7 @@ int cbm_aosp_search_symbols(const cbm_aosp_workspace_t *workspace, const char *q
     int step_rc;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         cbm_aosp_symbol_t *item = &items[n];
-        item->repo_path = dup_column(stmt, 0);
-        item->manifest_name = dup_column(stmt, 1);
-        const unsigned char *repo_id = sqlite3_column_text(stmt, 2);
-        size_t project_len = strlen(repo_id ? (const char *)repo_id : "") + 6;
-        item->project_name = malloc(project_len);
-        if (item->project_name) {
-            (void)snprintf(item->project_name, project_len, "aosp-%s",
-                           repo_id ? (const char *)repo_id : "");
-        }
-        item->name = dup_column(stmt, 3);
-        item->qualified_name = dup_column(stmt, 4);
-        item->label = dup_column(stmt, 5);
-        item->file_path = dup_column(stmt, 6);
-        item->start_line = sqlite3_column_int(stmt, 7);
-        item->end_line = sqlite3_column_int(stmt, 8);
-        if (!item->repo_path || !item->manifest_name || !item->project_name || !item->name ||
-            !item->qualified_name || !item->label || !item->file_path) {
+        if (aosp_symbol_from_row(stmt, item) != 0) {
             cbm_aosp_symbols_free(items, n + 1);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
@@ -1284,6 +1405,174 @@ int cbm_aosp_search_symbols(const cbm_aosp_workspace_t *workspace, const char *q
     sqlite3_close(db);
     *results = items;
     *count = n;
+    return 0;
+}
+
+static int normalize_symbol_reference(const char *reference, char *out, size_t out_size) {
+    while (reference && isspace((unsigned char)*reference)) reference++;
+    if (!reference || !reference[0] || !out || out_size < 2) return -1;
+    size_t input_len = strlen(reference);
+    while (input_len > 0 && isspace((unsigned char)reference[input_len - 1])) input_len--;
+    if (input_len == 0 || input_len >= out_size) return -1;
+    size_t written = 0;
+    for (size_t i = 0; i < input_len; i++) {
+        char c = reference[i];
+        bool separator = c == '/' || c == '\\' || c == ':' ||
+                         (c == '-' && i + 1 < input_len && reference[i + 1] == '>');
+        if (separator) {
+            if (c == '-' || (c == ':' && i + 1 < input_len && reference[i + 1] == ':')) i++;
+            while (i + 1 < input_len && reference[i + 1] == ':') i++;
+            if (written > 0 && out[written - 1] != '.') out[written++] = '.';
+        } else {
+            out[written++] = c;
+        }
+    }
+    while (written > 0 && out[written - 1] == '.') written--;
+    out[written] = '\0';
+    return written > 0 ? 0 : -1;
+}
+
+static bool symbol_qn_has_suffix(const char *qualified_name, const char *reference) {
+    size_t qn_len = strlen(qualified_name);
+    size_t ref_len = strlen(reference);
+    if (ref_len > qn_len || strcmp(qualified_name + qn_len - ref_len, reference) != 0) {
+        return false;
+    }
+    return qn_len == ref_len || qualified_name[qn_len - ref_len - 1] == '.';
+}
+
+static int symbol_match_score(sqlite3_stmt *stmt, const char *raw_reference,
+                              const char *normalized_reference, bool qualified) {
+    const char *global_id = (const char *)sqlite3_column_text(stmt, 0);
+    const char *name = (const char *)sqlite3_column_text(stmt, 5);
+    const char *qualified_name = (const char *)sqlite3_column_text(stmt, 6);
+    if (!global_id || !name || !qualified_name) return 0;
+    if (strcmp(global_id, raw_reference) == 0) return 400;
+    char normalized_qn[AOSP_PATH_BUF];
+    bool qn_normalized = normalize_symbol_reference(qualified_name, normalized_qn,
+                                                     sizeof(normalized_qn)) == 0;
+    if (strcmp(qualified_name, raw_reference) == 0 ||
+        strcmp(qualified_name, normalized_reference) == 0 ||
+        (qn_normalized && strcmp(normalized_qn, normalized_reference) == 0)) return 300;
+    if (qualified && ((qn_normalized && symbol_qn_has_suffix(normalized_qn, normalized_reference)) ||
+                      symbol_qn_has_suffix(qualified_name, raw_reference))) return 200;
+    if (!qualified && strcmp(name, normalized_reference) == 0) return 100;
+    return 0;
+}
+
+static cbm_aosp_symbol_match_kind_t symbol_match_kind(int score) {
+    if (score == 400) return CBM_AOSP_SYMBOL_MATCH_GLOBAL_ID;
+    if (score == 300) return CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME;
+    if (score == 200) return CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX;
+    if (score == 100) return CBM_AOSP_SYMBOL_MATCH_EXACT_NAME;
+    return CBM_AOSP_SYMBOL_MATCH_NONE;
+}
+
+void cbm_aosp_symbol_resolution_free(cbm_aosp_symbol_resolution_t *resolution) {
+    if (!resolution) return;
+    cbm_aosp_symbols_free(resolution->candidates, resolution->candidate_count);
+    memset(resolution, 0, sizeof(*resolution));
+}
+
+int cbm_aosp_resolve_symbol(const cbm_aosp_workspace_t *workspace, const char *reference,
+                            cbm_aosp_symbol_resolution_t *out, char *err, size_t err_size) {
+    if (!workspace || !reference || !out) {
+        set_error(err, err_size, "AOSP symbol reference is required", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    char normalized[AOSP_SYMBOL_REF_BUF];
+    if (normalize_symbol_reference(reference, normalized, sizeof(normalized)) != 0) {
+        set_error(err, err_size, "AOSP symbol reference is empty or too long", NULL);
+        return -1;
+    }
+    while (isspace((unsigned char)*reference)) reference++;
+    char raw[AOSP_SYMBOL_REF_BUF];
+    size_t raw_len = strlen(reference);
+    while (raw_len > 0 && isspace((unsigned char)reference[raw_len - 1])) raw_len--;
+    memcpy(raw, reference, raw_len);
+    raw[raw_len] = '\0';
+    bool qualified = strchr(normalized, '.') != NULL;
+    const char *leaf = aosp_symbol_leaf(normalized);
+
+    char master_path[AOSP_PATH_BUF];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open_v2(master_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "AOSP workspace is not initialized", master_path);
+        sqlite3_close(db);
+        return -1;
+    }
+    const char *sql =
+        "SELECT s.global_id,s.repo_id,s.local_node_id,r.path,r.manifest_name,s.name,"
+        "s.qualified_name,s.label,s.language,s.file_path,s.start_line,s.end_line "
+        "FROM symbols s JOIN repos r ON r.repo_id=s.repo_id "
+        "WHERE s.workspace_id=?1 AND (s.global_id=?2 OR s.qualified_name=?2 "
+        "OR s.qualified_name=?3 OR s.qualified_leaf=?4) "
+        "ORDER BY s.qualified_name,r.path,s.global_id;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP symbol resolution", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, raw, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, normalized, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, leaf, -1, SQLITE_TRANSIENT);
+
+    cbm_aosp_symbol_t *items = calloc(AOSP_RESOLVE_LIMIT, sizeof(*items));
+    if (!items) {
+        set_error(err, err_size, "out of memory", NULL);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    int best_score = 0;
+    int stored = 0;
+    int total = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int score = symbol_match_score(stmt, raw, normalized, qualified);
+        if (score == 0 || score < best_score) continue;
+        if (score > best_score) {
+            for (int i = 0; i < stored; i++) aosp_symbol_clear(&items[i]);
+            stored = 0;
+            total = 0;
+            best_score = score;
+        }
+        total++;
+        if (stored < AOSP_RESOLVE_LIMIT) {
+            if (aosp_symbol_from_row(stmt, &items[stored]) != 0) {
+                cbm_aosp_symbols_free(items, stored);
+                sqlite3_finalize(stmt);
+                sqlite3_close(db);
+                set_error(err, err_size, "out of memory", NULL);
+                return -1;
+            }
+            stored++;
+        }
+    }
+    if (step_rc != SQLITE_DONE) {
+        set_error(err, err_size, "cannot resolve AOSP symbol", sqlite3_errmsg(db));
+        cbm_aosp_symbols_free(items, stored);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (total == 0) {
+        free(items);
+        out->status = CBM_AOSP_SYMBOL_NOT_FOUND;
+        return 0;
+    }
+    out->status = total == 1 ? CBM_AOSP_SYMBOL_RESOLVED : CBM_AOSP_SYMBOL_AMBIGUOUS;
+    out->match_kind = symbol_match_kind(best_score);
+    out->candidates = items;
+    out->candidate_count = stored;
+    out->total_candidate_count = total;
+    out->truncated = total > stored;
     return 0;
 }
 

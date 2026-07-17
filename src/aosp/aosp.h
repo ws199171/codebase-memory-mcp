@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define CBM_AOSP_ID_LEN 32
 #define CBM_AOSP_HASH_LEN 64
@@ -46,16 +47,43 @@ typedef struct {
 } cbm_aosp_master_stats_t;
 
 typedef struct {
+    char *global_id;
+    char *repo_id;
     char *repo_path;
     char *manifest_name;
     char *project_name;
+    int64_t local_node_id;
     char *name;
     char *qualified_name;
     char *label;
+    char *language;
     char *file_path;
     int start_line;
     int end_line;
 } cbm_aosp_symbol_t;
+
+typedef enum {
+    CBM_AOSP_SYMBOL_NOT_FOUND = 0,
+    CBM_AOSP_SYMBOL_RESOLVED,
+    CBM_AOSP_SYMBOL_AMBIGUOUS,
+} cbm_aosp_symbol_resolution_status_t;
+
+typedef enum {
+    CBM_AOSP_SYMBOL_MATCH_NONE = 0,
+    CBM_AOSP_SYMBOL_MATCH_GLOBAL_ID,
+    CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME,
+    CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX,
+    CBM_AOSP_SYMBOL_MATCH_EXACT_NAME,
+} cbm_aosp_symbol_match_kind_t;
+
+typedef struct {
+    cbm_aosp_symbol_resolution_status_t status;
+    cbm_aosp_symbol_match_kind_t match_kind;
+    cbm_aosp_symbol_t *candidates;
+    int candidate_count;
+    int total_candidate_count;
+    bool truncated;
+} cbm_aosp_symbol_resolution_t;
 
 /* Discover an AOSP checkout from .repo/manifest.xml plus local_manifests.
  * Uses the vendored tree-sitter XML grammar and applies include,
@@ -88,6 +116,13 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
 int cbm_aosp_search_symbols(const cbm_aosp_workspace_t *workspace, const char *query, int limit,
                             cbm_aosp_symbol_t **results, int *count, char *err, size_t err_size);
 void cbm_aosp_symbols_free(cbm_aosp_symbol_t *results, int count);
+
+/* Resolve one Master-catalog symbol by deterministic tiers. A qualified miss
+ * never falls back to an unrelated short name. Ambiguous best-tier candidates
+ * are returned explicitly and never promoted to a resolved result. */
+int cbm_aosp_resolve_symbol(const cbm_aosp_workspace_t *workspace, const char *reference,
+                            cbm_aosp_symbol_resolution_t *out, char *err, size_t err_size);
+void cbm_aosp_symbol_resolution_free(cbm_aosp_symbol_resolution_t *resolution);
 
 /* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
 int cbm_cmd_aosp(int argc, char **argv);

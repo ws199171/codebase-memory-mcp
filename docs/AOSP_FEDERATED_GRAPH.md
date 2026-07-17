@@ -116,6 +116,31 @@ qualified references are normalized to the catalog's dotted qualified-name form.
 restricted to callable, type-like, variable, field, and macro definitions. Calls
 and usages that have no supported catalog target remain explicit unresolved rows.
 
+## Symbol Resolution
+
+`cbm_aosp_resolve_symbol` resolves one workspace Master-catalog reference using
+deterministic tiers, in order:
+
+1. exact global symbol ID;
+2. exact qualified name;
+3. qualified-name suffix at a component boundary;
+4. exact unqualified name.
+
+C++/Rust `::`, C++ `->`, and path separators are normalized to qualified-name
+components. A reference containing a qualifier never falls back to an unrelated
+short-name match. Only candidates from the highest matching tier are returned. A
+single candidate is `RESOLVED`; multiple best-tier candidates are `AMBIGUOUS`; no
+candidate is `NOT_FOUND`. Duplicate exact qualified names across repositories are
+therefore ambiguous rather than selected by repository order.
+
+Each candidate carries its global ID, repository ID and path, shard project name,
+local node ID, label, language, qualified name, file, and source range. Results are
+ordered by qualified name, repository path, and global ID. At most 200 candidates
+are materialized; `total_candidate_count` and `truncated` preserve explicit
+ambiguity when a common short name has more matches. The resolver is the internal
+Q1 contract used by later shard routing and traversal tasks; public workspace-aware
+CLI and MCP compatibility is introduced by Q6.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
@@ -131,3 +156,8 @@ which the indexed leaf is populated.
 Master schema v6 adds `cross_edge_refresh_failures`, keyed by workspace and source
 repository. The row retains the latest error and failure timestamp for status
 reporting while the refresh queue remains the source of retry work.
+
+Master schema v7 adds the indexed `symbols.qualified_leaf` resolver key. Existing
+symbol rows are backfilled from their qualified names before the version is
+recorded. Resolver candidate lookup uses this index and then applies exact
+component-boundary matching in memory, avoiding a full symbol-table suffix scan.
