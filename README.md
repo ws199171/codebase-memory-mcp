@@ -580,6 +580,8 @@ ambiguous name-only candidates are not linked.
 
 Implementation status, remaining milestones, acceptance criteria, and verification
 evidence are tracked in [`docs/AOSP_SUPPORT_PLAN.md`](docs/AOSP_SUPPORT_PLAN.md).
+The workspace-level cross-repository edge identity, status, evidence, and refresh
+rules are defined in [`docs/AOSP_FEDERATED_GRAPH.md`](docs/AOSP_FEDERATED_GRAPH.md).
 
 ## MCP Tools
 

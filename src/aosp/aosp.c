@@ -8,6 +8,7 @@
  */
 #include "aosp/aosp.h"
 #include "aosp/build_graph.h"
+#include "aosp/federated_graph.h"
 #include "aosp/protocol_graph.h"
 
 #include "foundation/compat.h"
@@ -726,10 +727,6 @@ static const char *AOSP_SCHEMA =
     " VALUES('delete',old.id,old.name,old.qualified_name,old.signature,old.docstring);"
     " INSERT INTO symbols_fts(rowid,name,qualified_name,signature,docstring)"
     " VALUES(new.id,new.name,new.qualified_name,new.signature,new.docstring); END;"
-    "CREATE TABLE IF NOT EXISTS cross_symbol_edges("
-    " source_global_id TEXT NOT NULL, target_global_id TEXT NOT NULL, type TEXT NOT NULL,"
-    " confidence REAL NOT NULL DEFAULT 0, evidence TEXT DEFAULT '', properties TEXT DEFAULT '{}',"
-    " PRIMARY KEY(source_global_id,target_global_id,type));"
     "CREATE TABLE IF NOT EXISTS protocol_nodes("
     " protocol_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " kind TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL, file_path TEXT DEFAULT '',"
@@ -761,6 +758,7 @@ int cbm_aosp_master_sync(const cbm_aosp_workspace_t *workspace, char *err, size_
     sqlite3_busy_timeout(db, 10000);
     if (exec_sql(db, "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;", err, err_size) != 0 ||
         exec_sql(db, AOSP_SCHEMA, err, err_size) != 0 ||
+        cbm_aosp_cross_edges_ensure_schema(db, err, err_size) != 0 ||
         exec_sql(db, "BEGIN IMMEDIATE;", err, err_size) != 0) {
         sqlite3_close(db);
         return -1;
