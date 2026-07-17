@@ -41,8 +41,8 @@ complete:
 ## Current Queue
 
 - Current task: none.
-- Next task: `F2` - collect cross-repository structural relationship candidates.
-- Worktree baseline: `21e7483` on `codex/aosp-federated-graph`.
+- Next task: `F3` - resolve cross-repository calls and usages.
+- Worktree baseline: `d53eb01` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -83,7 +83,7 @@ complete:
   types, evidence fields, unresolved representation, and refresh lifecycle.
   Acceptance: schema/API tests prove deterministic IDs, workspace isolation,
   idempotent refresh, and stale-edge deletion for one refreshed repository.
-- [ ] `F2` Collect cross-repository import, include, type-reference, inheritance,
+- [x] `F2` Collect cross-repository import, include, type-reference, inheritance,
   implementation, and annotation candidates from repository shards.
   Acceptance: a multi-repository fixture produces each supported candidate class
   without creating edges for local-only relationships.
@@ -226,3 +226,4 @@ unaccepted critical coverage gap.
 | `B0.1-B0.6` | `f0863a6` | Cross-repository module fixture and sanitizer suite |
 | `P0.1-P0.7` | `d57b988` | Binder/JNI fixture, 173 focused tests, production smoke |
 | `F1` | `21e7483` | v3 migration, deterministic/isolated refresh tests, 176 focused tests, production schema v4 smoke |
+| `F2` | `d53eb01` | Six structural edge classes, local-edge exclusion, 177 focused tests, production `aosp federate` smoke |
