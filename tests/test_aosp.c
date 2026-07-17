@@ -756,6 +756,8 @@ static int create_structural_shard(const char *path, const char *project, bool s
         rc |= insert_shard_node(stmt, 15, "ambiguousCall", qn, "Method", "src/vendor/api/A.java");
         (void)snprintf(qn, sizeof(qn), "%s.overload.B.ambiguousCall", project);
         rc |= insert_shard_node(stmt, 16, "ambiguousCall", qn, "Method", "src/vendor/api/B.java");
+        (void)snprintf(qn, sizeof(qn), "%s.right.qualifierOnly", project);
+        rc |= insert_shard_node(stmt, 17, "qualifierOnly", qn, "Function", "src/vendor/api/Only.java");
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -802,6 +804,7 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
         "    VendorApi.execute();\n"
         "    localOnly();\n"
         "    ambiguousCall();\n"
+        "    wrong.qualifierOnly();\n"
         "    missingJava();\n"
         "    return sharedValue;\n"
         "  }\n"
@@ -867,6 +870,27 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
         ASSERT(sqlite3_column_int(stmt, 0) >= 1);
     }
     sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT confidence,properties FROM cross_symbol_edges "
+        "WHERE workspace_id=?1 AND type='CALLS' AND target_name=?2;",
+        -1, &stmt, NULL), SQLITE_OK);
+    const char *scored_targets[] = {"VendorApi.execute", "vendorKotlin"};
+    const char *scored_resolutions[] = {"qualified_suffix", "unique_short_name"};
+    for (size_t i = 0; i < sizeof(scored_targets) / sizeof(scored_targets[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, scored_targets[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        double confidence = sqlite3_column_double(stmt, 0);
+        ASSERT(i == 0 ? confidence >= 0.95 : confidence < 0.80);
+        const char *properties = (const char *)sqlite3_column_text(stmt, 1);
+        ASSERT_NOT_NULL(properties);
+        ASSERT_NOT_NULL(strstr(properties, scored_resolutions[i]));
+        ASSERT_NOT_NULL(strstr(properties, "\"candidate_count\":1"));
+    }
+    sqlite3_finalize(stmt);
     ASSERT_EQ(sqlite3_prepare_v2(db,
         "SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND target_name='LocalBase';",
         -1, &stmt, NULL), SQLITE_OK);
@@ -905,19 +929,28 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
     sqlite3_finalize(stmt);
 
     ASSERT_EQ(sqlite3_prepare_v2(db,
-        "SELECT count(*),min(status),max(status) FROM cross_symbol_edges "
+        "SELECT count(*),count(DISTINCT target_global_id),min(status),max(status),"
+        "min(confidence),min(properties),max(properties) FROM cross_symbol_edges "
         "WHERE workspace_id=?1 AND type='CALLS' AND target_name='ambiguousCall';",
         -1, &stmt, NULL), SQLITE_OK);
     sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
-    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "ambiguous");
+    ASSERT_EQ(sqlite3_column_int(stmt, 1), 2);
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "ambiguous");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "ambiguous");
+    ASSERT(sqlite3_column_double(stmt, 4) < 0.5);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 5),
+                  (const char *)sqlite3_column_text(stmt, 6));
+    ASSERT_NOT_NULL(strstr((const char *)sqlite3_column_text(stmt, 5),
+                           "\"candidate_count\":2"));
     sqlite3_finalize(stmt);
 
-    const char *unresolved_targets[] = {"missingJava", "missing_cpp", "missingKotlin", "missing_rust"};
+    const char *unresolved_targets[] = {
+        "missingJava", "missing_cpp", "missingKotlin", "missing_rust", "wrong.qualifierOnly",
+    };
     ASSERT_EQ(sqlite3_prepare_v2(db,
-        "SELECT status,target_global_id,confidence,evidence FROM cross_symbol_edges "
+        "SELECT status,target_global_id,confidence,evidence,properties FROM cross_symbol_edges "
         "WHERE workspace_id=?1 AND type='CALLS' AND target_name=?2;",
         -1, &stmt, NULL), SQLITE_OK);
     for (size_t i = 0; i < sizeof(unresolved_targets) / sizeof(unresolved_targets[0]); i++) {
@@ -930,6 +963,10 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
         ASSERT_EQ(sqlite3_column_type(stmt, 1), SQLITE_NULL);
         ASSERT_EQ(sqlite3_column_double(stmt, 2), 0.0);
         ASSERT(sqlite3_column_text(stmt, 3) != NULL);
+        const char *properties = (const char *)sqlite3_column_text(stmt, 4);
+        ASSERT_NOT_NULL(properties);
+        ASSERT_NOT_NULL(strstr(properties, "\"resolution\":\"unresolved\""));
+        ASSERT_NOT_NULL(strstr(properties, "\"candidate_count\":0"));
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);

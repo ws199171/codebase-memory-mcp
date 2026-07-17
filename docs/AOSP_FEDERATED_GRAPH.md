@@ -60,6 +60,13 @@ non-empty evidence value. Producers use evidence to identify the resolver rule,
 not to store an unsupported conclusion. Additional structured facts may be stored
 in `properties` as JSON.
 
+The structural producer records `resolution`, numeric `score`, and
+`candidate_count` in `properties`. Exact qualified names and qualified suffixes
+have higher confidence than unique unqualified short names. A qualified reference
+never falls back to a short-name-only target when its qualifier does not match.
+Multiple best candidates are retained as separate `ambiguous` rows with the same
+candidate count; no consumer may promote one of those rows to `resolved`.
+
 ## Refresh Lifecycle
 
 `cbm_aosp_cross_edges_refresh` atomically replaces all outgoing cross-repository

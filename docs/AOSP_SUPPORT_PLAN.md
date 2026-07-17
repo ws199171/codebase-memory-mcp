@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: none.
-- Next task: `F4` - add ambiguity handling, confidence scoring, and evidence retention.
-- Worktree baseline: `0b1774e` on `codex/aosp-federated-graph`.
+- Current task: `F4` - add ambiguity handling, confidence scoring, and evidence retention.
+- Next task: `F5` - implement cross-edge refresh and dependency invalidation.
+- Worktree baseline: `ab9b1c2` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 

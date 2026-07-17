@@ -28,6 +28,7 @@ typedef struct {
     char *target_name;
     char *type;
     char *evidence;
+    char *properties;
 } owned_candidate_t;
 
 typedef struct {
@@ -105,6 +106,7 @@ static void candidate_vec_free(candidate_vec_t *vec) {
         free(vec->items[i].target_name);
         free(vec->items[i].type);
         free(vec->items[i].evidence);
+        free(vec->items[i].properties);
     }
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
@@ -113,7 +115,8 @@ static void candidate_vec_free(candidate_vec_t *vec) {
 static bool candidate_vec_add(candidate_vec_t *vec, const char *source_id,
                               const char *target_id, const char *target_name,
                               const char *type, cbm_aosp_cross_edge_status_t status,
-                              double confidence, const char *evidence) {
+                              double confidence, const char *evidence,
+                              const char *properties) {
     if (vec->count == vec->cap) {
         int cap = vec->cap ? vec->cap * 2 : 64;
         owned_candidate_t *items = realloc(vec->items, (size_t)cap * sizeof(*items));
@@ -128,13 +131,15 @@ static bool candidate_vec_add(candidate_vec_t *vec, const char *source_id,
     item->target_name = strdup(target_name);
     item->type = strdup(type);
     item->evidence = strdup(evidence);
+    item->properties = strdup(properties);
     if (!item->source_id || (target_id && !item->target_id) || !item->target_name ||
-        !item->type || !item->evidence) {
+        !item->type || !item->evidence || !item->properties) {
         free(item->source_id);
         free(item->target_id);
         free(item->target_name);
         free(item->type);
         free(item->evidence);
+        free(item->properties);
         memset(item, 0, sizeof(*item));
         return false;
     }
@@ -145,7 +150,7 @@ static bool candidate_vec_add(candidate_vec_t *vec, const char *source_id,
     item->value.status = status;
     item->value.confidence = confidence;
     item->value.evidence = item->evidence;
-    item->value.properties = "{}";
+    item->value.properties = item->properties;
     vec->count++;
     return true;
 }
@@ -260,18 +265,54 @@ static bool ends_with(const char *text, const char *suffix) {
     return suffix_len <= text_len && strcmp(text + text_len - suffix_len, suffix) == 0;
 }
 
+static bool ends_with_boundary(const char *text, const char *suffix, char boundary) {
+    size_t text_len = strlen(text);
+    size_t suffix_len = strlen(suffix);
+    if (!ends_with(text, suffix)) return false;
+    return text_len == suffix_len || text[text_len - suffix_len - 1] == boundary;
+}
+
 static int match_score(const char *edge_type, const char *reference, const char *short_name,
                        const char *name, const char *qualified_name, const char *file_path) {
     if (strcmp(edge_type, "INCLUDES") == 0) {
         if (strcmp(file_path, reference) == 0) return 110;
-        if (ends_with(file_path, reference)) return 100;
-        if (strcmp(name, short_name) == 0) return 70;
+        if (ends_with_boundary(file_path, reference, '/')) return 100;
         return 0;
     }
-    if (ends_with(qualified_name, reference)) return 110;
-    if (strcmp(name, reference) == 0) return 100;
-    if (strcmp(name, short_name) == 0) return 80;
+    bool qualified_reference = strcmp(reference, short_name) != 0;
+    if (strcmp(qualified_name, reference) == 0) return 120;
+    if (qualified_reference && ends_with_boundary(qualified_name, reference, '.')) return 110;
+    if (!qualified_reference && strcmp(name, reference) == 0) return 80;
     return 0;
+}
+
+static const char *resolution_name(const char *edge_type, int score) {
+    if (strcmp(edge_type, "INCLUDES") == 0) {
+        if (score == 110) return "exact_file_path";
+        return "file_path_suffix";
+    }
+    if (score == 120) return "exact_qualified_name";
+    if (score == 110) return "qualified_suffix";
+    return "unique_short_name";
+}
+
+static double resolved_confidence(int score) {
+    if (score >= 120) return 0.99;
+    if (score >= 110) return 0.97;
+    if (score >= 100) return 0.95;
+    if (score >= 80) return 0.75;
+    return 0.75;
+}
+
+static double ambiguous_confidence(int score) {
+    return score >= 100 ? 0.55 : 0.35;
+}
+
+static void resolution_properties(char out[192], const char *resolution,
+                                  int score, int candidate_count) {
+    (void)snprintf(out, 192,
+                   "{\"resolution\":\"%s\",\"score\":%d,\"candidate_count\":%d}",
+                   resolution, score, candidate_count);
 }
 
 static char *lookup_source_id(collect_ctx_t *ctx, const char *qualified_name) {
@@ -347,9 +388,15 @@ static int collect_reference(collect_ctx_t *ctx, const char *source_qn, const ch
     if (local_best > 0) {
         ctx->stats.local_references_skipped++;
     } else if (cross_best == 0) {
+        char properties[192];
+        resolution_properties(properties, "unresolved", 0, 0);
         if (!candidate_vec_add(&ctx->candidates, source_id, NULL, reference, requested_type,
-                               CBM_AOSP_CROSS_EDGE_UNRESOLVED, 0.0, evidence)) rc = -1;
+                               CBM_AOSP_CROSS_EDGE_UNRESOLVED, 0.0, evidence,
+                               properties)) rc = -1;
     } else {
+        const char *resolution = resolution_name(requested_type, best_score);
+        char properties[192];
+        resolution_properties(properties, resolution, best_score, cross_best);
         for (int i = 0; i < matches.count && rc == 0; i++) {
             target_match_t *match = &matches.items[i];
             if (match->score != best_score || strcmp(match->repo_id, ctx->repo->repo_id) == 0) continue;
@@ -361,13 +408,15 @@ static int collect_reference(collect_ctx_t *ctx, const char *source_qn, const ch
             cbm_aosp_cross_edge_status_t status = cross_best == 1
                                                       ? CBM_AOSP_CROSS_EDGE_RESOLVED
                                                       : CBM_AOSP_CROSS_EDGE_AMBIGUOUS;
-            double confidence = cross_best == 1 ? (best_score >= 100 ? 0.98 : 0.85) : 0.5;
+            double confidence = cross_best == 1 ? resolved_confidence(best_score)
+                                                : ambiguous_confidence(best_score);
             if (cross_best == 1 && confidence_hint >= 0.0 && confidence_hint <= 1.0 &&
                 confidence_hint < confidence) {
                 confidence = confidence_hint;
             }
             if (!candidate_vec_add(&ctx->candidates, source_id, match->global_id, reference,
-                                   edge_type, status, confidence, evidence)) rc = -1;
+                                   edge_type, status, confidence, evidence,
+                                   properties)) rc = -1;
         }
     }
     if (rc != 0) sg_error(ctx->err, ctx->err_size, "out of memory", NULL);
