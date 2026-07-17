@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `F6` - report cross-edge coverage and resolution state.
-- Next task: `Q1` - implement the workspace-level symbol resolver.
-- Worktree baseline: `3731d5c` on `codex/aosp-federated-graph`.
+- Current task: `Q1` - implement the workspace-level symbol resolver.
+- Next task: `Q2` - implement Master-to-shard routing.
+- Worktree baseline: `4c3b29d` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -96,7 +96,7 @@ complete:
 - [x] `F5` Implement per-repository cross-edge refresh and dependency invalidation.
   Acceptance: reindexing one repository updates affected edges without rebuilding
   unrelated workspace state.
-- [ ] `F6` Report cross-edge coverage, unresolved counts, and resolution errors.
+- [x] `F6` Report cross-edge coverage, unresolved counts, and resolution errors.
   Acceptance: CLI and MCP status distinguish indexed, resolved, ambiguous,
   unresolved, stale, and failed state.
 
@@ -230,3 +230,4 @@ unaccepted critical coverage gap.
 | `F3` | `0b1774e` | C/C++, Java, Kotlin, and Rust calls/usages; local, ambiguous, unresolved coverage; 177 focused tests; production two-repository federation smoke |
 | `F4` | `60dc77b` | Qualified/short-name confidence tiers, structured candidate evidence, qualifier-mismatch rejection, duplicate-name ambiguity fixture, 177 focused tests, production three-state smoke |
 | `F5` | `c57883b` | Schema v5 refresh queue/state and indexed dependency leaf, v3/v4 migrations, three-repository selective refresh, retry retention, 178 focused tests, production incremental federation smoke |
+| `F6` | `4c3b29d` | Schema v6 refresh-failure retention, CLI/MCP coverage parity, stale edge reporting, failed-refresh retry cleanup, 178 focused tests, production `-Werror` build and dual-entry status smoke |
