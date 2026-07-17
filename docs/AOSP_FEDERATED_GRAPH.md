@@ -80,6 +80,12 @@ does not delete edges owned by another repository.
 Content-aware invalidation and dependency propagation are implemented by later
 tasks in the AOSP support plan.
 
+The structural producer uses each indexed shard's File nodes as its work boundary,
+replays the existing AST extractor for those files, and resolves only targets in a
+different manifest repository. A best local target suppresses Master edge creation;
+that relationship remains owned by the repository shard. Run `aosp federate` only
+after all desired repository shards have been indexed or refreshed.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

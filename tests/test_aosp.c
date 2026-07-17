@@ -6,6 +6,7 @@
 #include "aosp/build_graph.h"
 #include "aosp/federated_graph.h"
 #include "aosp/protocol_graph.h"
+#include "aosp/structural_graph.h"
 #include "foundation/compat_fs.h"
 #include "mcp/mcp.h"
 
@@ -665,6 +666,177 @@ TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries) {
     PASS();
 }
 
+static int insert_shard_node(sqlite3_stmt *stmt, int id, const char *name,
+                             const char *qualified_name, const char *label,
+                             const char *file_path) {
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_int(stmt, 1, id);
+    sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, qualified_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, label, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, file_path, -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+}
+
+static int create_structural_shard(const char *path, const char *project, bool source) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK ||
+        sqlite3_exec(db,
+            "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+            "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);",
+            NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT INTO nodes VALUES(?1,?2,?3,?4,?5,1,2,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    char qn[1024];
+    int rc = 0;
+    if (source) {
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client.java.__file__", project);
+        rc |= insert_shard_node(stmt, 1, "Client.java", qn, "File", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.client.cpp.__file__", project);
+        rc |= insert_shard_node(stmt, 2, "client.cpp", qn, "File", "client.cpp");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client", project);
+        rc |= insert_shard_node(stmt, 3, "Client", qn, "Class", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.Client.convert", project);
+        rc |= insert_shard_node(stmt, 4, "convert", qn, "Method", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.LocalBase", project);
+        rc |= insert_shard_node(stmt, 5, "LocalBase", qn, "Class", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.app.LocalChild", project);
+        rc |= insert_shard_node(stmt, 6, "LocalChild", qn, "Class", "src/app/Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.client.NativeClient", project);
+        rc |= insert_shard_node(stmt, 7, "NativeClient", qn, "Class", "client.cpp");
+    } else {
+        (void)snprintf(qn, sizeof(qn), "%s.include.vendor.api.vendor.h.__file__", project);
+        rc |= insert_shard_node(stmt, 1, "vendor.h", qn, "File", "include/vendor/api/vendor.h");
+        (void)snprintf(qn, sizeof(qn), "%s.src.vendor.api.VendorBase", project);
+        rc |= insert_shard_node(stmt, 2, "VendorBase", qn, "Class", "src/vendor/api/Types.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.vendor.api.VendorInterface", project);
+        rc |= insert_shard_node(stmt, 3, "VendorInterface", qn, "Interface", "src/vendor/api/Types.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.vendor.api.VendorAnnotation", project);
+        rc |= insert_shard_node(stmt, 4, "VendorAnnotation", qn, "Decorator", "src/vendor/api/Types.java");
+        (void)snprintf(qn, sizeof(qn), "%s.src.vendor.api.VendorType", project);
+        rc |= insert_shard_node(stmt, 5, "VendorType", qn, "Class", "src/vendor/api/Types.java");
+        (void)snprintf(qn, sizeof(qn), "%s.include.vendor.api.VendorNativeBase", project);
+        rc |= insert_shard_node(stmt, 6, "VendorNativeBase", qn, "Class", "include/vendor/api/vendor.h");
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+static int set_repo_indexed(const cbm_aosp_workspace_t *workspace,
+                            const cbm_aosp_repo_t *repo, const char *db_path) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "UPDATE repos SET status='indexed',db_path=?1 WHERE workspace_id=?2 AND repo_id=?3;",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, db_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, repo->repo_id, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    ASSERT_EQ(make_dir(root, "frameworks/base/src/app"), 0);
+    ASSERT_EQ(make_dir(root, "vendor/acme/widgets/include/vendor/api"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/src/app/Client.java",
+        "package app;\n"
+        "import vendor.api.VendorAnnotation;\n"
+        "import vendor.api.VendorBase;\n"
+        "import vendor.api.VendorInterface;\n"
+        "import vendor.api.VendorType;\n"
+        "@VendorAnnotation\n"
+        "class Client extends VendorBase implements VendorInterface {\n"
+        "  VendorType convert(VendorType value) { return value; }\n"
+        "}\n"
+        "class LocalBase {}\n"
+        "class LocalChild extends LocalBase {}\n"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/client.cpp",
+        "#include \"vendor/api/vendor.h\"\n"
+        "class NativeClient : public VendorNativeBase {};\n"), 0);
+    ASSERT_EQ(write_relative(root, "vendor/acme/widgets/include/vendor/api/vendor.h",
+        "class VendorNativeBase {};\n"), 0);
+
+    cbm_aosp_workspace_t workspace;
+    char err[1024] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    char source_path[4096];
+    char target_path[4096];
+    char source_project[64];
+    char target_project[64];
+    (void)snprintf(source_path, sizeof(source_path), "%s/struct-source.db", root);
+    (void)snprintf(target_path, sizeof(target_path), "%s/struct-target.db", root);
+    (void)snprintf(source_project, sizeof(source_project), "aosp-%s", workspace.repos[0].repo_id);
+    (void)snprintf(target_project, sizeof(target_project), "aosp-%s", workspace.repos[1].repo_id);
+    ASSERT_EQ(create_structural_shard(source_path, source_project, true), 0);
+    ASSERT_EQ(create_structural_shard(target_path, target_project, false), 0);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[0], source_path,
+                                       err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[1], target_path,
+                                       err, sizeof(err)), 0);
+    ASSERT_EQ(set_repo_indexed(&workspace, &workspace.repos[0], source_path), 0);
+    ASSERT_EQ(set_repo_indexed(&workspace, &workspace.repos[1], target_path), 0);
+
+    cbm_aosp_structural_stats_t stats;
+    ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.repos_scanned, 2);
+    ASSERT(stats.files_scanned >= 2);
+    ASSERT(stats.edges.resolved_count >= 6);
+    ASSERT(stats.local_references_skipped >= 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open_v2(master_path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    const char *types[] = {"IMPORTS", "INCLUDES", "EXTENDS", "IMPLEMENTS", "ANNOTATED_BY", "USES_TYPE"};
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND type=?2;",
+        -1, &stmt, NULL), SQLITE_OK);
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, types[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT(sqlite3_column_int(stmt, 0) >= 1);
+    }
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM cross_symbol_edges WHERE workspace_id=?1 AND target_name='LocalBase';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(aosp) {
     RUN_TEST(aosp_manifest_include_and_local_override);
     RUN_TEST(aosp_manifest_rejects_parent_path);
@@ -677,4 +849,5 @@ SUITE(aosp) {
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
     RUN_TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges);
+    RUN_TEST(aosp_structural_federation_collects_cross_repo_candidates_only);
 }

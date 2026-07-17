@@ -82,7 +82,7 @@ int cbm_aosp_search_symbols(const cbm_aosp_workspace_t *workspace, const char *q
                             cbm_aosp_symbol_t **results, int *count, char *err, size_t err_size);
 void cbm_aosp_symbols_free(cbm_aosp_symbol_t *results, int count);
 
-/* `codebase-memory-mcp aosp init|index|status|repos|search ...`. */
+/* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
 int cbm_cmd_aosp(int argc, char **argv);
 
 #endif /* CBM_AOSP_H */

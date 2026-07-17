@@ -557,6 +557,9 @@ codebase-memory-mcp aosp modules /path/to/aosp --query libbinder
 codebase-memory-mcp aosp link /path/to/aosp
 codebase-memory-mcp aosp protocols /path/to/aosp --query IAudioFlinger
 
+# Collect structural cross-repository symbol edges after all shards are indexed.
+codebase-memory-mcp aosp federate /path/to/aosp
+
 # Inspect coverage and search definitions across all indexed repositories.
 codebase-memory-mcp aosp status /path/to/aosp
 codebase-memory-mcp aosp repos /path/to/aosp
@@ -582,6 +585,9 @@ Implementation status, remaining milestones, acceptance criteria, and verificati
 evidence are tracked in [`docs/AOSP_SUPPORT_PLAN.md`](docs/AOSP_SUPPORT_PLAN.md).
 The workspace-level cross-repository edge identity, status, evidence, and refresh
 rules are defined in [`docs/AOSP_FEDERATED_GRAPH.md`](docs/AOSP_FEDERATED_GRAPH.md).
+The current federation pass collects import/include, type, inheritance,
+implementation, and annotation relationships. Call and usage federation is tracked
+as the next milestone in the execution plan.
 
 ## MCP Tools
 

@@ -515,7 +515,7 @@ static void print_help(void) {
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
-    printf("  codebase-memory-mcp aosp <init|index|build|modules|link|protocols|status|repos|search> ...\n");
+    printf("  codebase-memory-mcp aosp <init|index|build|modules|link|federate|protocols|status|repos|search> ...\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nUI options:\n");

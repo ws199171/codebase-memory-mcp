@@ -10,6 +10,7 @@
 #include "aosp/build_graph.h"
 #include "aosp/federated_graph.h"
 #include "aosp/protocol_graph.h"
+#include "aosp/structural_graph.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -913,7 +914,7 @@ done:
 static bool is_catalog_symbol(const char *label) {
     static const char *labels[] = {
         "Function", "Method", "Class", "Interface", "Struct", "Enum", "Trait",
-        "Type", "Namespace", "Module", "Variable", "Constant", "Field",
+        "Type", "Namespace", "Module", "Variable", "Constant", "Field", "File", "Decorator",
     };
     if (!label) return false;
     for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
@@ -1224,6 +1225,7 @@ static void print_aosp_usage(FILE *stream) {
         "  codebase-memory-mcp aosp build [root]\n"
         "  codebase-memory-mcp aosp modules [root] [--query text] [--limit N]\n"
         "  codebase-memory-mcp aosp link [root]\n"
+        "  codebase-memory-mcp aosp federate [root]\n"
         "  codebase-memory-mcp aosp protocols [root] [--query text] [--limit N]\n"
         "  codebase-memory-mcp aosp status [root]\n"
         "  codebase-memory-mcp aosp repos [root]\n"
@@ -1383,6 +1385,21 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("  JNI: %d static, %d dynamic edges\n",
                    stats.jni_static_edges, stats.jni_dynamic_edges);
             printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);
+        }
+    } else if (strcmp(action, "federate") == 0) {
+        cbm_aosp_structural_stats_t stats;
+        if (cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP federation failed");
+            exit_code = 1;
+        } else {
+            printf("AOSP structural federation complete\n");
+            printf("  repositories: %d, files: %d, references: %d\n",
+                   stats.repos_scanned, stats.files_scanned, stats.references_seen);
+            printf("  edges: %d (%d resolved, %d ambiguous, %d unresolved)\n",
+                   stats.edges.edge_count, stats.edges.resolved_count,
+                   stats.edges.ambiguous_count, stats.edges.unresolved_count);
+            printf("  local skipped: %d, missing sources: %d\n",
+                   stats.local_references_skipped, stats.missing_sources);
         }
     } else if (strcmp(action, "protocols") == 0) {
         cbm_aosp_protocol_node_t *nodes = NULL;
