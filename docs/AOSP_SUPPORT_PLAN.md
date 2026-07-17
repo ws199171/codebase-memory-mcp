@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `F4` - add ambiguity handling, confidence scoring, and evidence retention.
+- Current task: none.
 - Next task: `F5` - implement cross-edge refresh and dependency invalidation.
-- Worktree baseline: `ab9b1c2` on `codex/aosp-federated-graph`.
+- Worktree baseline: `60dc77b` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -90,7 +90,7 @@ complete:
 - [x] `F3` Resolve cross-repository calls and usages to definition symbols.
   Acceptance: C/C++, Java, Kotlin, and Rust fixtures cover direct, qualified, and
   unresolved references across repositories.
-- [ ] `F4` Add ambiguity handling, confidence scoring, and evidence retention.
+- [x] `F4` Add ambiguity handling, confidence scoring, and evidence retention.
   Acceptance: duplicate-name fixtures never produce an unsupported name-only edge;
   ambiguous candidates remain queryable.
 - [ ] `F5` Implement per-repository cross-edge refresh and dependency invalidation.
@@ -228,3 +228,4 @@ unaccepted critical coverage gap.
 | `F1` | `21e7483` | v3 migration, deterministic/isolated refresh tests, 176 focused tests, production schema v4 smoke |
 | `F2` | `d53eb01` | Six structural edge classes, local-edge exclusion, 177 focused tests, production `aosp federate` smoke |
 | `F3` | `0b1774e` | C/C++, Java, Kotlin, and Rust calls/usages; local, ambiguous, unresolved coverage; 177 focused tests; production two-repository federation smoke |
+| `F4` | `60dc77b` | Qualified/short-name confidence tiers, structured candidate evidence, qualifier-mismatch rejection, duplicate-name ambiguity fixture, 177 focused tests, production three-state smoke |
