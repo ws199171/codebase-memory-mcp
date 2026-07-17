@@ -233,6 +233,58 @@ int cbm_aosp_trace_path(const cbm_aosp_workspace_t *workspace,
                         char *err, size_t err_size);
 void cbm_aosp_trace_result_free(cbm_aosp_trace_result_t *result);
 
+/* Q4: Read-only federated query_graph for multi-hop patterns across code,
+ * module, and protocol relationships. */
+
+typedef enum {
+    CBM_AOSP_QUERY_KIND_SYMBOL = 0,   /* code symbol-to-symbol edges */
+    CBM_AOSP_QUERY_KIND_MODULE = 1,   /* build module dependencies */
+    CBM_AOSP_QUERY_KIND_PROTOCOL = 2, /* protocol (Binder/JNI) edges */
+} cbm_aosp_query_kind_t;
+
+typedef struct {
+    cbm_aosp_query_kind_t kind;
+    cbm_aosp_trace_direction_t direction; /* OUTGOING, INCOMING, or BOTH */
+    const char *edge_type;               /* NULL = any edge type */
+} cbm_aosp_query_hop_t;
+
+typedef struct {
+    cbm_aosp_query_hop_t *hops; /* ordered pattern of hops */
+    int hop_count;
+    int max_results;            /* 0 = unlimited */
+} cbm_aosp_query_graph_options_t;
+
+typedef struct {
+    char *node_id;              /* global_id, module_id, or protocol_id */
+    char *repo_id;
+    char *name;
+    char *qualified_name;
+    cbm_aosp_query_kind_t kind; /* what kind of node this is */
+    char *file_path;
+    int start_line;
+    char *edge_type;            /* edge that led here, NULL for start */
+    double confidence;          /* edge confidence (0.0 for start) */
+    int hop_index;              /* 0 = start, 1 = after first hop, etc. */
+    bool cross_repo;            /* true if this hop crossed a repo boundary */
+} cbm_aosp_query_node_t;
+
+typedef struct {
+    cbm_aosp_query_node_t *nodes;
+    int node_count;
+    bool truncated;
+} cbm_aosp_query_graph_result_t;
+
+/* Execute a multi-hop federated graph query starting from a code symbol.
+ * Each hop in the pattern specifies a relation kind (symbol/module/protocol),
+ * direction, and optional edge type filter. The query traverses local shard
+ * edges, cross-repository edges, module dependencies, and protocol edges. */
+int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
+                         const char *start_global_id,
+                         const cbm_aosp_query_graph_options_t *options,
+                         cbm_aosp_query_graph_result_t *out,
+                         char *err, size_t err_size);
+void cbm_aosp_query_graph_result_free(cbm_aosp_query_graph_result_t *result);
+
 /* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
 int cbm_cmd_aosp(int argc, char **argv);
 

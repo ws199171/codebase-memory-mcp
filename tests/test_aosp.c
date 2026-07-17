@@ -872,6 +872,301 @@ TEST(aosp_trace_path_traverses_local_and_cross_repo_edges) {
     PASS();
 }
 
+static int insert_module(const cbm_aosp_workspace_t *workspace, const char *module_id,
+                         const char *repo_id, const char *name, const char *type,
+                         const char *file_path) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO modules(module_id,workspace_id,repo_id,name,module_type,file_path,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, module_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, file_path, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int insert_module_dep(const cbm_aosp_workspace_t *workspace,
+                             const char *source_id, const char *target_name,
+                             const char *target_id, const char *type) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO module_dependencies(source_id,target_name,type,target_id,resolved,properties) "
+            "VALUES(?1,?2,?3,?4,1,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, source_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, target_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, target_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int insert_protocol_node(const cbm_aosp_workspace_t *workspace,
+                                const char *protocol_id, const char *repo_id,
+                                const char *kind, const char *name,
+                                const char *qualified_name, const char *file_path,
+                                const char *symbol_global_id) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO protocol_nodes(protocol_id,workspace_id,repo_id,kind,name,"
+            "qualified_name,file_path,symbol_global_id,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, protocol_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, qualified_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, file_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, symbol_global_id ? symbol_global_id : "", -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int insert_protocol_edge(const cbm_aosp_workspace_t *workspace,
+                                const char *source_id, const char *target_id,
+                                const char *type, double confidence,
+                                const char *evidence) {
+    char master_path[4096];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open(master_path, &db) != SQLITE_OK) goto done;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+            "VALUES(?1,?2,?3,?4,?5,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, source_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, target_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 4, confidence);
+    sqlite3_bind_text(stmt, 5, evidence, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_paths[2][4096];
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/qg-%d.db", root, i);
+        ASSERT_EQ(create_trace_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+        ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[i].repo_id, shard_paths[i]), 0);
+    }
+
+    /* Resolve start symbol */
+    cbm_aosp_symbol_resolution_t res;
+    ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "alpha.Start", &res, err, sizeof(err)), 0);
+    char *start_gid = strdup(res.candidates[0].global_id);
+    char *start_repo_id = strdup(res.candidates[0].repo_id);
+    cbm_aosp_symbol_resolution_free(&res);
+
+    /* Insert modules: one in repo 0 (Start's and Mid's file), one in repo 1 */
+    ASSERT_EQ(insert_module(&workspace, "mod-alpha", start_repo_id,
+                            "libalpha", "cc_library_shared", "alpha/Start.java"), 0);
+    ASSERT_EQ(insert_module(&workspace, "mod-alpha-mid", start_repo_id,
+                            "libalpha_mid", "cc_library_shared", "alpha/Mid.java"), 0);
+    ASSERT_EQ(insert_module(&workspace, "mod-beta", workspace.repos[1].repo_id,
+                            "libbeta", "cc_library_shared", "beta/Target.java"), 0);
+    /* Module dependency: mod-alpha-mid depends on mod-beta */
+    ASSERT_EQ(insert_module_dep(&workspace, "mod-alpha-mid", "libbeta", "mod-beta",
+                                "shared_libs"), 0);
+
+    /* Insert protocol node linked to Start symbol */
+    ASSERT_EQ(insert_protocol_node(&workspace, "proto-start", start_repo_id,
+                                   "AIDL", "IStart", "alpha.IStart",
+                                   "alpha/Start.java", start_gid), 0);
+    ASSERT_EQ(insert_protocol_node(&workspace, "proto-target", workspace.repos[1].repo_id,
+                                   "AIDL", "ITarget", "beta.ITarget",
+                                   "beta/Target.java", NULL), 0);
+    /* Protocol edge: proto-start implements proto-target */
+    ASSERT_EQ(insert_protocol_edge(&workspace, "proto-start", "proto-target",
+                                   "AIDL_PROXY", 0.9, "aidl_link"), 0);
+
+    /* Test 1: Single-hop SYMBOL query (same as trace_path with depth 1) */
+    cbm_aosp_query_hop_t code_hop = {0};
+    code_hop.kind = CBM_AOSP_QUERY_KIND_SYMBOL;
+    code_hop.direction = CBM_AOSP_TRACE_OUTGOING;
+    code_hop.edge_type = NULL;
+
+    cbm_aosp_query_graph_options_t opts = {0};
+    opts.hops = &code_hop;
+    opts.hop_count = 1;
+    opts.max_results = 0;
+
+    cbm_aosp_query_graph_result_t result;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    /* Start + alpha.Mid (local CALLS) = 2 nodes */
+    ASSERT_EQ(result.node_count, 2);
+    ASSERT_EQ(result.nodes[0].hop_index, 0);
+    ASSERT_EQ(result.nodes[0].kind, CBM_AOSP_QUERY_KIND_SYMBOL);
+    ASSERT_EQ(result.nodes[1].hop_index, 1);
+    ASSERT_EQ(result.nodes[1].kind, CBM_AOSP_QUERY_KIND_SYMBOL);
+    ASSERT_STR_EQ(result.nodes[1].edge_type, "CALLS");
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 2: SYMBOL → MODULE pattern (find containing module) */
+    cbm_aosp_query_hop_t hops2[2] = {0};
+    hops2[0].kind = CBM_AOSP_QUERY_KIND_SYMBOL;
+    hops2[0].direction = CBM_AOSP_TRACE_OUTGOING;
+    hops2[1].kind = CBM_AOSP_QUERY_KIND_MODULE;
+    hops2[1].direction = CBM_AOSP_TRACE_BOTH;
+
+    opts.hops = hops2;
+    opts.hop_count = 2;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    /* Start (SYMBOL, hop 0), alpha.Mid (SYMBOL, hop 1), mod-alpha-mid (MODULE, hop 2) */
+    ASSERT(result.node_count >= 3);
+    bool found_module = false;
+    for (int i = 0; i < result.node_count; i++) {
+        if (result.nodes[i].kind == CBM_AOSP_QUERY_KIND_MODULE) {
+            found_module = true;
+            ASSERT_STR_EQ(result.nodes[i].node_id, "mod-alpha-mid");
+            ASSERT_EQ(result.nodes[i].hop_index, 2);
+        }
+    }
+    ASSERT(found_module);
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 3: SYMBOL → MODULE → MODULE pattern (follow module deps) */
+    cbm_aosp_query_hop_t hops3[3] = {0};
+    hops3[0].kind = CBM_AOSP_QUERY_KIND_SYMBOL;
+    hops3[0].direction = CBM_AOSP_TRACE_OUTGOING;
+    hops3[1].kind = CBM_AOSP_QUERY_KIND_MODULE;
+    hops3[1].direction = CBM_AOSP_TRACE_BOTH;
+    hops3[2].kind = CBM_AOSP_QUERY_KIND_MODULE;
+    hops3[2].direction = CBM_AOSP_TRACE_OUTGOING;
+
+    opts.hops = hops3;
+    opts.hop_count = 3;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    /* Should find mod-beta via mod-alpha's dependency */
+    bool found_beta = false;
+    for (int i = 0; i < result.node_count; i++) {
+        if (result.nodes[i].kind == CBM_AOSP_QUERY_KIND_MODULE &&
+            strcmp(result.nodes[i].node_id, "mod-beta") == 0) {
+            found_beta = true;
+            ASSERT_EQ(result.nodes[i].hop_index, 3);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "depends_on");
+        }
+    }
+    ASSERT(found_beta);
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 4: SYMBOL → PROTOCOL pattern (find linked protocol node from Start) */
+    cbm_aosp_query_hop_t hops4[2] = {0};
+    hops4[0].kind = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    hops4[0].direction = CBM_AOSP_TRACE_BOTH;
+    hops4[1].kind = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    hops4[1].direction = CBM_AOSP_TRACE_OUTGOING;
+
+    opts.hops = hops4;
+    opts.hop_count = 1;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    /* Should find proto-start linked to Start symbol */
+    bool found_proto = false;
+    for (int i = 0; i < result.node_count; i++) {
+        if (result.nodes[i].kind == CBM_AOSP_QUERY_KIND_PROTOCOL) {
+            found_proto = true;
+            ASSERT_STR_EQ(result.nodes[i].node_id, "proto-start");
+            ASSERT_EQ(result.nodes[i].hop_index, 1);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "protocol_link");
+        }
+    }
+    ASSERT(found_proto);
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 5: PROTOCOL → PROTOCOL (follow protocol edges) */
+    cbm_aosp_query_hop_t hops5[2] = {0};
+    hops5[0].kind = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    hops5[0].direction = CBM_AOSP_TRACE_BOTH;
+    hops5[1].kind = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    hops5[1].direction = CBM_AOSP_TRACE_OUTGOING;
+
+    opts.hops = hops5;
+    opts.hop_count = 2;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    /* Should find proto-target via proto-start's AIDL_PROXY edge */
+    bool found_proto_target = false;
+    for (int i = 0; i < result.node_count; i++) {
+        if (result.nodes[i].kind == CBM_AOSP_QUERY_KIND_PROTOCOL &&
+            strcmp(result.nodes[i].node_id, "proto-target") == 0) {
+            found_proto_target = true;
+            ASSERT_EQ(result.nodes[i].hop_index, 2);
+            ASSERT_STR_EQ(result.nodes[i].edge_type, "AIDL_PROXY");
+            ASSERT_EQ(result.nodes[i].confidence, 0.9);
+        }
+    }
+    ASSERT(found_proto_target);
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 6: Result budget truncation */
+    opts.hops = &code_hop;
+    opts.hop_count = 1;
+    opts.max_results = 1;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_gid, &opts, &result, err, sizeof(err)), 0);
+    ASSERT_EQ(result.node_count, 1);
+    ASSERT(result.truncated);
+    cbm_aosp_query_graph_result_free(&result);
+
+    /* Test 7: Missing start symbol */
+    opts.hops = &code_hop;
+    opts.hop_count = 1;
+    opts.max_results = 0;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, "nonexistent", &opts, &result, err, sizeof(err)),
+              -1);
+    ASSERT(strstr(err, "not found") != NULL);
+
+    free(start_gid);
+    free(start_repo_id);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_build_graph_resolves_cross_repo_modules) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1839,6 +2134,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity);
     RUN_TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges);
     RUN_TEST(aosp_trace_path_traverses_local_and_cross_repo_edges);
+    RUN_TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);

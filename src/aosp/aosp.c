@@ -2301,6 +2301,619 @@ done:
     return rc;
 }
 
+/* ── Q4: Federated query_graph ─────────────────────────────────── */
+
+typedef struct {
+    char *node_id;
+    char *repo_id;
+    cbm_aosp_query_kind_t kind;
+    int hop_index;
+    char *edge_type;
+    double confidence;
+    bool cross_repo;
+} qg_queue_item_t;
+
+typedef struct {
+    qg_queue_item_t *items;
+    int capacity;
+    int head;
+    int count;
+} qg_queue_t;
+
+static void qg_queue_init(qg_queue_t *q) {
+    q->items = NULL; q->capacity = 0; q->head = 0; q->count = 0;
+}
+
+static void qg_queue_free(qg_queue_t *q) {
+    if (!q->items) return;
+    for (int i = 0; i < q->count; i++) {
+        int idx = q->head + i;
+        if (idx >= q->capacity) idx -= q->capacity;
+        free(q->items[idx].node_id);
+        free(q->items[idx].repo_id);
+        free(q->items[idx].edge_type);
+    }
+    free(q->items);
+    q->items = NULL; q->capacity = 0; q->head = 0; q->count = 0;
+}
+
+static int qg_queue_push(qg_queue_t *q, const char *node_id, const char *repo_id,
+                         cbm_aosp_query_kind_t kind, int hop_index,
+                         const char *edge_type, double confidence, bool cross_repo) {
+    if (q->count >= q->capacity) {
+        int new_cap = q->capacity == 0 ? 64 : q->capacity * 2;
+        qg_queue_item_t *ni = calloc((size_t)new_cap, sizeof(*ni));
+        if (!ni) return -1;
+        for (int i = 0; i < q->count; i++) {
+            int idx = q->head + i;
+            if (idx >= q->capacity) idx -= q->capacity;
+            ni[i] = q->items[idx];
+        }
+        free(q->items);
+        q->items = ni; q->capacity = new_cap; q->head = 0;
+    }
+    int tail = q->head + q->count;
+    if (tail >= q->capacity) tail -= q->capacity;
+    q->items[tail].node_id = strdup(node_id);
+    q->items[tail].repo_id = strdup(repo_id ? repo_id : "");
+    q->items[tail].kind = kind;
+    q->items[tail].hop_index = hop_index;
+    q->items[tail].edge_type = edge_type ? strdup(edge_type) : NULL;
+    q->items[tail].confidence = confidence;
+    q->items[tail].cross_repo = cross_repo;
+    if (!q->items[tail].node_id || !q->items[tail].repo_id ||
+        (edge_type && !q->items[tail].edge_type)) {
+        free(q->items[tail].node_id);
+        free(q->items[tail].repo_id);
+        free(q->items[tail].edge_type);
+        return -1;
+    }
+    q->count++;
+    return 0;
+}
+
+static qg_queue_item_t qg_queue_pop(qg_queue_t *q) {
+    qg_queue_item_t item = q->items[q->head];
+    q->head++;
+    if (q->head >= q->capacity) q->head = 0;
+    q->count--;
+    return item;
+}
+
+void cbm_aosp_query_graph_result_free(cbm_aosp_query_graph_result_t *result) {
+    if (!result) return;
+    for (int i = 0; i < result->node_count; i++) {
+        free(result->nodes[i].node_id);
+        free(result->nodes[i].repo_id);
+        free(result->nodes[i].name);
+        free(result->nodes[i].qualified_name);
+        free(result->nodes[i].file_path);
+        free(result->nodes[i].edge_type);
+    }
+    free(result->nodes);
+    memset(result, 0, sizeof(*result));
+}
+
+int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
+                         const char *start_global_id,
+                         const cbm_aosp_query_graph_options_t *options,
+                         cbm_aosp_query_graph_result_t *out,
+                         char *err, size_t err_size) {
+    if (!workspace || !start_global_id || !out) {
+        set_error(err, err_size, "AOSP query requires workspace and start symbol", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!options || options->hop_count <= 0) {
+        set_error(err, err_size, "AOSP query requires at least one hop", NULL);
+        return -1;
+    }
+
+    char master_path[AOSP_PATH_BUF];
+    if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) {
+        set_error(err, err_size, "AOSP workspace is not initialized", NULL);
+        return -1;
+    }
+    sqlite3 *master = NULL;
+    sqlite3_stmt *sym_lookup = NULL;
+    sqlite3_stmt *gid_lookup = NULL;
+    sqlite3_stmt *cross_out = NULL;
+    sqlite3_stmt *cross_in = NULL;
+    sqlite3_stmt *mod_by_file = NULL;
+    sqlite3_stmt *mod_dep_out = NULL;
+    sqlite3_stmt *mod_dep_in = NULL;
+    sqlite3_stmt *mod_by_id = NULL;
+    sqlite3_stmt *sym_by_file = NULL;
+    sqlite3_stmt *proto_by_sym = NULL;
+    sqlite3_stmt *proto_edge_out = NULL;
+    sqlite3_stmt *proto_edge_in = NULL;
+    sqlite3_stmt *proto_by_id = NULL;
+    sqlite3_stmt *proto_sym = NULL;
+    int rc = -1;
+
+    if (sqlite3_open_v2(master_path, &master, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot open AOSP master database", master_path);
+        sqlite3_close(master);
+        return -1;
+    }
+    if (sqlite3_prepare_v2(master,
+            "SELECT repo_id, local_node_id, qualified_name, label, file_path, start_line "
+            "FROM symbols WHERE workspace_id=?1 AND global_id=?2;",
+            -1, &sym_lookup, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT global_id FROM symbols WHERE workspace_id=?1 AND repo_id=?2 "
+            "AND local_node_id=?3;",
+            -1, &gid_lookup, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT target_global_id, type, confidence, evidence "
+            "FROM cross_symbol_edges WHERE workspace_id=?1 AND source_global_id=?2 "
+            "AND status='resolved';",
+            -1, &cross_out, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT source_global_id, type, confidence, evidence "
+            "FROM cross_symbol_edges WHERE workspace_id=?1 AND target_global_id=?2 "
+            "AND status='resolved';",
+            -1, &cross_in, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT module_id, name, module_type, file_path FROM modules "
+            "WHERE workspace_id=?1 AND repo_id=?2 AND file_path=?3;",
+            -1, &mod_by_file, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT target_id FROM module_dependencies WHERE source_id=?1 AND resolved=1;",
+            -1, &mod_dep_out, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT source_id FROM module_dependencies WHERE target_id=?1 AND resolved=1;",
+            -1, &mod_dep_in, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT module_id, name, module_type, file_path, repo_id FROM modules "
+            "WHERE module_id=?1;",
+            -1, &mod_by_id, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT global_id, qualified_name, label, start_line FROM symbols "
+            "WHERE workspace_id=?1 AND repo_id=?2 AND file_path=?3;",
+            -1, &sym_by_file, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT protocol_id, kind, name, qualified_name, file_path, repo_id "
+            "FROM protocol_nodes WHERE workspace_id=?1 AND symbol_global_id=?2;",
+            -1, &proto_by_sym, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT target_id, type, confidence, evidence FROM protocol_edges "
+            "WHERE source_id=?1;",
+            -1, &proto_edge_out, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT source_id, type, confidence, evidence FROM protocol_edges "
+            "WHERE target_id=?1;",
+            -1, &proto_edge_in, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT protocol_id, kind, name, qualified_name, file_path, repo_id, "
+            "symbol_global_id FROM protocol_nodes WHERE protocol_id=?1;",
+            -1, &proto_by_id, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT repo_id, qualified_name, label, file_path, start_line "
+            "FROM symbols WHERE workspace_id=?1 AND global_id=?2;",
+            -1, &proto_sym, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP query statements", sqlite3_errmsg(master));
+        goto done;
+    }
+
+    /* Verify start symbol */
+    sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(sym_lookup, 2, start_global_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(sym_lookup) != SQLITE_ROW) {
+        set_error(err, err_size, "AOSP start symbol not found", start_global_id);
+        goto done;
+    }
+    const char *start_repo_raw = (const char *)sqlite3_column_text(sym_lookup, 0);
+    char *start_repo = strdup(start_repo_raw ? start_repo_raw : "");
+    sqlite3_reset(sym_lookup);
+    sqlite3_clear_bindings(sym_lookup);
+    if (!start_repo) {
+        set_error(err, err_size, "out of memory", NULL);
+        goto done;
+    }
+
+    qg_queue_t queue;
+    qg_queue_init(&queue);
+    trace_visited_t visited;
+    memset(&visited, 0, sizeof(visited));
+
+    int result_cap = options->max_results > 0 ? options->max_results : 256;
+    cbm_aosp_query_node_t *results = calloc((size_t)result_cap, sizeof(*results));
+    if (!results) {
+        set_error(err, err_size, "out of memory", NULL);
+        free(start_repo);
+        goto cleanup_q;
+    }
+
+    /* Enqueue start node */
+    if (qg_queue_push(&queue, start_global_id, start_repo, CBM_AOSP_QUERY_KIND_SYMBOL,
+                      0, NULL, 0.0, false) != 0 ||
+        trace_visited_add(&visited, start_global_id) != 0) {
+        set_error(err, err_size, "out of memory", NULL);
+        free(results);
+        results = NULL;
+        free(start_repo);
+        goto cleanup_q;
+    }
+    free(start_repo);
+
+    bool truncated = false;
+
+    while (queue.count > 0) {
+        qg_queue_item_t item = qg_queue_pop(&queue);
+
+        /* Determine which hop this node belongs to */
+        int hop_idx = item.hop_index;
+        const cbm_aosp_query_hop_t *hop = NULL;
+        if (hop_idx < options->hop_count) {
+            hop = &options->hops[hop_idx];
+        }
+
+        /* Look up node info and add to results */
+        if (out->node_count >= result_cap) {
+            if (options->max_results > 0) {
+                truncated = true;
+                free(item.node_id);
+                free(item.repo_id);
+                free(item.edge_type);
+                break;
+            }
+            int nc = result_cap * 2;
+            cbm_aosp_query_node_t *nr = realloc(results, (size_t)nc * sizeof(*nr));
+            if (!nr) {
+                set_error(err, err_size, "out of memory", NULL);
+                free(item.node_id);
+                free(item.repo_id);
+                free(item.edge_type);
+                free(results);
+                results = NULL;
+                goto cleanup_q;
+            }
+            memset(nr + result_cap, 0, (size_t)(nc - result_cap) * sizeof(*nr));
+            results = nr;
+            result_cap = nc;
+        }
+
+        cbm_aosp_query_node_t *qn = &results[out->node_count];
+        memset(qn, 0, sizeof(*qn));
+        qn->node_id = item.node_id;
+        qn->repo_id = item.repo_id;
+        qn->kind = item.kind;
+        qn->hop_index = item.hop_index;
+        qn->edge_type = item.edge_type;
+        qn->confidence = item.confidence;
+        qn->cross_repo = item.cross_repo;
+        qn->name = strdup("");
+        qn->qualified_name = strdup("");
+        qn->file_path = strdup("");
+        qn->start_line = 0;
+
+        /* Fill in node details based on kind */
+        if (item.kind == CBM_AOSP_QUERY_KIND_SYMBOL) {
+            sqlite3_reset(sym_lookup);
+            sqlite3_clear_bindings(sym_lookup);
+            sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(sym_lookup, 2, item.node_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(sym_lookup) == SQLITE_ROW) {
+                free(qn->qualified_name);
+                free(qn->file_path);
+                qn->qualified_name = dup_column(sym_lookup, 2);
+                qn->file_path = dup_column(sym_lookup, 4);
+                qn->start_line = sqlite3_column_int(sym_lookup, 5);
+                const char *label = (const char *)sqlite3_column_text(sym_lookup, 3);
+                free(qn->name);
+                qn->name = strdup(label ? label : "");
+            }
+        } else if (item.kind == CBM_AOSP_QUERY_KIND_MODULE) {
+            sqlite3_reset(mod_by_id);
+            sqlite3_clear_bindings(mod_by_id);
+            sqlite3_bind_text(mod_by_id, 1, item.node_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(mod_by_id) == SQLITE_ROW) {
+                free(qn->name);
+                free(qn->qualified_name);
+                free(qn->file_path);
+                free(qn->repo_id);
+                qn->name = dup_column(mod_by_id, 1);
+                qn->qualified_name = dup_column(mod_by_id, 1);
+                qn->file_path = dup_column(mod_by_id, 3);
+                qn->repo_id = dup_column(mod_by_id, 4);
+            }
+        } else if (item.kind == CBM_AOSP_QUERY_KIND_PROTOCOL) {
+            sqlite3_reset(proto_by_id);
+            sqlite3_clear_bindings(proto_by_id);
+            sqlite3_bind_text(proto_by_id, 1, item.node_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(proto_by_id) == SQLITE_ROW) {
+                free(qn->name);
+                free(qn->qualified_name);
+                free(qn->file_path);
+                free(qn->repo_id);
+                qn->name = dup_column(proto_by_id, 2);
+                qn->qualified_name = dup_column(proto_by_id, 3);
+                qn->file_path = dup_column(proto_by_id, 4);
+                qn->repo_id = dup_column(proto_by_id, 5);
+            }
+        }
+        out->node_count++;
+
+        /* Don't expand beyond the last hop */
+        if (!hop) continue;
+
+        const char *cur_repo = qn->repo_id;
+
+        /* Expand based on hop kind and current node kind */
+        if (hop->kind == CBM_AOSP_QUERY_KIND_SYMBOL && item.kind == CBM_AOSP_QUERY_KIND_SYMBOL) {
+            /* Follow code edges (local shard + cross-repo) */
+            cbm_aosp_shard_route_t route;
+            if (cbm_aosp_shard_route(workspace, item.node_id, &route, NULL, 0) == 0) {
+                if (hop->direction == CBM_AOSP_TRACE_OUTGOING ||
+                    hop->direction == CBM_AOSP_TRACE_BOTH) {
+                    cbm_aosp_shard_edge_t *edges = NULL;
+                    int ec = 0;
+                    if (cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_OUTGOING,
+                                                   &edges, &ec, NULL, 0) == 0) {
+                        for (int i = 0; i < ec; i++) {
+                            if (hop->edge_type && strcmp(hop->edge_type, edges[i].type) != 0)
+                                continue;
+                            sqlite3_reset(gid_lookup);
+                            sqlite3_clear_bindings(gid_lookup);
+                            sqlite3_bind_text(gid_lookup, 1, workspace->workspace_id, -1,
+                                              SQLITE_TRANSIENT);
+                            sqlite3_bind_text(gid_lookup, 2, cur_repo, -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_int64(gid_lookup, 3, edges[i].neighbor_id);
+                            if (sqlite3_step(gid_lookup) == SQLITE_ROW) {
+                                const char *nid = (const char *)sqlite3_column_text(gid_lookup, 0);
+                                if (nid && !trace_visited_contains(&visited, nid)) {
+                                    char vid[128];
+                                    (void)snprintf(vid, sizeof(vid), "S:%s", nid);
+                                    if (!trace_visited_contains(&visited, vid) &&
+                                        trace_visited_add(&visited, vid) == 0)
+                                        (void)qg_queue_push(&queue, nid, cur_repo,
+                                                            CBM_AOSP_QUERY_KIND_SYMBOL,
+                                                            hop_idx + 1, edges[i].type, 1.0,
+                                                            false);
+                                }
+                            }
+                        }
+                        cbm_aosp_shard_edges_free(edges, ec);
+                    }
+                }
+                if (hop->direction == CBM_AOSP_TRACE_INCOMING ||
+                    hop->direction == CBM_AOSP_TRACE_BOTH) {
+                    cbm_aosp_shard_edge_t *edges = NULL;
+                    int ec = 0;
+                    if (cbm_aosp_shard_read_edges(&route, CBM_AOSP_SHARD_EDGE_INCOMING,
+                                                   &edges, &ec, NULL, 0) == 0) {
+                        for (int i = 0; i < ec; i++) {
+                            if (hop->edge_type && strcmp(hop->edge_type, edges[i].type) != 0)
+                                continue;
+                            sqlite3_reset(gid_lookup);
+                            sqlite3_clear_bindings(gid_lookup);
+                            sqlite3_bind_text(gid_lookup, 1, workspace->workspace_id, -1,
+                                              SQLITE_TRANSIENT);
+                            sqlite3_bind_text(gid_lookup, 2, cur_repo, -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_int64(gid_lookup, 3, edges[i].neighbor_id);
+                            if (sqlite3_step(gid_lookup) == SQLITE_ROW) {
+                                const char *nid = (const char *)sqlite3_column_text(gid_lookup, 0);
+                                if (nid) {
+                                    char vid[128];
+                                    (void)snprintf(vid, sizeof(vid), "S:%s", nid);
+                                    if (!trace_visited_contains(&visited, vid) &&
+                                        trace_visited_add(&visited, vid) == 0)
+                                        (void)qg_queue_push(&queue, nid, cur_repo,
+                                                            CBM_AOSP_QUERY_KIND_SYMBOL,
+                                                            hop_idx + 1, edges[i].type, 1.0,
+                                                            false);
+                                }
+                            }
+                        }
+                        cbm_aosp_shard_edges_free(edges, ec);
+                    }
+                }
+                cbm_aosp_shard_route_close(&route);
+            }
+            /* Cross-repo edges */
+            if (hop->direction == CBM_AOSP_TRACE_OUTGOING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(cross_out);
+                sqlite3_clear_bindings(cross_out);
+                sqlite3_bind_text(cross_out, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(cross_out, 2, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(cross_out) == SQLITE_ROW) {
+                    const char *tid = (const char *)sqlite3_column_text(cross_out, 0);
+                    const char *et = (const char *)sqlite3_column_text(cross_out, 1);
+                    double conf = sqlite3_column_double(cross_out, 2);
+                    if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
+                    if (tid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "S:%s", tid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_SYMBOL,
+                                                hop_idx + 1, et, conf, true);
+                    }
+                }
+            }
+            if (hop->direction == CBM_AOSP_TRACE_INCOMING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(cross_in);
+                sqlite3_clear_bindings(cross_in);
+                sqlite3_bind_text(cross_in, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(cross_in, 2, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(cross_in) == SQLITE_ROW) {
+                    const char *sid = (const char *)sqlite3_column_text(cross_in, 0);
+                    const char *et = (const char *)sqlite3_column_text(cross_in, 1);
+                    double conf = sqlite3_column_double(cross_in, 2);
+                    if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
+                    if (sid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "S:%s", sid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_SYMBOL,
+                                                hop_idx + 1, et, conf, true);
+                    }
+                }
+            }
+        } else if (hop->kind == CBM_AOSP_QUERY_KIND_MODULE &&
+                   item.kind == CBM_AOSP_QUERY_KIND_SYMBOL) {
+            /* Transition: find containing module(s) */
+            sqlite3_reset(sym_lookup);
+            sqlite3_clear_bindings(sym_lookup);
+            sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(sym_lookup, 2, item.node_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(sym_lookup) == SQLITE_ROW) {
+                const char *file = (const char *)sqlite3_column_text(sym_lookup, 4);
+                if (file && file[0]) {
+                    sqlite3_reset(mod_by_file);
+                    sqlite3_clear_bindings(mod_by_file);
+                    sqlite3_bind_text(mod_by_file, 1, workspace->workspace_id, -1,
+                                      SQLITE_TRANSIENT);
+                    sqlite3_bind_text(mod_by_file, 2, cur_repo, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(mod_by_file, 3, file, -1, SQLITE_TRANSIENT);
+                    while (sqlite3_step(mod_by_file) == SQLITE_ROW) {
+                        const char *mid = (const char *)sqlite3_column_text(mod_by_file, 0);
+                        if (mid) {
+                            char vid[128];
+                            (void)snprintf(vid, sizeof(vid), "M:%s", mid);
+                            if (!trace_visited_contains(&visited, vid) &&
+                                trace_visited_add(&visited, vid) == 0)
+                                (void)qg_queue_push(&queue, mid, cur_repo,
+                                                    CBM_AOSP_QUERY_KIND_MODULE,
+                                                    hop_idx + 1, "defined_in", 1.0, false);
+                        }
+                    }
+                }
+            }
+        } else if (hop->kind == CBM_AOSP_QUERY_KIND_MODULE &&
+                   item.kind == CBM_AOSP_QUERY_KIND_MODULE) {
+            /* Follow module dependencies */
+            if (hop->direction == CBM_AOSP_TRACE_OUTGOING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(mod_dep_out);
+                sqlite3_clear_bindings(mod_dep_out);
+                sqlite3_bind_text(mod_dep_out, 1, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(mod_dep_out) == SQLITE_ROW) {
+                    const char *tid = (const char *)sqlite3_column_text(mod_dep_out, 0);
+                    if (tid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "M:%s", tid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_MODULE,
+                                                hop_idx + 1, "depends_on", 1.0, false);
+                    }
+                }
+            }
+            if (hop->direction == CBM_AOSP_TRACE_INCOMING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(mod_dep_in);
+                sqlite3_clear_bindings(mod_dep_in);
+                sqlite3_bind_text(mod_dep_in, 1, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(mod_dep_in) == SQLITE_ROW) {
+                    const char *sid = (const char *)sqlite3_column_text(mod_dep_in, 0);
+                    if (sid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "M:%s", sid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_MODULE,
+                                                hop_idx + 1, "depended_by", 1.0, false);
+                    }
+                }
+            }
+        } else if (hop->kind == CBM_AOSP_QUERY_KIND_PROTOCOL &&
+                   item.kind == CBM_AOSP_QUERY_KIND_SYMBOL) {
+            /* Transition: find linked protocol node(s) */
+            sqlite3_reset(proto_by_sym);
+            sqlite3_clear_bindings(proto_by_sym);
+            sqlite3_bind_text(proto_by_sym, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(proto_by_sym, 2, item.node_id, -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(proto_by_sym) == SQLITE_ROW) {
+                const char *pid = (const char *)sqlite3_column_text(proto_by_sym, 0);
+                if (pid) {
+                    char vid[128];
+                    (void)snprintf(vid, sizeof(vid), "P:%s", pid);
+                    if (!trace_visited_contains(&visited, vid) &&
+                        trace_visited_add(&visited, vid) == 0)
+                        (void)qg_queue_push(&queue, pid, cur_repo,
+                                            CBM_AOSP_QUERY_KIND_PROTOCOL,
+                                            hop_idx + 1, "protocol_link", 1.0, false);
+                }
+            }
+        } else if (hop->kind == CBM_AOSP_QUERY_KIND_PROTOCOL &&
+                   item.kind == CBM_AOSP_QUERY_KIND_PROTOCOL) {
+            /* Follow protocol edges */
+            if (hop->direction == CBM_AOSP_TRACE_OUTGOING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(proto_edge_out);
+                sqlite3_clear_bindings(proto_edge_out);
+                sqlite3_bind_text(proto_edge_out, 1, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(proto_edge_out) == SQLITE_ROW) {
+                    const char *tid = (const char *)sqlite3_column_text(proto_edge_out, 0);
+                    const char *et = (const char *)sqlite3_column_text(proto_edge_out, 1);
+                    double conf = sqlite3_column_double(proto_edge_out, 2);
+                    if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
+                    if (tid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "P:%s", tid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_PROTOCOL,
+                                                hop_idx + 1, et, conf, false);
+                    }
+                }
+            }
+            if (hop->direction == CBM_AOSP_TRACE_INCOMING ||
+                hop->direction == CBM_AOSP_TRACE_BOTH) {
+                sqlite3_reset(proto_edge_in);
+                sqlite3_clear_bindings(proto_edge_in);
+                sqlite3_bind_text(proto_edge_in, 1, item.node_id, -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(proto_edge_in) == SQLITE_ROW) {
+                    const char *sid = (const char *)sqlite3_column_text(proto_edge_in, 0);
+                    const char *et = (const char *)sqlite3_column_text(proto_edge_in, 1);
+                    double conf = sqlite3_column_double(proto_edge_in, 2);
+                    if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
+                    if (sid) {
+                        char vid[128];
+                        (void)snprintf(vid, sizeof(vid), "P:%s", sid);
+                        if (!trace_visited_contains(&visited, vid) &&
+                            trace_visited_add(&visited, vid) == 0)
+                            (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_PROTOCOL,
+                                                hop_idx + 1, et, conf, false);
+                    }
+                }
+            }
+        }
+        /* Other transitions (MODULE→SYMBOL, PROTOCOL→SYMBOL) not needed for
+         * the initial Q4 contract; can be added in later tasks. */
+    }
+
+    out->nodes = results;
+    out->truncated = truncated;
+    rc = 0;
+
+cleanup_q:
+    qg_queue_free(&queue);
+    trace_visited_free(&visited);
+done:
+    sqlite3_finalize(sym_lookup);
+    sqlite3_finalize(gid_lookup);
+    sqlite3_finalize(cross_out);
+    sqlite3_finalize(cross_in);
+    sqlite3_finalize(mod_by_file);
+    sqlite3_finalize(mod_dep_out);
+    sqlite3_finalize(mod_dep_in);
+    sqlite3_finalize(mod_by_id);
+    sqlite3_finalize(sym_by_file);
+    sqlite3_finalize(proto_by_sym);
+    sqlite3_finalize(proto_edge_out);
+    sqlite3_finalize(proto_edge_in);
+    sqlite3_finalize(proto_by_id);
+    sqlite3_finalize(proto_sym);
+    sqlite3_close(master);
+    return rc;
+}
+
 static void print_aosp_usage(FILE *stream) {
     (void)fprintf(stream,
         "Usage:\n"
