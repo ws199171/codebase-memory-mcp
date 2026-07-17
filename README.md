@@ -578,6 +578,9 @@ symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
 registration tables. Each protocol edge records its confidence and evidence;
 ambiguous name-only candidates are not linked.
 
+Implementation status, remaining milestones, acceptance criteria, and verification
+evidence are tracked in [`docs/AOSP_SUPPORT_PLAN.md`](docs/AOSP_SUPPORT_PLAN.md).
+
 ## MCP Tools
 
 ### Indexing
