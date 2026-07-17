@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `Q4` - implement a read-only federated `query_graph` surface.
-- Next task: `Q5` - route workspace search results to exact source snippets.
-- Worktree baseline: Q3 trace_path commit on `codex/aosp-federated-graph`.
+- Current task: `Q5` - route workspace search results to exact source snippets.
+- Next task: `Q6` - add workspace-aware CLI and MCP query contracts.
+- Worktree baseline: Q4 query_graph commit on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
@@ -107,7 +107,7 @@ complete:
 - [x] `Q2` Implement shard routing from Master symbol IDs to repository databases.
 - [x] `Q3` Implement cross-shard `trace_path` traversal with depth, direction,
   cycle, result-budget, and cancellation controls.
-- [ ] `Q4` Implement a read-only federated `query_graph` surface for supported
+- [x] `Q4` Implement a read-only federated `query_graph` surface for supported
   multi-hop patterns across code, module, and protocol relationships.
 - [ ] `Q5` Route workspace search results to exact source snippets.
 - [ ] `Q6` Add workspace-aware CLI and MCP query contracts without breaking
@@ -234,3 +234,4 @@ unaccepted critical coverage gap.
 | `Q1` | `552dca2` | Deterministic global-ID/QN/suffix/short-name resolver, explicit ambiguity and bounded candidate reporting, schema v7 indexed leaf migration, mixed C++/Rust separator normalization, 179 focused tests, production `-Werror` build and real C++ shard/index-plan smoke |
 | `Q2` | `0eee37b` | Master-to-shard routing by global_id and resolved symbol, read-only shard node/edge reads with outgoing/incoming direction, missing-symbol and unindexed-repo error paths, 180 focused tests, production `-Werror` build |
 | `Q3` | `dc5cdbb` | BFS cross-shard trace_path with depth/direction/cycle/budget/cancel controls, local shard edges and resolved cross-repository edges, incoming/outgoing/both traversal, 181 focused tests, production `-Werror` build |
+| `Q4` | `5d6b4cb` | Multi-hop federated query_graph across code/module/protocol relationships, SYMBOL→SYMBOL/MODULE/PROTOCOL transitions, module dependency and protocol edge traversal, edge-type filter, result budget, 182 focused tests, production `-Werror` build |

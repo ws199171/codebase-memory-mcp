@@ -192,6 +192,37 @@ evidence, 0.0 confidence, depth 0, and `cross_repo` false.
 
 This is the internal Q3 contract used by later federated query tasks (Q4).
 
+## Federated Query Graph
+
+`cbm_aosp_query_graph` executes a multi-hop pattern query starting from a code
+symbol. Each hop in the pattern specifies a relation kind, direction, and
+optional edge type filter. The query traverses local shard edges, cross-
+repository edges, build module dependencies, and protocol edges in a single
+BFS pass.
+
+Supported hop kinds and transitions:
+
+| Current node | Hop kind | Action |
+|---|---|---|
+| SYMBOL | SYMBOL | Follow code edges (local shard + cross-repository) |
+| SYMBOL | MODULE | Find containing module(s) by matching file path |
+| SYMBOL | PROTOCOL | Find linked protocol node(s) by `symbol_global_id` |
+| MODULE | MODULE | Follow resolved `module_dependencies` |
+| PROTOCOL | PROTOCOL | Follow `protocol_edges` |
+
+Each result node carries its node ID (global_id, module_id, or protocol_id),
+kind, repository ID, name, qualified name, file path, the edge type and
+confidence that led to it, the hop index in the pattern, and a `cross_repo`
+flag. The start node has a NULL edge type, 0.0 confidence, hop index 0, and
+`cross_repo` false.
+
+Cycle detection uses a visited set keyed by `"K:node_id"` where K is the node
+kind prefix (S/M/P), preventing revisits across different relationship types.
+The result budget provides early termination with a `truncated` flag.
+
+This is the internal Q4 contract. Public workspace-aware CLI and MCP
+compatibility is introduced by Q6.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
