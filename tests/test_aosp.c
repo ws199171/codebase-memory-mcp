@@ -3,6 +3,7 @@
 #include "test_helpers.h"
 
 #include "aosp/aosp.h"
+#include "aosp/build_graph.h"
 #include "foundation/compat_fs.h"
 #include "mcp/mcp.h"
 
@@ -32,6 +33,7 @@ static int create_workspace_fixture(char **root_out) {
     if (make_dir(root, ".repo/manifests") != 0 ||
         make_dir(root, ".repo/local_manifests") != 0 ||
         make_dir(root, "frameworks/base") != 0 ||
+        make_dir(root, "frameworks/base/media") != 0 ||
         make_dir(root, "vendor/acme/widgets") != 0) {
         th_rmtree(root);
         free(root);
@@ -48,7 +50,26 @@ static int create_workspace_fixture(char **root_out) {
             "<manifest>"
             "<remove-project name=\"platform/system/core\"/>"
             "<project name=\"acme/widgets\" path=\"vendor/acme/widgets\"/>"
-            "</manifest>") != 0) {
+            "</manifest>") != 0 ||
+        write_relative(root, "frameworks/base/Android.bp",
+            "cc_library_shared {\n"
+            "  name: \"libframework_audio\",\n"
+            "  shared_libs: [\"libvendor_audio\", \"libmissing\"],\n"
+            "  static_libs: [\"libbase_defaults\"],\n"
+            "  target: { android: { shared_libs: [\"libandroid_extra\"] } },\n"
+            "}\n"
+            "cc_defaults { name: \"libbase_defaults\" }\n"
+            "cc_library { name: \"libandroid_extra\" }\n"
+            "aidl_interface { name: \"android.media.audio\", imports: [\"vendor.acme.audio\"] }\n") != 0 ||
+        write_relative(root, "frameworks/base/media/IAudioService.aidl",
+            "package android.media;\ninterface IAudioService { void start(); }\n") != 0 ||
+        write_relative(root, "vendor/acme/widgets/Android.bp",
+            "aidl_interface { name: \"vendor.acme.audio\" }\n") != 0 ||
+        write_relative(root, "vendor/acme/widgets/Android.mk",
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := libvendor_audio\n"
+            "LOCAL_SHARED_LIBRARIES := libbase_defaults\n"
+            "include $(BUILD_SHARED_LIBRARY)\n") != 0) {
         th_rmtree(root);
         free(root);
         return -1;
@@ -227,6 +248,47 @@ TEST(aosp_catalog_and_global_symbol_search) {
     PASS();
 }
 
+TEST(aosp_build_graph_resolves_cross_repo_modules) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.blueprint_files, 2);
+    ASSERT_EQ(stats.make_files, 1);
+    ASSERT_EQ(stats.aidl_files, 1);
+    ASSERT_EQ(stats.module_count, 7);
+    ASSERT_EQ(stats.dependency_count, 6);
+    ASSERT_EQ(stats.resolved_count, 5);
+    ASSERT_EQ(stats.unresolved_count, 1);
+
+    cbm_aosp_module_t *modules = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_aosp_search_modules(&workspace, "libframework_audio", 10, &modules,
+                                      &count, err, sizeof(err)), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(modules[0].repo_path, "frameworks/base");
+    ASSERT_EQ(modules[0].outgoing_dependencies, 3);
+    cbm_aosp_modules_free(modules, count);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"libframework_audio\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT(response != NULL);
+    ASSERT(strstr(response, "\"isError\":false") != NULL);
+    ASSERT(strstr(response, "libframework_audio") != NULL);
+    ASSERT(strstr(response, "dependencies_unresolved") != NULL);
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(aosp) {
     RUN_TEST(aosp_manifest_include_and_local_override);
     RUN_TEST(aosp_manifest_rejects_parent_path);
@@ -234,4 +296,5 @@ SUITE(aosp) {
     RUN_TEST(aosp_workspace_ids_are_root_scoped);
     RUN_TEST(aosp_master_sync_and_stats);
     RUN_TEST(aosp_catalog_and_global_symbol_search);
+    RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
 }

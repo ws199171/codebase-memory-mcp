@@ -1,0 +1,950 @@
+/* AOSP Soong/Make build graph extraction. */
+#include "aosp/build_graph.h"
+
+#include "foundation/compat_fs.h"
+#include "foundation/sha256.h"
+
+#include <sqlite3.h>
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum {
+    BG_PATH_MAX = 4096,
+    BG_MAX_FILE_BYTES = 32 * 1024 * 1024,
+    BG_MAX_WALK_DEPTH = 256,
+};
+
+typedef struct {
+    char **items;
+    int count;
+    int cap;
+} str_vec_t;
+
+typedef struct {
+    char *name;
+    char *kind;
+} dep_decl_t;
+
+typedef struct {
+    char *name;
+    char *type;
+    char *file_path;
+    dep_decl_t *deps;
+    int dep_count;
+    int dep_cap;
+} module_decl_t;
+
+typedef struct {
+    module_decl_t *items;
+    int count;
+    int cap;
+} module_vec_t;
+
+typedef struct {
+    const char *source;
+    size_t length;
+    size_t pos;
+} lexer_t;
+
+typedef enum {
+    TOK_EOF,
+    TOK_IDENT,
+    TOK_STRING,
+    TOK_LBRACE,
+    TOK_RBRACE,
+    TOK_LBRACKET,
+    TOK_RBRACKET,
+    TOK_COLON,
+    TOK_COMMA,
+    TOK_PLUS,
+    TOK_OTHER,
+} token_kind_t;
+
+typedef struct {
+    token_kind_t kind;
+    char *text;
+} token_t;
+
+typedef struct {
+    lexer_t lexer;
+    token_t current;
+} parser_t;
+
+typedef struct {
+    const cbm_aosp_workspace_t *workspace;
+    const cbm_aosp_repo_t *repo;
+    module_vec_t modules;
+    cbm_aosp_build_stats_t stats;
+    char *err;
+    size_t err_size;
+} scan_ctx_t;
+
+static void bg_error(char *err, size_t err_size, const char *message, const char *detail) {
+    if (!err || err_size == 0) return;
+    if (detail && detail[0]) {
+        (void)snprintf(err, err_size, "%s: %s", message, detail);
+    } else {
+        (void)snprintf(err, err_size, "%s", message);
+    }
+}
+
+static char *bg_read_file(const char *path, size_t *length_out) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        (void)fclose(file);
+        return NULL;
+    }
+    long length = ftell(file);
+    if (length < 0 || length > BG_MAX_FILE_BYTES || fseek(file, 0, SEEK_SET) != 0) {
+        (void)fclose(file);
+        return NULL;
+    }
+    char *source = malloc((size_t)length + 1);
+    if (!source) {
+        (void)fclose(file);
+        return NULL;
+    }
+    size_t read = fread(source, 1, (size_t)length, file);
+    (void)fclose(file);
+    if (read != (size_t)length) {
+        free(source);
+        return NULL;
+    }
+    source[read] = '\0';
+    if (length_out) *length_out = read;
+    return source;
+}
+
+static bool str_vec_add(str_vec_t *vec, const char *value) {
+    if (!vec || !value || !value[0]) return true;
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 8;
+        char **items = realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    vec->items[vec->count] = strdup(value);
+    if (!vec->items[vec->count]) return false;
+    vec->count++;
+    return true;
+}
+
+static void str_vec_free(str_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) free(vec->items[i]);
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static bool module_add_dep(module_decl_t *module, const char *name, const char *kind) {
+    if (!module || !name || !name[0] || !kind) return true;
+    if (strstr(name, "$(") || strstr(name, "${")) return true;
+    for (int i = 0; i < module->dep_count; i++) {
+        if (strcmp(module->deps[i].name, name) == 0 && strcmp(module->deps[i].kind, kind) == 0) {
+            return true;
+        }
+    }
+    if (module->dep_count == module->dep_cap) {
+        int new_cap = module->dep_cap ? module->dep_cap * 2 : 8;
+        dep_decl_t *deps = realloc(module->deps, (size_t)new_cap * sizeof(*deps));
+        if (!deps) return false;
+        module->deps = deps;
+        module->dep_cap = new_cap;
+    }
+    dep_decl_t *dep = &module->deps[module->dep_count];
+    dep->name = strdup(name);
+    dep->kind = strdup(kind);
+    if (!dep->name || !dep->kind) {
+        free(dep->name);
+        free(dep->kind);
+        return false;
+    }
+    module->dep_count++;
+    return true;
+}
+
+static void module_free(module_decl_t *module) {
+    if (!module) return;
+    free(module->name);
+    free(module->type);
+    free(module->file_path);
+    for (int i = 0; i < module->dep_count; i++) {
+        free(module->deps[i].name);
+        free(module->deps[i].kind);
+    }
+    free(module->deps);
+    memset(module, 0, sizeof(*module));
+}
+
+static bool module_vec_add(module_vec_t *vec, module_decl_t *module) {
+    if (!module->name || !module->name[0] || strstr(module->name, "$(") ||
+        strstr(module->name, "${")) {
+        module_free(module);
+        return true;
+    }
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 64;
+        module_decl_t *items = realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    vec->items[vec->count++] = *module;
+    memset(module, 0, sizeof(*module));
+    return true;
+}
+
+static void module_vec_free(module_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) module_free(&vec->items[i]);
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static void token_free(token_t *token) {
+    if (!token) return;
+    free(token->text);
+    token->text = NULL;
+}
+
+static void lexer_skip(lexer_t *lexer) {
+    while (lexer->pos < lexer->length) {
+        unsigned char c = (unsigned char)lexer->source[lexer->pos];
+        if (isspace(c)) {
+            lexer->pos++;
+            continue;
+        }
+        if (c == '/' && lexer->pos + 1 < lexer->length && lexer->source[lexer->pos + 1] == '/') {
+            lexer->pos += 2;
+            while (lexer->pos < lexer->length && lexer->source[lexer->pos] != '\n') lexer->pos++;
+            continue;
+        }
+        if (c == '/' && lexer->pos + 1 < lexer->length && lexer->source[lexer->pos + 1] == '*') {
+            lexer->pos += 2;
+            while (lexer->pos + 1 < lexer->length &&
+                   !(lexer->source[lexer->pos] == '*' && lexer->source[lexer->pos + 1] == '/')) {
+                lexer->pos++;
+            }
+            if (lexer->pos + 1 < lexer->length) lexer->pos += 2;
+            continue;
+        }
+        break;
+    }
+}
+
+static token_t lexer_next(lexer_t *lexer) {
+    lexer_skip(lexer);
+    token_t token = {0};
+    if (lexer->pos >= lexer->length) {
+        token.kind = TOK_EOF;
+        return token;
+    }
+    char c = lexer->source[lexer->pos++];
+    switch (c) {
+        case '{': token.kind = TOK_LBRACE; return token;
+        case '}': token.kind = TOK_RBRACE; return token;
+        case '[': token.kind = TOK_LBRACKET; return token;
+        case ']': token.kind = TOK_RBRACKET; return token;
+        case ':': token.kind = TOK_COLON; return token;
+        case ',': token.kind = TOK_COMMA; return token;
+        case '+': token.kind = TOK_PLUS; return token;
+        case '"': {
+            token.kind = TOK_STRING;
+            size_t cap = 32;
+            size_t count = 0;
+            token.text = malloc(cap);
+            if (!token.text) return token;
+            while (lexer->pos < lexer->length) {
+                char ch = lexer->source[lexer->pos++];
+                if (ch == '"') break;
+                if (ch == '\\' && lexer->pos < lexer->length) {
+                    char escaped = lexer->source[lexer->pos++];
+                    ch = escaped == 'n' ? '\n' : escaped == 't' ? '\t' : escaped;
+                }
+                if (count + 1 >= cap) {
+                    cap *= 2;
+                    char *grown = realloc(token.text, cap);
+                    if (!grown) {
+                        token_free(&token);
+                        return token;
+                    }
+                    token.text = grown;
+                }
+                token.text[count++] = ch;
+            }
+            token.text[count] = '\0';
+            return token;
+        }
+        default: break;
+    }
+    if (isalnum((unsigned char)c) || c == '_' || c == '.' || c == '-') {
+        size_t start = lexer->pos - 1;
+        while (lexer->pos < lexer->length) {
+            unsigned char ch = (unsigned char)lexer->source[lexer->pos];
+            if (!isalnum(ch) && ch != '_' && ch != '.' && ch != '-') break;
+            lexer->pos++;
+        }
+        size_t length = lexer->pos - start;
+        token.kind = TOK_IDENT;
+        token.text = malloc(length + 1);
+        if (token.text) {
+            memcpy(token.text, lexer->source + start, length);
+            token.text[length] = '\0';
+        }
+        return token;
+    }
+    token.kind = TOK_OTHER;
+    return token;
+}
+
+static void parser_advance(parser_t *parser) {
+    token_free(&parser->current);
+    parser->current = lexer_next(&parser->lexer);
+}
+
+static const char *dependency_kind(const char *key) {
+    if (!key) return NULL;
+    if (strcmp(key, "shared_libs") == 0 || strcmp(key, "runtime_libs") == 0) return "SHARED_LIB";
+    if (strcmp(key, "static_libs") == 0 || strcmp(key, "whole_static_libs") == 0) return "STATIC_LIB";
+    if (strcmp(key, "header_libs") == 0 || strcmp(key, "export_header_lib_headers") == 0) return "HEADER_LIB";
+    if (strcmp(key, "defaults") == 0) return "DEFAULTS";
+    if (strcmp(key, "libs") == 0 || strcmp(key, "java_libs") == 0) return "LIB";
+    if (strcmp(key, "required") == 0 || strcmp(key, "host_required") == 0 ||
+        strcmp(key, "target_required") == 0) return "REQUIRED";
+    if (strcmp(key, "tools") == 0 || strcmp(key, "tool_files") == 0) return "TOOL";
+    if (strcmp(key, "plugins") == 0) return "PLUGIN";
+    if (strcmp(key, "aidl_libs") == 0 || strcmp(key, "imports") == 0) return "AIDL_IMPORT";
+    return NULL;
+}
+
+static bool parse_bp_value(parser_t *parser, module_decl_t *module, const char *key, int depth);
+
+static bool parse_bp_object(parser_t *parser, module_decl_t *module, int depth) {
+    while (parser->current.kind != TOK_EOF && parser->current.kind != TOK_RBRACE) {
+        if (parser->current.kind != TOK_IDENT) {
+            parser_advance(parser);
+            continue;
+        }
+        char *key = parser->current.text ? strdup(parser->current.text) : NULL;
+        parser_advance(parser);
+        if (parser->current.kind != TOK_COLON) {
+            free(key);
+            continue;
+        }
+        parser_advance(parser);
+        bool ok = parse_bp_value(parser, module, key, depth);
+        free(key);
+        if (!ok) return false;
+        if (parser->current.kind == TOK_COMMA) parser_advance(parser);
+    }
+    if (parser->current.kind == TOK_RBRACE) parser_advance(parser);
+    return true;
+}
+
+static bool record_bp_string(module_decl_t *module, const char *key, int depth, const char *value) {
+    if (depth == 1 && key && strcmp(key, "name") == 0 && !module->name) {
+        module->name = strdup(value);
+        return module->name != NULL;
+    }
+    const char *kind = dependency_kind(key);
+    if (kind && strcmp(key, "imports") == 0 &&
+        (!module->type || strcmp(module->type, "aidl_interface") != 0)) {
+        kind = NULL;
+    }
+    return !kind || module_add_dep(module, value, kind);
+}
+
+static bool parse_bp_value(parser_t *parser, module_decl_t *module, const char *key, int depth) {
+    int bracket_depth = 0;
+    while (parser->current.kind != TOK_EOF) {
+        if (parser->current.kind == TOK_STRING) {
+            if (!record_bp_string(module, key, depth, parser->current.text ? parser->current.text : "")) {
+                return false;
+            }
+            parser_advance(parser);
+        } else if (parser->current.kind == TOK_LBRACKET) {
+            bracket_depth++;
+            parser_advance(parser);
+        } else if (parser->current.kind == TOK_RBRACKET) {
+            parser_advance(parser);
+            if (--bracket_depth <= 0) return true;
+        } else if (parser->current.kind == TOK_LBRACE) {
+            parser_advance(parser);
+            if (!parse_bp_object(parser, module, depth + 1)) return false;
+            if (bracket_depth == 0) return true;
+        } else if ((parser->current.kind == TOK_COMMA || parser->current.kind == TOK_RBRACE) &&
+                   bracket_depth == 0) {
+            return true;
+        } else {
+            parser_advance(parser);
+        }
+    }
+    return true;
+}
+
+static bool parse_blueprint(const char *source, size_t length, const char *file_path,
+                            module_vec_t *modules) {
+    parser_t parser = {.lexer = {.source = source, .length = length}};
+    parser.current = lexer_next(&parser.lexer);
+    while (parser.current.kind != TOK_EOF) {
+        if (parser.current.kind != TOK_IDENT) {
+            parser_advance(&parser);
+            continue;
+        }
+        char *type = parser.current.text ? strdup(parser.current.text) : NULL;
+        parser_advance(&parser);
+        if (parser.current.kind != TOK_LBRACE) {
+            free(type);
+            continue;
+        }
+        parser_advance(&parser);
+        module_decl_t module = {.type = type, .file_path = strdup(file_path)};
+        if (!module.type || !module.file_path || !parse_bp_object(&parser, &module, 1) ||
+            !module_vec_add(modules, &module)) {
+            module_free(&module);
+            token_free(&parser.current);
+            return false;
+        }
+    }
+    token_free(&parser.current);
+    return true;
+}
+
+static char *trim(char *text) {
+    while (*text && isspace((unsigned char)*text)) text++;
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) *--end = '\0';
+    return text;
+}
+
+static void make_add_words(module_decl_t *module, char *value, const char *kind) {
+    char *save = NULL;
+    for (char *word = strtok_r(value, " \t", &save); word; word = strtok_r(NULL, " \t", &save)) {
+        (void)module_add_dep(module, word, kind);
+    }
+}
+
+static const char *make_dependency_kind(const char *key) {
+    if (strcmp(key, "LOCAL_SHARED_LIBRARIES") == 0) return "SHARED_LIB";
+    if (strcmp(key, "LOCAL_STATIC_LIBRARIES") == 0 || strcmp(key, "LOCAL_WHOLE_STATIC_LIBRARIES") == 0) return "STATIC_LIB";
+    if (strcmp(key, "LOCAL_HEADER_LIBRARIES") == 0) return "HEADER_LIB";
+    if (strcmp(key, "LOCAL_JAVA_LIBRARIES") == 0 || strcmp(key, "LOCAL_STATIC_JAVA_LIBRARIES") == 0) return "LIB";
+    if (strcmp(key, "LOCAL_REQUIRED_MODULES") == 0) return "REQUIRED";
+    return NULL;
+}
+
+static bool parse_android_mk(char *source, const char *file_path, module_vec_t *modules) {
+    module_decl_t current = {.file_path = strdup(file_path), .type = strdup("android_make")};
+    if (!current.file_path || !current.type) {
+        module_free(&current);
+        return false;
+    }
+    str_vec_t logical = {0};
+    char *save = NULL;
+    char *pending = NULL;
+    size_t pending_len = 0;
+    for (char *line = strtok_r(source, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        char *part = trim(line);
+        size_t len = strlen(part);
+        bool continued = len > 0 && part[len - 1] == '\\';
+        if (continued) part[--len] = '\0';
+        char *grown = realloc(pending, pending_len + len + 2);
+        if (!grown) {
+            free(pending);
+            str_vec_free(&logical);
+            module_free(&current);
+            return false;
+        }
+        pending = grown;
+        if (pending_len) pending[pending_len++] = ' ';
+        memcpy(pending + pending_len, part, len + 1);
+        pending_len += len;
+        if (continued) continue;
+        if (!str_vec_add(&logical, pending)) {
+            free(pending);
+            str_vec_free(&logical);
+            module_free(&current);
+            return false;
+        }
+        free(pending);
+        pending = NULL;
+        pending_len = 0;
+    }
+    free(pending);
+
+    for (int i = 0; i < logical.count; i++) {
+        char *line = logical.items[i];
+        if (strstr(line, "CLEAR_VARS")) {
+            module_free(&current);
+            current.file_path = strdup(file_path);
+            current.type = strdup("android_make");
+            continue;
+        }
+        if (strncmp(line, "include", 7) == 0 && strstr(line, "BUILD_")) {
+            const char *build = strstr(line, "BUILD_");
+            free(current.type);
+            size_t build_len = 0;
+            while (build && (isupper((unsigned char)build[build_len]) || build[build_len] == '_')) {
+                build_len++;
+            }
+            current.type = build_len ? strndup(build, build_len) : strdup("android_make");
+            if (!current.type || !module_vec_add(modules, &current)) {
+                module_free(&current);
+                str_vec_free(&logical);
+                return false;
+            }
+            current.file_path = strdup(file_path);
+            current.type = strdup("android_make");
+            continue;
+        }
+        char *assign = strstr(line, ":=");
+        size_t op_len = 2;
+        if (!assign) assign = strstr(line, "+=");
+        if (!assign) {
+            assign = strchr(line, '=');
+            op_len = 1;
+        }
+        if (!assign) continue;
+        *assign = '\0';
+        char *key = trim(line);
+        char *value = trim(assign + op_len);
+        if (strcmp(key, "LOCAL_MODULE") == 0) {
+            free(current.name);
+            current.name = strdup(value);
+        } else {
+            const char *kind = make_dependency_kind(key);
+            if (kind) make_add_words(&current, value, kind);
+        }
+    }
+    module_free(&current);
+    str_vec_free(&logical);
+    return true;
+}
+
+static bool parse_aidl(const char *source, size_t length, const char *file_path,
+                       module_vec_t *modules) {
+    lexer_t lexer = {.source = source, .length = length};
+    token_t token = lexer_next(&lexer);
+    char *package_name = NULL;
+    char *decl_name = NULL;
+    while (token.kind != TOK_EOF) {
+        if (token.kind == TOK_IDENT && token.text && strcmp(token.text, "package") == 0) {
+            token_free(&token);
+            token = lexer_next(&lexer);
+            if (token.kind == TOK_IDENT && token.text) package_name = strdup(token.text);
+        } else if (token.kind == TOK_IDENT && token.text &&
+                   (strcmp(token.text, "interface") == 0 || strcmp(token.text, "parcelable") == 0 ||
+                    strcmp(token.text, "union") == 0 || strcmp(token.text, "enum") == 0)) {
+            token_free(&token);
+            token = lexer_next(&lexer);
+            if (token.kind == TOK_IDENT && token.text) {
+                decl_name = strdup(token.text);
+                break;
+            }
+        }
+        token_free(&token);
+        token = lexer_next(&lexer);
+    }
+    token_free(&token);
+    if (!decl_name) {
+        free(package_name);
+        return true;
+    }
+    size_t needed = strlen(decl_name) + (package_name ? strlen(package_name) + 1 : 0) + 1;
+    char *qualified = malloc(needed);
+    if (!qualified) {
+        free(package_name);
+        free(decl_name);
+        return false;
+    }
+    if (package_name) {
+        (void)snprintf(qualified, needed, "%s.%s", package_name, decl_name);
+    } else {
+        (void)snprintf(qualified, needed, "%s", decl_name);
+    }
+    module_decl_t module = {.name = qualified, .type = strdup("aidl_decl"),
+                            .file_path = strdup(file_path)};
+    free(package_name);
+    free(decl_name);
+    if (!module.type || !module.file_path || !module_vec_add(modules, &module)) {
+        module_free(&module);
+        return false;
+    }
+    return true;
+}
+
+static bool skip_dir(const char *name) {
+    return strcmp(name, ".git") == 0 || strcmp(name, ".repo") == 0 || strcmp(name, "out") == 0 ||
+           strcmp(name, "node_modules") == 0 || strncmp(name, "bazel-", 6) == 0;
+}
+
+static bool is_nested_repo_boundary(const scan_ctx_t *ctx, const char *abs_path) {
+    for (int i = 0; i < ctx->workspace->repo_count; i++) {
+        const cbm_aosp_repo_t *candidate = &ctx->workspace->repos[i];
+        if (candidate != ctx->repo && candidate->abs_path &&
+            strcmp(candidate->abs_path, abs_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, int depth) {
+    if (depth > BG_MAX_WALK_DEPTH) {
+        bg_error(ctx->err, ctx->err_size, "AOSP build scan depth exceeded", rel_dir);
+        return -1;
+    }
+    cbm_dir_t *dir = cbm_opendir(abs_dir);
+    if (!dir) return 0;
+    cbm_dirent_t *entry;
+    int rc = 0;
+    while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {
+        if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) continue;
+        char abs_path[BG_PATH_MAX];
+        char rel_path[BG_PATH_MAX];
+        (void)snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, entry->name);
+        (void)snprintf(rel_path, sizeof(rel_path), "%s%s%s", rel_dir, rel_dir[0] ? "/" : "",
+                       entry->name);
+        if (entry->is_dir) {
+            if (!skip_dir(entry->name) && !is_nested_repo_boundary(ctx, abs_path)) {
+                rc = scan_tree(ctx, abs_path, rel_path, depth + 1);
+            }
+            continue;
+        }
+        bool is_bp = strcmp(entry->name, "Android.bp") == 0;
+        bool is_mk = strcmp(entry->name, "Android.mk") == 0;
+        size_t name_len = strlen(entry->name);
+        bool is_aidl = name_len > 5 && strcmp(entry->name + name_len - 5, ".aidl") == 0;
+        if (!is_bp && !is_mk && !is_aidl) continue;
+        size_t length = 0;
+        char *source = bg_read_file(abs_path, &length);
+        if (!source) {
+            bg_error(ctx->err, ctx->err_size, "cannot read AOSP build file", abs_path);
+            rc = -1;
+            continue;
+        }
+        bool ok;
+        if (is_bp) {
+            ctx->stats.blueprint_files++;
+            ok = parse_blueprint(source, length, rel_path, &ctx->modules);
+        } else if (is_mk) {
+            ctx->stats.make_files++;
+            ok = parse_android_mk(source, rel_path, &ctx->modules);
+        } else {
+            ctx->stats.aidl_files++;
+            ok = parse_aidl(source, length, rel_path, &ctx->modules);
+        }
+        free(source);
+        if (!ok) {
+            bg_error(ctx->err, ctx->err_size, "cannot parse AOSP build file", abs_path);
+            rc = -1;
+        }
+    }
+    cbm_closedir(dir);
+    return rc;
+}
+
+static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, char out[65]) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&ctx);
+    cbm_sha256_update(&ctx, repo->repo_id, strlen(repo->repo_id));
+    cbm_sha256_update(&ctx, "\0", 1);
+    cbm_sha256_update(&ctx, module->file_path, strlen(module->file_path));
+    cbm_sha256_update(&ctx, "\0", 1);
+    cbm_sha256_update(&ctx, module->type, strlen(module->type));
+    cbm_sha256_update(&ctx, "\0", 1);
+    cbm_sha256_update(&ctx, module->name, strlen(module->name));
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
+}
+
+static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t *contexts,
+                               int context_count, char *err, size_t err_size) {
+    char path[BG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        bg_error(err, err_size, "cannot open AOSP master database", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 10000);
+    char *sql_err = NULL;
+    sqlite3_stmt *reset = NULL;
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_stmt *insert_module = NULL;
+    sqlite3_stmt *insert_dep = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
+    const char *reset_sql =
+        "DELETE FROM module_edges WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1) OR target_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);";
+    if (sqlite3_prepare_v2(db, reset_sql, -1, &reset, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(reset, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(reset) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(reset);
+    reset = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM module_dependencies WHERE source_id IN "
+            "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM modules WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO modules(module_id,workspace_id,repo_id,name,module_type,file_path,properties)"
+            " VALUES(?1,?2,?3,?4,?5,?6,'{}');", -1, &insert_module, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type) VALUES(?1,?2,?3);",
+            -1, &insert_dep, NULL) != SQLITE_OK) goto fail_insert;
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].modules.count; i++) {
+            module_decl_t *module = &contexts[c].modules.items[i];
+            char id[65];
+            module_id(contexts[c].repo, module, id);
+            sqlite3_reset(insert_module);
+            sqlite3_clear_bindings(insert_module);
+            sqlite3_bind_text(insert_module, 1, id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_module, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_module, 3, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_module, 4, module->name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_module, 5, module->type, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_module, 6, module->file_path, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(insert_module) != SQLITE_DONE) goto fail_insert;
+            for (int d = 0; d < module->dep_count; d++) {
+                sqlite3_reset(insert_dep);
+                sqlite3_clear_bindings(insert_dep);
+                sqlite3_bind_text(insert_dep, 1, id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_dep, 2, module->deps[d].name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_dep, 3, module->deps[d].kind, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(insert_dep) != SQLITE_DONE) goto fail_insert;
+            }
+        }
+    }
+    sqlite3_finalize(insert_module);
+    sqlite3_finalize(insert_dep);
+    insert_module = NULL;
+    insert_dep = NULL;
+
+    const char *resolve_sql =
+        "UPDATE module_dependencies SET target_id=(SELECT t.module_id FROM modules t "
+        "JOIN modules s ON s.module_id=module_dependencies.source_id "
+        "WHERE t.workspace_id=?1 AND t.name=module_dependencies.target_name "
+        "ORDER BY (t.repo_id=s.repo_id) DESC,t.module_id LIMIT 1) WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?2);";
+    if (sqlite3_prepare_v2(db, resolve_sql, -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE module_dependencies SET resolved=(target_id IS NOT NULL) WHERE source_id IN "
+            "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
+            "SELECT source_id,target_id,type,'{}' FROM module_dependencies WHERE target_id IS NOT NULL "
+            "AND source_id IN (SELECT module_id FROM modules WHERE workspace_id=?1);",
+            -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_exec(db, "COMMIT;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
+    sqlite3_close(db);
+    return 0;
+
+fail_insert:
+    sqlite3_finalize(insert_module);
+    sqlite3_finalize(insert_dep);
+fail:
+    sqlite3_finalize(reset);
+    sqlite3_finalize(stmt);
+    (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    bg_error(err, err_size, "cannot persist AOSP build graph",
+             sql_err ? sql_err : sqlite3_errmsg(db));
+    sqlite3_free(sql_err);
+    sqlite3_close(db);
+    return -1;
+}
+
+int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_stats_t *stats,
+                         char *err, size_t err_size) {
+    if (!workspace || !stats) return -1;
+    memset(stats, 0, sizeof(*stats));
+    char path[BG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "AOSP workspace is not initialized", path);
+        sqlite3_close(db);
+        return -1;
+    }
+    const char *sql =
+        "SELECT (SELECT count(*) FROM modules WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1 AND d.resolved=1),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1 AND d.resolved=0);";
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "cannot read AOSP build graph", sqlite3_errmsg(db));
+    } else {
+        sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            stats->module_count = sqlite3_column_int(stmt, 0);
+            stats->dependency_count = sqlite3_column_int(stmt, 1);
+            stats->resolved_count = sqlite3_column_int(stmt, 2);
+            stats->unresolved_count = sqlite3_column_int(stmt, 3);
+            rc = 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_stats_t *stats,
+                        char *err, size_t err_size) {
+    if (!workspace || !stats) return -1;
+    if (cbm_aosp_master_sync(workspace, err, err_size) != 0) return -1;
+    scan_ctx_t *contexts = calloc((size_t)workspace->repo_count, sizeof(*contexts));
+    if (!contexts) return -1;
+    int rc = 0;
+    cbm_aosp_build_stats_t file_stats = {0};
+    for (int i = 0; i < workspace->repo_count && rc == 0; i++) {
+        contexts[i].workspace = workspace;
+        contexts[i].repo = &workspace->repos[i];
+        contexts[i].err = err;
+        contexts[i].err_size = err_size;
+        if (workspace->repos[i].exists) {
+            rc = scan_tree(&contexts[i], workspace->repos[i].abs_path, "", 0);
+            file_stats.blueprint_files += contexts[i].stats.blueprint_files;
+            file_stats.make_files += contexts[i].stats.make_files;
+            file_stats.aidl_files += contexts[i].stats.aidl_files;
+        }
+    }
+    if (rc == 0) rc = persist_build_graph(workspace, contexts, workspace->repo_count, err, err_size);
+    if (rc == 0) {
+        rc = cbm_aosp_build_stats(workspace, stats, err, err_size);
+        stats->blueprint_files = file_stats.blueprint_files;
+        stats->make_files = file_stats.make_files;
+        stats->aidl_files = file_stats.aidl_files;
+    }
+    for (int i = 0; i < workspace->repo_count; i++) module_vec_free(&contexts[i].modules);
+    free(contexts);
+    return rc;
+}
+
+void cbm_aosp_modules_free(cbm_aosp_module_t *results, int count) {
+    if (!results) return;
+    for (int i = 0; i < count; i++) {
+        free(results[i].module_id);
+        free(results[i].repo_path);
+        free(results[i].name);
+        free(results[i].module_type);
+        free(results[i].file_path);
+    }
+    free(results);
+}
+
+static char *column_dup(sqlite3_stmt *stmt, int column) {
+    const unsigned char *text = sqlite3_column_text(stmt, column);
+    return strdup(text ? (const char *)text : "");
+}
+
+int cbm_aosp_search_modules(const cbm_aosp_workspace_t *workspace, const char *query, int limit,
+                            cbm_aosp_module_t **results, int *count, char *err, size_t err_size) {
+    if (!workspace || !results || !count) return -1;
+    *results = NULL;
+    *count = 0;
+    if (limit <= 0) limit = 50;
+    if (limit > 500) limit = 500;
+    char path[BG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "AOSP workspace is not initialized", path);
+        sqlite3_close(db);
+        return -1;
+    }
+    const char *sql =
+        "SELECT m.module_id,r.path,m.name,m.module_type,m.file_path,"
+        "(SELECT count(*) FROM module_edges e WHERE e.source_id=m.module_id),"
+        "(SELECT count(*) FROM module_edges e WHERE e.target_id=m.module_id) "
+        "FROM modules m JOIN repos r ON r.repo_id=m.repo_id WHERE m.workspace_id=?1 "
+        "AND (?2='' OR m.name LIKE '%'||?2||'%' OR m.module_type LIKE '%'||?2||'%') "
+        "ORDER BY m.name,m.module_id LIMIT ?3;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "cannot prepare AOSP module search", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, query ? query : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, limit);
+    cbm_aosp_module_t *items = calloc((size_t)limit, sizeof(*items));
+    if (!items) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    int n = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        cbm_aosp_module_t *item = &items[n];
+        item->module_id = column_dup(stmt, 0);
+        item->repo_path = column_dup(stmt, 1);
+        item->name = column_dup(stmt, 2);
+        item->module_type = column_dup(stmt, 3);
+        item->file_path = column_dup(stmt, 4);
+        item->outgoing_dependencies = sqlite3_column_int(stmt, 5);
+        item->incoming_dependencies = sqlite3_column_int(stmt, 6);
+        if (!item->module_id || !item->repo_path || !item->name || !item->module_type ||
+            !item->file_path) {
+            cbm_aosp_modules_free(items, n + 1);
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            return -1;
+        }
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        bg_error(err, err_size, "cannot search AOSP modules", sqlite3_errmsg(db));
+        cbm_aosp_modules_free(items, n);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    *results = items;
+    *count = n;
+    return 0;
+}

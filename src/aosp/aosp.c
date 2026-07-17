@@ -7,6 +7,7 @@
  * summaries. No source repository is modified.
  */
 #include "aosp/aosp.h"
+#include "aosp/build_graph.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -681,6 +682,7 @@ static const char *AOSP_SCHEMA =
     "PRAGMA foreign_keys=ON;"
     "CREATE TABLE IF NOT EXISTS schema_versions(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(1,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -697,6 +699,11 @@ static const char *AOSP_SCHEMA =
     "CREATE TABLE IF NOT EXISTS module_edges("
     " source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL, properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_id,target_id,type));"
+    "CREATE TABLE IF NOT EXISTS module_dependencies("
+    " source_id TEXT NOT NULL, target_name TEXT NOT NULL, type TEXT NOT NULL,"
+    " target_id TEXT, resolved INTEGER NOT NULL DEFAULT 0, properties TEXT DEFAULT '{}',"
+    " PRIMARY KEY(source_id,target_name,type));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_module_deps_target ON module_dependencies(target_name);"
     "CREATE TABLE IF NOT EXISTS symbols("
     " id INTEGER PRIMARY KEY, global_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " local_node_id INTEGER, name TEXT NOT NULL, qualified_name TEXT NOT NULL, label TEXT NOT NULL,"
@@ -1205,6 +1212,8 @@ static void print_aosp_usage(FILE *stream) {
         "Usage:\n"
         "  codebase-memory-mcp aosp init [root]\n"
         "  codebase-memory-mcp aosp index [root] [--repo manifest-path]\n"
+        "  codebase-memory-mcp aosp build [root]\n"
+        "  codebase-memory-mcp aosp modules [root] [--query text] [--limit N]\n"
         "  codebase-memory-mcp aosp status [root]\n"
         "  codebase-memory-mcp aosp repos [root]\n"
         "  codebase-memory-mcp aosp search <query> [root] [--limit N]\n");
@@ -1240,6 +1249,19 @@ int cbm_cmd_aosp(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--repo") == 0 && i + 1 < argc) {
                 repo_filter = argv[++i];
+            } else if (argv[i][0] != '-') {
+                root = argv[i];
+            } else {
+                print_aosp_usage(stderr);
+                return 1;
+            }
+        }
+    } else if (strcmp(action, "modules") == 0) {
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--query") == 0 && i + 1 < argc) {
+                search_query = argv[++i];
+            } else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+                search_limit = atoi(argv[++i]);
             } else if (argv[i][0] != '-') {
                 root = argv[i];
             } else {
@@ -1307,6 +1329,35 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("AOSP index complete: %d indexed, %d failed\n", indexed, failed);
             exit_code = failed == 0 ? 0 : 1;
         }
+    } else if (strcmp(action, "build") == 0) {
+        cbm_aosp_build_stats_t stats;
+        if (cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP build scan failed");
+            exit_code = 1;
+        } else {
+            printf("AOSP build graph complete\n");
+            printf("  files: %d Android.bp, %d Android.mk, %d AIDL\n",
+                   stats.blueprint_files, stats.make_files, stats.aidl_files);
+            printf("  modules: %d\n  dependencies: %d (%d resolved, %d unresolved)\n",
+                   stats.module_count, stats.dependency_count, stats.resolved_count,
+                   stats.unresolved_count);
+        }
+    } else if (strcmp(action, "modules") == 0) {
+        cbm_aosp_module_t *modules = NULL;
+        int count = 0;
+        if (cbm_aosp_search_modules(&workspace, search_query, search_limit, &modules, &count,
+                                    err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP module search failed");
+            exit_code = 1;
+        } else {
+            for (int i = 0; i < count; i++) {
+                printf("%s\t%s\t%s\t%s\tout:%d\tin:%d\n", modules[i].repo_path,
+                       modules[i].module_type, modules[i].name, modules[i].file_path,
+                       modules[i].outgoing_dependencies, modules[i].incoming_dependencies);
+            }
+            printf("%d module%s\n", count, count == 1 ? "" : "s");
+        }
+        cbm_aosp_modules_free(modules, count);
     } else if (strcmp(action, "status") == 0) {
         cbm_aosp_master_stats_t stats;
         if (cbm_aosp_master_stats(&workspace, &stats, err, sizeof(err)) != 0) {

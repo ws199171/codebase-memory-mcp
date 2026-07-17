@@ -176,7 +176,7 @@ SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 STORE_SRCS = src/store/store.c
 
 # AOSP workspace federation control plane
-AOSP_SRCS = src/aosp/aosp.c
+AOSP_SRCS = src/aosp/aosp.c src/aosp/build_graph.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c

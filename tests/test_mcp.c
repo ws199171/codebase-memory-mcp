@@ -296,6 +296,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
     ASSERT_NOT_NULL(strstr(json, "aosp_search_symbols"));
+    ASSERT_NOT_NULL(strstr(json, "aosp_get_architecture"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
     free(json);
     PASS();
@@ -339,6 +340,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"detect_changes", false, true, true, false},
         {"manage_adr", false, true, false, false},
         {"aosp_search_symbols", true, false, true, false},
+        {"aosp_get_architecture", true, false, true, false},
         {"ingest_traces", false, false, false, false},
     };
 
@@ -736,8 +738,18 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
         "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
-    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"16\""));
     ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(resp, "aosp_get_architecture"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/list\",\"params\":{\"cursor\":\"16\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -763,6 +775,7 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
         "index_status",     "check_index_coverage", "detect_changes", "aosp_search_symbols",
+        "aosp_get_architecture",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -801,7 +814,7 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_EQ(mcp_response_tool_count(resp), 8U);
+    ASSERT_EQ(mcp_response_tool_count(resp), 9U);
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "search_graph"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "trace_path"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_code_snippet"));
@@ -810,6 +823,7 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "index_status"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "check_index_coverage"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "aosp_search_symbols"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "aosp_get_architecture"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "query_graph"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "search_code"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "get_graph_schema"));

@@ -39,6 +39,7 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "aosp/aosp.h"
+#include "aosp/build_graph.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -598,6 +599,15 @@ static const tool_def_t TOOLS[] = {
      "\"limit\":{\"type\":\"integer\",\"default\":20,\"maximum\":200}},"
      "\"required\":[\"workspace_root\",\"query\"]}"},
 
+    {"aosp_get_architecture", "Get AOSP architecture",
+     "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
+     "counts and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Optional module name/type filter\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500}},"
+     "\"required\":[\"workspace_root\"]}"},
+
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
@@ -635,6 +645,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"aosp_search_symbols", true, false, true, false},
+    {"aosp_get_architecture", true, false, true, false},
     {"ingest_traces", false, false, false, false},
 };
 
@@ -685,10 +696,12 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
         "index_status",     "check_index_coverage", "detect_changes", "aosp_search_symbols",
+        "aosp_get_architecture",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
         "list_projects", "index_status", "check_index_coverage", "aosp_search_symbols",
+        "aosp_get_architecture",
     };
     if (!name) {
         return false;
@@ -7853,7 +7866,7 @@ static char *handle_aosp_search_symbols(const char *args) {
         free(query);
         return cbm_mcp_text_result("workspace_root and query are required", true);
     }
-    cbm_aosp_workspace_t workspace;
+    cbm_aosp_workspace_t workspace = {0};
     cbm_aosp_symbol_t *symbols = NULL;
     int count = 0;
     char err[CBM_SZ_1K] = {0};
@@ -7893,6 +7906,60 @@ static char *handle_aosp_search_symbols(const char *args) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     cbm_aosp_symbols_free(symbols, count);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(query);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static char *handle_aosp_get_architecture(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 50);
+    if (!workspace_root || !workspace_root[0]) {
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result("workspace_root is required", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    cbm_aosp_build_stats_t stats;
+    cbm_aosp_module_t *modules = NULL;
+    int count = 0;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        cbm_aosp_build_stats(&workspace, &stats, err, sizeof(err)) != 0 ||
+        cbm_aosp_search_modules(&workspace, query, limit, &modules, &count, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP architecture query failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_int(doc, root, "modules_total", stats.module_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_total", stats.dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_resolved", stats.resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_unresolved", stats.unresolved_count);
+    yyjson_mut_obj_add_int(doc, root, "count", count);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "repo", modules[i].repo_path);
+        yyjson_mut_obj_add_strcpy(doc, item, "name", modules[i].name);
+        yyjson_mut_obj_add_strcpy(doc, item, "type", modules[i].module_type);
+        yyjson_mut_obj_add_strcpy(doc, item, "file", modules[i].file_path);
+        yyjson_mut_obj_add_int(doc, item, "outgoing_dependencies", modules[i].outgoing_dependencies);
+        yyjson_mut_obj_add_int(doc, item, "incoming_dependencies", modules[i].incoming_dependencies);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "modules", items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_modules_free(modules, count);
     cbm_aosp_workspace_free(&workspace);
     free(workspace_root);
     free(query);
@@ -7960,6 +8027,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "aosp_search_symbols") == 0) {
         return handle_aosp_search_symbols(args_json);
+    }
+    if (strcmp(tool_name, "aosp_get_architecture") == 0) {
+        return handle_aosp_get_architecture(args_json);
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
