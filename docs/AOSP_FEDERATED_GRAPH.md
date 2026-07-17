@@ -165,6 +165,33 @@ carries the edge type, properties, and the neighbor's local node ID, name,
 qualified name, label, and file path. This is the internal Q2 contract used by
 later cross-shard traversal tasks (Q3).
 
+## Trace Path Traversal
+
+`cbm_aosp_trace_path` traverses the federated graph starting from a Master
+global symbol ID using breadth-first search. It follows local shard edges
+(via Q2 shard routing) and resolved cross-repository edges (from the Master
+`cross_symbol_edges` table) up to a configurable depth.
+
+Traversal controls:
+
+- **max_depth**: maximum hops from the start node (0 = start only, -1 = unlimited)
+- **direction**: `OUTGOING`, `INCOMING`, or `BOTH`
+- **result_budget**: maximum nodes to return (0 = unlimited); sets `truncated`
+  when hit before exhaustion
+- **cancel_flag**: optional pointer to a volatile bool; traversal stops early
+  when set to true
+- **cycle detection**: a visited set keyed by global symbol ID prevents revisiting
+  nodes across both local and cross-repository hops
+
+Each result node carries the symbol's global ID, repository ID, qualified name,
+label, file path, start line, the edge type and evidence that led to it, the edge
+confidence (1.0 for local edges, Master-stored confidence for cross-repository
+edges), the hop depth from start, and a `cross_repo` flag indicating whether the
+hop crossed a repository boundary. The start node has a NULL edge type, NULL
+evidence, 0.0 confidence, depth 0, and `cross_repo` false.
+
+This is the internal Q3 contract used by later federated query tasks (Q4).
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
