@@ -570,6 +570,8 @@ Workspace state is stored under
 `~/.cache/codebase-memory-mcp/workspaces/<workspace-id>/master.db`; repository
 graphs use stable `aosp-<repo-id>.db` shards in the normal cache directory.
 Re-running `aosp index` refreshes the shard and its Master symbol catalog.
+It also queues only source repositories affected by that catalog change;
+`aosp federate` consumes that queue without rescanning unrelated shards.
 
 The shard contains the complete graph produced for that repository. The Master
 provides manifest topology, index state, global definition-symbol lookup, and a

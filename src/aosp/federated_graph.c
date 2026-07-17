@@ -17,7 +17,8 @@ static const char *CROSS_EDGE_TABLE_SQL =
     "CREATE TABLE IF NOT EXISTS cross_symbol_edges("
     " edge_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, source_repo_id TEXT NOT NULL,"
     " target_repo_id TEXT, source_global_id TEXT NOT NULL, target_global_id TEXT,"
-    " target_name TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, status TEXT NOT NULL,"
+    " target_name TEXT NOT NULL DEFAULT '', target_leaf TEXT NOT NULL DEFAULT '',"
+    " type TEXT NOT NULL, status TEXT NOT NULL,"
     " confidence REAL NOT NULL DEFAULT 0, evidence TEXT NOT NULL DEFAULT '',"
     " source_generation TEXT NOT NULL DEFAULT '', properties TEXT NOT NULL DEFAULT '{}',"
     " CHECK(status IN('resolved','ambiguous','unresolved')),"
@@ -33,8 +34,18 @@ static const char *CROSS_EDGE_INDEX_SQL =
     "ON cross_symbol_edges(workspace_id,target_global_id);"
     "CREATE INDEX IF NOT EXISTS idx_aosp_cross_edges_target_name "
     "ON cross_symbol_edges(workspace_id,target_name);"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_cross_edges_target_leaf "
+    "ON cross_symbol_edges(workspace_id,target_leaf,status);"
     "CREATE INDEX IF NOT EXISTS idx_aosp_cross_edges_status "
     "ON cross_symbol_edges(workspace_id,status);";
+
+static const char *CROSS_EDGE_REFRESH_SQL =
+    "CREATE TABLE IF NOT EXISTS cross_edge_refresh_queue("
+    " workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,reason TEXT NOT NULL,"
+    " queued_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));"
+    "CREATE TABLE IF NOT EXISTS cross_edge_refresh_state("
+    " workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,source_generation TEXT NOT NULL,"
+    " refreshed_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,source_repo_id));";
 
 static void fg_error(char *err, size_t err_size, const char *message, const char *detail) {
     if (!err || err_size == 0) return;
@@ -83,6 +94,14 @@ static void cross_edge_id(const char *workspace_id, const char *source_global_id
     digest_hex(digest, out);
 }
 
+static const char *cross_edge_leaf(const char *reference) {
+    const char *leaf = reference ? reference : "";
+    for (const char *p = leaf; *p; p++) {
+        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':' || *p == '>') leaf = p + 1;
+    }
+    return leaf;
+}
+
 static bool table_has_column(sqlite3 *db, const char *table, const char *column) {
     char sql[256];
     (void)snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
@@ -101,10 +120,12 @@ static bool table_has_column(sqlite3 *db, const char *table, const char *column)
     return found;
 }
 
-static int insert_schema_version(sqlite3 *db) {
+static int insert_schema_versions(sqlite3 *db) {
     return sqlite3_exec(db,
         "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
-        "VALUES(4,strftime('%s','now'));", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+        "VALUES(4,strftime('%s','now'));"
+        "INSERT OR IGNORE INTO schema_versions(version,applied_at) "
+        "VALUES(5,strftime('%s','now'));", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
 static int migrate_legacy_edges(sqlite3 *db, char *err, size_t err_size) {
@@ -124,8 +145,8 @@ static int migrate_legacy_edges(sqlite3 *db, char *err, size_t err_size) {
         "LEFT JOIN repos r ON r.repo_id=s.repo_id;";
     const char *insert_sql =
         "INSERT INTO cross_symbol_edges(edge_id,workspace_id,source_repo_id,target_repo_id,"
-        "source_global_id,target_global_id,target_name,type,status,confidence,evidence,"
-        "source_generation,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);";
+        "source_global_id,target_global_id,target_name,target_leaf,type,status,confidence,evidence,"
+        "source_generation,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14);";
     if (sqlite3_prepare_v2(db, read_sql, -1, &read_stmt, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, NULL) != SQLITE_OK) {
         fg_error(err, err_size, "cannot migrate AOSP cross edges", sqlite3_errmsg(db));
@@ -159,15 +180,18 @@ static int migrate_legacy_edges(sqlite3 *db, char *err, size_t err_size) {
         else sqlite3_bind_null(insert_stmt, 6);
         sqlite3_bind_text(insert_stmt, 7, resolved ? target_name : legacy_target_id,
                           -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 8, type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 9, resolved ? "resolved" : "unresolved",
+        sqlite3_bind_text(insert_stmt, 8,
+                          cross_edge_leaf(resolved ? target_name : legacy_target_id),
+                          -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 9, type, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 10, resolved ? "resolved" : "unresolved",
                           -1, SQLITE_STATIC);
-        sqlite3_bind_double(insert_stmt, 10, sqlite3_column_double(read_stmt, 3));
-        sqlite3_bind_text(insert_stmt, 11, evidence ? evidence : "legacy_v3",
+        sqlite3_bind_double(insert_stmt, 11, sqlite3_column_double(read_stmt, 3));
+        sqlite3_bind_text(insert_stmt, 12, evidence ? evidence : "legacy_v3",
                           -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 12, generation ? generation : "",
+        sqlite3_bind_text(insert_stmt, 13, generation ? generation : "",
                           -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 13, properties ? properties : "{}",
+        sqlite3_bind_text(insert_stmt, 14, properties ? properties : "{}",
                           -1, SQLITE_TRANSIENT);
         if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
             fg_error(err, err_size, "cannot migrate AOSP cross edge", sqlite3_errmsg(db));
@@ -184,7 +208,8 @@ static int migrate_legacy_edges(sqlite3 *db, char *err, size_t err_size) {
     insert_stmt = NULL;
     if (fg_exec(db, "DROP TABLE cross_symbol_edges_v3;", err, err_size) != 0 ||
         fg_exec(db, CROSS_EDGE_INDEX_SQL, err, err_size) != 0 ||
-        insert_schema_version(db) != 0 ||
+        fg_exec(db, CROSS_EDGE_REFRESH_SQL, err, err_size) != 0 ||
+        insert_schema_versions(db) != 0 ||
         fg_exec(db, "COMMIT;", err, err_size) != 0) {
         goto done;
     }
@@ -212,9 +237,15 @@ int cbm_aosp_cross_edges_ensure_schema(sqlite3 *db, char *err, size_t err_size) 
     if (exists && !table_has_column(db, "cross_symbol_edges", "edge_id")) {
         return migrate_legacy_edges(db, err, err_size);
     }
+    if (exists && !table_has_column(db, "cross_symbol_edges", "target_leaf") &&
+        fg_exec(db, "ALTER TABLE cross_symbol_edges ADD COLUMN target_leaf "
+                    "TEXT NOT NULL DEFAULT '';", err, err_size) != 0) {
+        return -1;
+    }
     if (fg_exec(db, CROSS_EDGE_TABLE_SQL, err, err_size) != 0 ||
         fg_exec(db, CROSS_EDGE_INDEX_SQL, err, err_size) != 0 ||
-        insert_schema_version(db) != 0) {
+        fg_exec(db, CROSS_EDGE_REFRESH_SQL, err, err_size) != 0 ||
+        insert_schema_versions(db) != 0) {
         if (err && err_size && !err[0]) {
             fg_error(err, err_size, "cannot initialize AOSP cross-edge schema", sqlite3_errmsg(db));
         }
@@ -311,6 +342,8 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
     sqlite3_stmt *source_stmt = NULL;
     sqlite3_stmt *target_stmt = NULL;
     sqlite3_stmt *insert_stmt = NULL;
+    sqlite3_stmt *state_stmt = NULL;
+    sqlite3_stmt *queue_stmt = NULL;
     char *generation = NULL;
     int rc = -1;
     if (sqlite3_open(path, &db) != SQLITE_OK) {
@@ -351,13 +384,23 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
             -1, &target_stmt, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
             "INSERT INTO cross_symbol_edges(edge_id,workspace_id,source_repo_id,target_repo_id,"
-            "source_global_id,target_global_id,target_name,type,status,confidence,evidence,"
-            "source_generation,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) "
+            "source_global_id,target_global_id,target_name,target_leaf,type,status,confidence,evidence,"
+            "source_generation,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) "
             "ON CONFLICT(edge_id) DO UPDATE SET target_repo_id=excluded.target_repo_id,"
             "target_global_id=excluded.target_global_id,target_name=excluded.target_name,"
+            "target_leaf=excluded.target_leaf,"
             "status=excluded.status,confidence=excluded.confidence,evidence=excluded.evidence,"
             "source_generation=excluded.source_generation,properties=excluded.properties;",
-            -1, &insert_stmt, NULL) != SQLITE_OK) {
+            -1, &insert_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT INTO cross_edge_refresh_state(workspace_id,source_repo_id,source_generation,"
+            "refreshed_at) VALUES(?1,?2,?3,strftime('%s','now')) "
+            "ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "source_generation=excluded.source_generation,refreshed_at=excluded.refreshed_at;",
+            -1, &state_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "DELETE FROM cross_edge_refresh_queue WHERE workspace_id=?1 AND source_repo_id=?2;",
+            -1, &queue_stmt, NULL) != SQLITE_OK) {
         fg_error(err, err_size, "cannot prepare AOSP cross-edge refresh", sqlite3_errmsg(db));
         goto rollback;
     }
@@ -451,18 +494,28 @@ int cbm_aosp_cross_edges_refresh(const cbm_aosp_workspace_t *workspace,
             sqlite3_bind_null(insert_stmt, 6);
         }
         sqlite3_bind_text(insert_stmt, 7, target_name ? target_name : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 8, candidate->type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 9, status, -1, SQLITE_STATIC);
-        sqlite3_bind_double(insert_stmt, 10, candidate->confidence);
-        sqlite3_bind_text(insert_stmt, 11, candidate->evidence, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 12, generation, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 13,
+        sqlite3_bind_text(insert_stmt, 8, cross_edge_leaf(target_name), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 9, candidate->type, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 10, status, -1, SQLITE_STATIC);
+        sqlite3_bind_double(insert_stmt, 11, candidate->confidence);
+        sqlite3_bind_text(insert_stmt, 12, candidate->evidence, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 13, generation, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 14,
                           candidate->properties ? candidate->properties : "{}",
                           -1, SQLITE_TRANSIENT);
         if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
             fg_error(err, err_size, "cannot write AOSP cross edge", sqlite3_errmsg(db));
             goto rollback;
         }
+    }
+    sqlite3_bind_text(state_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(state_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(state_stmt, 3, generation, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(queue_stmt, 2, source_repo->repo_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(state_stmt) != SQLITE_DONE || sqlite3_step(queue_stmt) != SQLITE_DONE) {
+        fg_error(err, err_size, "cannot finalize AOSP cross-edge refresh", sqlite3_errmsg(db));
+        goto rollback;
     }
     if (read_stats(db, workspace, source_repo, stats, err, err_size) != 0 ||
         fg_exec(db, "COMMIT;", err, err_size) != 0) {
@@ -480,6 +533,8 @@ done:
     sqlite3_finalize(source_stmt);
     sqlite3_finalize(target_stmt);
     sqlite3_finalize(insert_stmt);
+    sqlite3_finalize(state_stmt);
+    sqlite3_finalize(queue_stmt);
     sqlite3_close(db);
     return rc;
 }

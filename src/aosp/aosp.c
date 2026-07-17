@@ -944,6 +944,9 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
     sqlite3_stmt *read_stmt = NULL;
     sqlite3_stmt *insert_stmt = NULL;
     sqlite3_stmt *coverage_stmt = NULL;
+    sqlite3_stmt *self_queue_stmt = NULL;
+    sqlite3_stmt *incoming_queue_stmt = NULL;
+    sqlite3_stmt *candidate_queue_stmt = NULL;
     int rc = -1;
     if (sqlite3_open_v2(shard_path, &shard, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         set_error(err, err_size, "cannot open AOSP repository graph", sqlite3_errmsg(shard));
@@ -958,6 +961,32 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
     }
     sqlite3_busy_timeout(master, 10000);
     if (exec_sql(master, "BEGIN IMMEDIATE;", err, err_size) != 0) goto done;
+
+    if (sqlite3_prepare_v2(master,
+            "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+            "VALUES(?1,?2,'source_reindexed',strftime('%s','now')) "
+            "ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "reason=excluded.reason,queued_at=excluded.queued_at;",
+            -1, &self_queue_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+            "SELECT ?1,source_repo_id,'target_reindexed',strftime('%s','now') "
+            "FROM cross_symbol_edges WHERE workspace_id=?1 AND target_repo_id=?2 "
+            "GROUP BY source_repo_id ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "reason=excluded.reason,queued_at=excluded.queued_at;",
+            -1, &incoming_queue_stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP cross-edge invalidation", sqlite3_errmsg(master));
+        goto rollback;
+    }
+    sqlite3_bind_text(self_queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(self_queue_stmt, 2, repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(incoming_queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(incoming_queue_stmt, 2, repo->repo_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(self_queue_stmt) != SQLITE_DONE ||
+        sqlite3_step(incoming_queue_stmt) != SQLITE_DONE) {
+        set_error(err, err_size, "cannot queue AOSP cross-edge invalidation", sqlite3_errmsg(master));
+        goto rollback;
+    }
 
     sqlite3_stmt *delete_stmt = NULL;
     if (sqlite3_prepare_v2(master, "DELETE FROM symbols WHERE repo_id=?1;", -1,
@@ -1020,6 +1049,27 @@ int cbm_aosp_catalog_repo_db(const cbm_aosp_workspace_t *workspace, const cbm_ao
     }
 
     if (sqlite3_prepare_v2(master,
+            "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+            "SELECT DISTINCT e.workspace_id,e.source_repo_id,'candidate_catalog_changed',"
+            "strftime('%s','now') FROM cross_symbol_edges e JOIN symbols s ON "
+            "s.workspace_id=e.workspace_id AND s.repo_id=?2 AND "
+            "(s.name=e.target_leaf OR (e.target_leaf='' AND (e.target_name=s.name OR "
+            "e.target_name LIKE '%.'||s.name OR e.target_name LIKE '%/'||s.name))) "
+            "WHERE e.workspace_id=?1 AND e.status='unresolved' "
+            "ON CONFLICT(workspace_id,source_repo_id) DO UPDATE SET "
+            "reason=excluded.reason,queued_at=excluded.queued_at;",
+            -1, &candidate_queue_stmt, NULL) != SQLITE_OK) {
+        set_error(err, err_size, "cannot prepare AOSP candidate invalidation", sqlite3_errmsg(master));
+        goto rollback;
+    }
+    sqlite3_bind_text(candidate_queue_stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(candidate_queue_stmt, 2, repo->repo_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(candidate_queue_stmt) != SQLITE_DONE) {
+        set_error(err, err_size, "cannot queue AOSP candidate invalidation", sqlite3_errmsg(master));
+        goto rollback;
+    }
+
+    if (sqlite3_prepare_v2(master,
             "INSERT INTO coverage(workspace_id,repo_id,kind,detail) VALUES(?1,?2,'symbols',?3) "
             "ON CONFLICT(workspace_id,repo_id,kind) DO UPDATE SET detail=excluded.detail;",
             -1, &coverage_stmt, NULL) != SQLITE_OK) {
@@ -1045,6 +1095,9 @@ done:
     sqlite3_finalize(read_stmt);
     sqlite3_finalize(insert_stmt);
     sqlite3_finalize(coverage_stmt);
+    sqlite3_finalize(self_queue_stmt);
+    sqlite3_finalize(incoming_queue_stmt);
+    sqlite3_finalize(candidate_queue_stmt);
     sqlite3_close(shard);
     sqlite3_close(master);
     return rc;

@@ -613,6 +613,7 @@ int cbm_aosp_structural_link(const cbm_aosp_workspace_t *workspace,
     if (cbm_aosp_master_path(workspace, master_path, sizeof(master_path), false) != 0) return -1;
     sqlite3 *master = NULL;
     sqlite3_stmt *repo_lookup = NULL;
+    sqlite3_stmt *refresh_lookup = NULL;
     sqlite3_stmt *source_lookup = NULL;
     sqlite3_stmt *target_lookup = NULL;
     int rc = -1;
@@ -620,6 +621,12 @@ int cbm_aosp_structural_link(const cbm_aosp_workspace_t *workspace,
         sqlite3_prepare_v2(master,
             "SELECT db_path,status FROM repos WHERE workspace_id=?1 AND repo_id=?2;",
             -1, &repo_lookup, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(master,
+            "SELECT EXISTS(SELECT 1 FROM cross_edge_refresh_queue "
+            "WHERE workspace_id=?1 AND source_repo_id=?2) OR NOT EXISTS("
+            "SELECT 1 FROM cross_edge_refresh_state "
+            "WHERE workspace_id=?1 AND source_repo_id=?2);",
+            -1, &refresh_lookup, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(master,
             "SELECT global_id FROM symbols WHERE workspace_id=?1 AND repo_id=?2 "
             "AND qualified_name=?3;", -1, &source_lookup, NULL) != SQLITE_OK ||
@@ -633,6 +640,12 @@ int cbm_aosp_structural_link(const cbm_aosp_workspace_t *workspace,
     cbm_init();
     for (int i = 0; i < workspace->repo_count; i++) {
         const cbm_aosp_repo_t *repo = &workspace->repos[i];
+        sqlite3_reset(refresh_lookup);
+        sqlite3_clear_bindings(refresh_lookup);
+        sqlite3_bind_text(refresh_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(refresh_lookup, 2, repo->repo_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(refresh_lookup) != SQLITE_ROW ||
+            sqlite3_column_int(refresh_lookup, 0) == 0) continue;
         sqlite3_reset(repo_lookup);
         sqlite3_clear_bindings(repo_lookup);
         sqlite3_bind_text(repo_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
@@ -672,6 +685,7 @@ int cbm_aosp_structural_link(const cbm_aosp_workspace_t *workspace,
     rc = 0;
 done:
     sqlite3_finalize(repo_lookup);
+    sqlite3_finalize(refresh_lookup);
     sqlite3_finalize(source_lookup);
     sqlite3_finalize(target_lookup);
     sqlite3_close(master);

@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: none.
-- Next task: `F5` - implement cross-edge refresh and dependency invalidation.
-- Worktree baseline: `60dc77b` on `codex/aosp-federated-graph`.
+- Current task: `F5` - implement cross-edge refresh and dependency invalidation.
+- Next task: `F6` - report cross-edge coverage and resolution state.
+- Worktree baseline: `235fb25` on `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 

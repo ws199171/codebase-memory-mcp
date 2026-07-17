@@ -83,6 +83,13 @@ An empty replacement set is valid and removes stale edges. Any validation or
 database error rolls back the delete and all inserts. Refreshing one repository
 does not delete edges owned by another repository.
 
+Repository catalog refreshes enqueue only affected source repositories: the
+reindexed source itself, sources with edges targeting it, and sources whose
+unresolved names may match its new catalog. `aosp federate` scans queued or
+never-refreshed repositories only. A successful per-repository refresh records
+refresh state and clears its queue entry in the same transaction; failures retain
+the entry for retry. Unqueued repository edges and refresh state remain unchanged.
+
 `source_generation` records the repository generation observed for the refresh.
 Content-aware invalidation and dependency propagation are implemented by later
 tasks in the AOSP support plan.
@@ -106,3 +113,8 @@ Master schema v4 introduces the structured edge identity and status fields. On
 initialization, the v3 resolved-only table is migrated transactionally. Cataloged
 legacy targets remain resolved; missing legacy targets become unresolved records
 whose original target ID is retained as the target name and evidence.
+
+Master schema v5 adds the indexed `target_leaf`, per-source refresh queue, and
+refresh state. Existing v4 databases gain the leaf column in place; legacy rows
+use the compatibility matcher until their source repository is refreshed, after
+which the indexed leaf is populated.

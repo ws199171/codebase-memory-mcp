@@ -553,12 +553,40 @@ TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges) {
     ASSERT_EQ(stats.resolved_count, 1);
     ASSERT_EQ(sqlite3_open_v2(master_path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_prepare_v2(db,
-        "SELECT length(edge_id),status,evidence FROM cross_symbol_edges;",
+        "SELECT length(edge_id),status,evidence,target_leaf FROM cross_symbol_edges;",
         -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), CBM_AOSP_EDGE_ID_LEN);
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "resolved");
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "legacy_test");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "LegacyTarget");
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    ASSERT_EQ(sqlite3_open(master_path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+        "DROP TABLE cross_symbol_edges;"
+        "DELETE FROM schema_versions WHERE version=5;"
+        "CREATE TABLE cross_symbol_edges("
+        "edge_id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,"
+        "target_repo_id TEXT,source_global_id TEXT NOT NULL,target_global_id TEXT,"
+        "target_name TEXT NOT NULL DEFAULT '',type TEXT NOT NULL,status TEXT NOT NULL,"
+        "confidence REAL NOT NULL DEFAULT 0,evidence TEXT NOT NULL DEFAULT '',"
+        "source_generation TEXT NOT NULL DEFAULT '',properties TEXT NOT NULL DEFAULT '{}');",
+        NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(sqlite3_open_v2(master_path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM pragma_table_info('cross_symbol_edges') WHERE name='target_leaf';",
+        -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM schema_versions WHERE version=5;", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 
@@ -646,12 +674,33 @@ TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries) {
     sqlite3_close(left_db);
     sqlite3_close(right_db);
 
+    ASSERT_EQ(sqlite3_open(left_master, &left_db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(left_db,
+        "INSERT INTO cross_edge_refresh_queue(workspace_id,source_repo_id,reason,queued_at) "
+        "VALUES(?1,?2,'retry_test',strftime('%s','now')) ON CONFLICT DO UPDATE SET "
+        "reason=excluded.reason,queued_at=excluded.queued_at;", -1, &left_stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(left_stmt, 1, left.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(left_stmt, 2, left.repos[0].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(left_stmt), SQLITE_DONE);
+    sqlite3_finalize(left_stmt);
+    sqlite3_close(left_db);
+
     left_edge.target_global_id = right_target;
     ASSERT_NEQ(cbm_aosp_cross_edges_refresh(&left, &left.repos[0], &left_edge, 1,
                                             &stats, err, sizeof(err)), 0);
     ASSERT_EQ(cbm_aosp_cross_edge_stats(&left, &left.repos[0], &stats,
                                         err, sizeof(err)), 0);
     ASSERT_EQ(stats.edge_count, 1);
+    ASSERT_EQ(sqlite3_open_v2(left_master, &left_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(left_db,
+        "SELECT count(*) FROM cross_edge_refresh_queue WHERE workspace_id=?1 AND source_repo_id=?2;",
+        -1, &left_stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(left_stmt, 1, left.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(left_stmt, 2, left.repos[0].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(left_stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(left_stmt, 0), 1);
+    sqlite3_finalize(left_stmt);
+    sqlite3_close(left_db);
 
     free(left_source);
     free(left_target);
@@ -977,6 +1026,141 @@ TEST(aosp_structural_federation_collects_cross_repo_candidates_only) {
     PASS();
 }
 
+static int create_refresh_shard(const char *path, const char *project, int kind) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK ||
+        sqlite3_exec(db,
+            "DROP TABLE IF EXISTS nodes;"
+            "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+            "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);",
+            NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT INTO nodes VALUES(?1,?2,?3,?4,?5,1,3,'{}');",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    char qn[1024];
+    int rc = 0;
+    if (kind == 0) {
+        (void)snprintf(qn, sizeof(qn), "%s.Client.__file__", project);
+        rc |= insert_shard_node(stmt, 1, "Client.java", qn, "File", "Client.java");
+        (void)snprintf(qn, sizeof(qn), "%s.Client.run", project);
+        rc |= insert_shard_node(stmt, 2, "run", qn, "Method", "Client.java");
+    } else if (kind == 1) {
+        (void)snprintf(qn, sizeof(qn), "%s.TargetApi.hit", project);
+        rc |= insert_shard_node(stmt, 1, "hit", qn, "Method", "TargetApi.java");
+    } else if (kind == 2) {
+        (void)snprintf(qn, sizeof(qn), "%s.Other.__file__", project);
+        rc |= insert_shard_node(stmt, 1, "Other.java", qn, "File", "Other.java");
+        (void)snprintf(qn, sizeof(qn), "%s.Other.run", project);
+        rc |= insert_shard_node(stmt, 2, "run", qn, "Method", "Other.java");
+    } else {
+        (void)snprintf(qn, sizeof(qn), "%s.Replacement", project);
+        rc |= insert_shard_node(stmt, 1, "Replacement", qn, "Class", "Replacement.java");
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+TEST(aosp_federation_refreshes_only_invalidated_repositories) {
+    const char *temp_root = th_mktempdir("cbm_aosp_refresh");
+    ASSERT_NOT_NULL(temp_root);
+    char *root = strdup(temp_root);
+    ASSERT_NOT_NULL(root);
+    ASSERT_EQ(make_dir(root, ".repo/manifests"), 0);
+    ASSERT_EQ(make_dir(root, "source/app"), 0);
+    ASSERT_EQ(make_dir(root, "target/lib"), 0);
+    ASSERT_EQ(make_dir(root, "unrelated/tool"), 0);
+    ASSERT_EQ(write_relative(root, ".repo/manifest.xml",
+        "<manifest>"
+        "<project name=\"source/app\" path=\"source/app\"/>"
+        "<project name=\"target/lib\" path=\"target/lib\"/>"
+        "<project name=\"unrelated/tool\" path=\"unrelated/tool\"/>"
+        "</manifest>"), 0);
+    ASSERT_EQ(write_relative(root, "source/app/Client.java",
+        "class Client { void run() { TargetApi.hit(); } }\n"), 0);
+    ASSERT_EQ(write_relative(root, "unrelated/tool/Other.java",
+        "class Other { void run() { MissingOther(); } }\n"), 0);
+
+    cbm_aosp_workspace_t workspace;
+    char err[1024] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(workspace.repo_count, 3);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    char shard_paths[3][4096];
+    char projects[3][64];
+    for (int i = 0; i < 3; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/repo-%d.db", root, i);
+        (void)snprintf(projects[i], sizeof(projects[i]), "aosp-%s", workspace.repos[i].repo_id);
+        ASSERT_EQ(create_refresh_shard(shard_paths[i], projects[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+        ASSERT_EQ(set_repo_indexed(&workspace, &workspace.repos[i], shard_paths[i]), 0);
+    }
+
+    cbm_aosp_structural_stats_t stats;
+    ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.repos_scanned, 3);
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT edge_id FROM cross_symbol_edges WHERE workspace_id=?1 AND source_repo_id=?2;",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[2].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    char *unrelated_edge_id = strdup((const char *)sqlite3_column_text(stmt, 0));
+    ASSERT_NOT_NULL(unrelated_edge_id);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    ASSERT_EQ(create_refresh_shard(shard_paths[1], projects[1], 3), 0);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[1], shard_paths[1],
+                                       err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.repos_scanned, 2);
+    ASSERT_EQ(sqlite3_open(master_path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT edge_id FROM cross_symbol_edges WHERE workspace_id=?1 AND source_repo_id=?2;",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[2].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), unrelated_edge_id);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT status FROM cross_symbol_edges WHERE workspace_id=?1 AND source_repo_id=?2 "
+        "AND target_name='TargetApi.hit';", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[0].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "unresolved");
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM cross_edge_refresh_queue WHERE workspace_id=?1;",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    ASSERT_EQ(cbm_aosp_structural_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.repos_scanned, 0);
+    free(unrelated_edge_id);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(aosp) {
     RUN_TEST(aosp_manifest_include_and_local_override);
     RUN_TEST(aosp_manifest_rejects_parent_path);
@@ -990,4 +1174,5 @@ SUITE(aosp) {
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
     RUN_TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges);
     RUN_TEST(aosp_structural_federation_collects_cross_repo_candidates_only);
+    RUN_TEST(aosp_federation_refreshes_only_invalidated_repositories);
 }
