@@ -29,8 +29,12 @@ static int write_relative(const char *root, const char *relative, const char *co
 }
 
 static int create_workspace_fixture(char **root_out) {
-    const char *temp_root = th_mktempdir("cbm_aosp");
-    if (!temp_root) return -1;
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root)
+        return -1;
     char *root = strdup(temp_root);
     if (!root) return -1;
     if (make_dir(root, ".repo/manifests") != 0 ||
@@ -255,6 +259,8 @@ TEST(aosp_catalog_and_global_symbol_search) {
     ASSERT(strstr(response, "\"isError\":false") != NULL);
     ASSERT(strstr(response, "HandleAudio") != NULL);
     ASSERT(strstr(response, "frameworks/base") != NULL);
+    ASSERT(strstr(response, "global_id") != NULL);
+    ASSERT(strstr(response, "repo_id") != NULL);
     free(response);
 
     cbm_aosp_workspace_free(&workspace);
@@ -409,6 +415,16 @@ TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity) {
     ASSERT_EQ(resolution.candidate_count, 2);
     ASSERT_EQ(resolution.total_candidate_count, 2);
     cbm_aosp_symbol_resolution_free(&resolution);
+
+    char mcp_args[8192];
+    (void)snprintf(mcp_args, sizeof(mcp_args),
+                   "{\"workspace_root\":\"%s\",\"reference\":\"Duplicate\"}", root);
+    char *mcp_response = cbm_mcp_handle_tool(NULL, "aosp_resolve_symbol", mcp_args);
+    ASSERT_NOT_NULL(mcp_response);
+    ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "total_candidate_count"));
+    free(mcp_response);
 
     ASSERT_EQ(cbm_aosp_resolve_symbol(&workspace, "shared.ExactDuplicate", &resolution,
                                       err, sizeof(err)), 0);
@@ -654,6 +670,193 @@ TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges) {
     PASS();
 }
 
+static int create_snippet_shard(const char *path, int repo_index) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);";
+    const char *repo_zero =
+        "INSERT INTO nodes VALUES"
+        "(1,'SnippetBase','snippet.SnippetBase','Function','src/Base.cpp',2,4,'{}'),"
+        "(2,'SnippetEscape','snippet.SnippetEscape','Function','../outside.cpp',1,1,'{}'),"
+        "(3,'SnippetRange','snippet.SnippetRange','Function','src/Short.cpp',1,3,'{}'),"
+        "(4,'SnippetStale','snippet.SnippetStale','Function','src/Base.cpp',2,4,'{}');";
+    const char *repo_one =
+        "INSERT INTO nodes VALUES"
+        "(1,'SnippetVendor','snippet.SnippetVendor','Function','src/Vendor.kt',2,4,'{}');";
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0 && sqlite3_exec(db, repo_index == 0 ? repo_zero : repo_one,
+                                NULL, NULL, NULL) != SQLITE_OK) {
+        rc = -1;
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+TEST(aosp_workspace_search_routes_to_exact_source_snippets) {
+    char *root = NULL;
+    ASSERT_EQ(create_workspace_fixture(&root), 0);
+    ASSERT_EQ(make_dir(root, "frameworks/base/src"), 0);
+    ASSERT_EQ(make_dir(root, "vendor/acme/widgets/src"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/src/Base.cpp",
+                             "// header\nint SnippetBase() {\n  return 7;\n}\n// trailer\n"),
+              0);
+    ASSERT_EQ(write_relative(root, "frameworks/base/src/Short.cpp", "only one line\n"), 0);
+    ASSERT_EQ(write_relative(root, "frameworks/outside.cpp", "secret outside repo\n"), 0);
+    ASSERT_EQ(write_relative(root, "vendor/acme/widgets/src/Vendor.kt",
+                             "package demo\nfun SnippetVendor(): Int {\n    return 9\n}\n"),
+              0);
+
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+    char shard_paths[2][4096];
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/snippet-%d.db", root, i);
+        ASSERT_EQ(create_snippet_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i], err,
+                                           sizeof(err)),
+                  0);
+        ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[i].repo_id, shard_paths[i]), 0);
+    }
+
+    cbm_aosp_symbol_t *symbols = NULL;
+    int symbol_count = 0;
+    ASSERT_EQ(cbm_aosp_search_symbols(&workspace, "Snippet", 10, &symbols, &symbol_count, err,
+                                      sizeof(err)),
+              0);
+    ASSERT_EQ(symbol_count, 5);
+    char *escape_id = NULL;
+    char *range_id = NULL;
+    char *stale_id = NULL;
+    char *base_id = NULL;
+    char *vendor_id = NULL;
+    int exact_count = 0;
+    for (int i = 0; i < symbol_count; i++) {
+        cbm_aosp_source_snippet_t snippet;
+        if (strcmp(symbols[i].name, "SnippetBase") == 0) {
+            ASSERT_EQ(cbm_aosp_read_source_snippet(&workspace, symbols[i].global_id, &snippet, err,
+                                                   sizeof(err)),
+                      0);
+            ASSERT_STR_EQ(snippet.symbol.repo_path, "frameworks/base");
+            ASSERT_STR_EQ(snippet.symbol.file_path, "src/Base.cpp");
+            ASSERT_EQ(snippet.symbol.start_line, 2);
+            ASSERT_EQ(snippet.symbol.end_line, 4);
+            ASSERT_STR_EQ(snippet.workspace_file_path, "frameworks/base/src/Base.cpp");
+            ASSERT_STR_EQ(snippet.source, "int SnippetBase() {\n  return 7;\n}\n");
+            ASSERT_NOT_NULL(snippet.absolute_file_path);
+            base_id = strdup(symbols[i].global_id);
+            ASSERT_NOT_NULL(base_id);
+            cbm_aosp_source_snippet_free(&snippet);
+            exact_count++;
+        } else if (strcmp(symbols[i].name, "SnippetVendor") == 0) {
+            ASSERT_EQ(cbm_aosp_read_source_snippet(&workspace, symbols[i].global_id, &snippet, err,
+                                                   sizeof(err)),
+                      0);
+            ASSERT_STR_EQ(snippet.symbol.repo_path, "vendor/acme/widgets");
+            ASSERT_STR_EQ(snippet.workspace_file_path, "vendor/acme/widgets/src/Vendor.kt");
+            ASSERT_STR_EQ(snippet.source, "fun SnippetVendor(): Int {\n    return 9\n}\n");
+            vendor_id = strdup(symbols[i].global_id);
+            ASSERT_NOT_NULL(vendor_id);
+            cbm_aosp_source_snippet_free(&snippet);
+            exact_count++;
+        } else if (strcmp(symbols[i].name, "SnippetEscape") == 0) {
+            escape_id = strdup(symbols[i].global_id);
+        } else if (strcmp(symbols[i].name, "SnippetRange") == 0) {
+            range_id = strdup(symbols[i].global_id);
+        } else if (strcmp(symbols[i].name, "SnippetStale") == 0) {
+            stale_id = strdup(symbols[i].global_id);
+        }
+    }
+    ASSERT_EQ(exact_count, 2);
+    ASSERT_NOT_NULL(escape_id);
+    ASSERT_NOT_NULL(range_id);
+    ASSERT_NOT_NULL(stale_id);
+    ASSERT_NOT_NULL(base_id);
+    ASSERT_NOT_NULL(vendor_id);
+
+    char mcp_args[8192];
+    (void)snprintf(mcp_args, sizeof(mcp_args),
+                   "{\"workspace_root\":\"%s\",\"reference\":\"snippet.SnippetBase\"}",
+                   root);
+    char *mcp_response = cbm_mcp_handle_tool(NULL, "aosp_resolve_symbol", mcp_args);
+    ASSERT_NOT_NULL(mcp_response);
+    ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "resolved"));
+    ASSERT_NOT_NULL(strstr(mcp_response, base_id));
+    free(mcp_response);
+
+    (void)snprintf(mcp_args, sizeof(mcp_args),
+                   "{\"workspace_root\":\"%s\",\"global_id\":\"%s\"}",
+                   root, base_id);
+    mcp_response = cbm_mcp_handle_tool(NULL, "aosp_get_source_snippet", mcp_args);
+    ASSERT_NOT_NULL(mcp_response);
+    ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "frameworks/base/src/Base.cpp"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "return 7"));
+    free(mcp_response);
+
+    cbm_aosp_source_snippet_t snippet;
+    err[0] = '\0';
+    ASSERT_NEQ(
+        cbm_aosp_read_source_snippet(&workspace, "missing-global-id", &snippet, err, sizeof(err)),
+        0);
+    ASSERT_NOT_NULL(strstr(err, "not found"));
+
+    err[0] = '\0';
+    ASSERT_NEQ(cbm_aosp_read_source_snippet(&workspace, escape_id, &snippet, err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(strstr(err, "escapes repository root"));
+
+    err[0] = '\0';
+    ASSERT_NEQ(cbm_aosp_read_source_snippet(&workspace, range_id, &snippet, err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(strstr(err, "range exceeds"));
+
+    sqlite3 *shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_paths[0], &shard), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(shard,
+                           "UPDATE nodes SET qualified_name='changed.SnippetStale' WHERE id=4;",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(shard);
+    err[0] = '\0';
+    ASSERT_NEQ(cbm_aosp_read_source_snippet(&workspace, stale_id, &snippet, err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(strstr(err, "catalog is stale"));
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "UPDATE repos SET status='discovered',db_path='' "
+                  "WHERE workspace_id=?1 AND repo_id=?2;",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, workspace.repos[1].repo_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+    err[0] = '\0';
+    ASSERT_NEQ(cbm_aosp_read_source_snippet(&workspace, vendor_id, &snippet, err, sizeof(err)), 0);
+    ASSERT_NOT_NULL(strstr(err, "not indexed"));
+
+    free(escape_id);
+    free(range_id);
+    free(stale_id);
+    free(base_id);
+    free(vendor_id);
+    cbm_aosp_symbols_free(symbols, symbol_count);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 static int create_trace_shard(const char *path, int repo_index) {
     sqlite3 *db = NULL;
     if (sqlite3_open(path, &db) != SQLITE_OK) return -1;
@@ -855,6 +1058,20 @@ TEST(aosp_trace_path_traverses_local_and_cross_repo_edges) {
     ASSERT(found_mid_in);
     cbm_aosp_trace_result_free(&result);
 
+    char mcp_args[8192];
+    (void)snprintf(
+        mcp_args, sizeof(mcp_args),
+        "{\"workspace_root\":\"%s\",\"start\":\"alpha.Start\","
+        "\"max_depth\":2,\"direction\":\"outgoing\",\"result_budget\":10}",
+        root);
+    char *mcp_response = cbm_mcp_handle_tool(NULL, "aosp_trace_path", mcp_args);
+    ASSERT_NOT_NULL(mcp_response);
+    ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(mcp_response, target_gid));
+    ASSERT_NOT_NULL(strstr(mcp_response, "cross_calls"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "cross_repo"));
+    free(mcp_response);
+
     /* Test: missing start symbol returns error */
     opts.direction = CBM_AOSP_TRACE_OUTGOING;
     ASSERT_EQ(cbm_aosp_trace_path(&workspace, "nonexistent-id", &opts, &result, err, sizeof(err)),
@@ -1042,8 +1259,10 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
     ASSERT_EQ(result.node_count, 2);
     ASSERT_EQ(result.nodes[0].hop_index, 0);
     ASSERT_EQ(result.nodes[0].kind, CBM_AOSP_QUERY_KIND_SYMBOL);
+    ASSERT_STR_EQ(result.nodes[0].name, "Start");
     ASSERT_EQ(result.nodes[1].hop_index, 1);
     ASSERT_EQ(result.nodes[1].kind, CBM_AOSP_QUERY_KIND_SYMBOL);
+    ASSERT_STR_EQ(result.nodes[1].name, "Mid");
     ASSERT_STR_EQ(result.nodes[1].edge_type, "CALLS");
     cbm_aosp_query_graph_result_free(&result);
 
@@ -1141,6 +1360,21 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
     }
     ASSERT(found_proto_target);
     cbm_aosp_query_graph_result_free(&result);
+
+    char mcp_args[8192];
+    (void)snprintf(
+        mcp_args, sizeof(mcp_args),
+        "{\"workspace_root\":\"%s\",\"start\":\"alpha.Start\",\"hops\":["
+        "{\"kind\":\"symbol\",\"direction\":\"outgoing\"},"
+        "{\"kind\":\"module\",\"direction\":\"both\"},"
+        "{\"kind\":\"module\",\"direction\":\"outgoing\"}],\"max_results\":20}",
+        root);
+    char *mcp_response = cbm_mcp_handle_tool(NULL, "aosp_query_graph", mcp_args);
+    ASSERT_NOT_NULL(mcp_response);
+    ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "mod-beta"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "depends_on"));
+    free(mcp_response);
 
     /* Test 6: Result budget truncation */
     opts.hops = &code_hop;
@@ -2133,6 +2367,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_catalog_and_global_symbol_search);
     RUN_TEST(aosp_workspace_symbol_resolver_tiers_and_ambiguity);
     RUN_TEST(aosp_shard_routing_routes_symbols_and_reads_nodes_and_edges);
+    RUN_TEST(aosp_workspace_search_routes_to_exact_source_snippets);
     RUN_TEST(aosp_trace_path_traverses_local_and_cross_repo_edges);
     RUN_TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);

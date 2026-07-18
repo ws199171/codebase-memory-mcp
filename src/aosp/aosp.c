@@ -39,6 +39,7 @@ enum {
     AOSP_DIR_MODE = 0755,
     AOSP_SYMBOL_REF_BUF = 1024,
     AOSP_RESOLVE_LIMIT = 200,
+    AOSP_MAX_SNIPPET_BYTES = 4 * 1024 * 1024,
 };
 
 typedef struct {
@@ -338,7 +339,7 @@ static int remove_repo(cbm_aosp_workspace_t *workspace, const char *name, const 
 static bool path_under_root(const char *root, const char *path) {
     size_t root_len = strlen(root);
     return strncmp(root, path, root_len) == 0 &&
-           (path[root_len] == '\0' || path[root_len] == '/');
+           (path[root_len] == '\0' || path[root_len] == '/' || path[root_len] == '\\');
 }
 
 static int parse_manifest_file(manifest_ctx_t *ctx, const char *manifest_path);
@@ -2394,6 +2395,208 @@ void cbm_aosp_query_graph_result_free(cbm_aosp_query_graph_result_t *result) {
     memset(result, 0, sizeof(*result));
 }
 
+void cbm_aosp_source_snippet_free(cbm_aosp_source_snippet_t *snippet) {
+    if (!snippet)
+        return;
+    aosp_symbol_clear(&snippet->symbol);
+    free(snippet->workspace_file_path);
+    free(snippet->absolute_file_path);
+    free(snippet->source);
+    memset(snippet, 0, sizeof(*snippet));
+}
+
+static const cbm_aosp_repo_t *find_workspace_repo(const cbm_aosp_workspace_t *workspace,
+                                                  const char *repo_id) {
+    for (int i = 0; workspace && repo_id && i < workspace->repo_count; i++) {
+        if (strcmp(workspace->repos[i].repo_id, repo_id) == 0) {
+            return &workspace->repos[i];
+        }
+    }
+    return NULL;
+}
+
+static int replace_owned_string(char **target, const char *value) {
+    char *replacement = strdup(value ? value : "");
+    if (!replacement)
+        return -1;
+    free(*target);
+    *target = replacement;
+    return 0;
+}
+
+static char *read_exact_source_lines(const char *path, int start_line, int end_line, char *err,
+                                     size_t err_size) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        set_error(err, err_size, "cannot open AOSP source file", path);
+        return NULL;
+    }
+    size_t capacity = 4096;
+    size_t length = 0;
+    char *source = malloc(capacity);
+    if (!source) {
+        (void)fclose(file);
+        set_error(err, err_size, "out of memory", NULL);
+        return NULL;
+    }
+    int line = 1;
+    bool reached_end = false;
+    int ch;
+    while ((ch = fgetc(file)) != EOF) {
+        if (line >= start_line && line <= end_line) {
+            if (ch == '\0') {
+                set_error(err, err_size, "AOSP source range contains a NUL byte", path);
+                free(source);
+                (void)fclose(file);
+                return NULL;
+            }
+            if (length >= AOSP_MAX_SNIPPET_BYTES) {
+                set_error(err, err_size, "AOSP source snippet exceeds size limit", path);
+                free(source);
+                (void)fclose(file);
+                return NULL;
+            }
+            if (length + 1 >= capacity) {
+                size_t next = capacity * 2;
+                if (next > (size_t)AOSP_MAX_SNIPPET_BYTES + 1) {
+                    next = (size_t)AOSP_MAX_SNIPPET_BYTES + 1;
+                }
+                char *grown = realloc(source, next);
+                if (!grown) {
+                    set_error(err, err_size, "out of memory", NULL);
+                    free(source);
+                    (void)fclose(file);
+                    return NULL;
+                }
+                source = grown;
+                capacity = next;
+            }
+            source[length++] = (char)ch;
+        }
+        if (ch == '\n') {
+            if (line == end_line) {
+                reached_end = true;
+                break;
+            }
+            line++;
+        }
+    }
+    if (ferror(file)) {
+        set_error(err, err_size, "cannot read AOSP source file", path);
+        free(source);
+        (void)fclose(file);
+        return NULL;
+    }
+    (void)fclose(file);
+    if (!reached_end && !(line == end_line && length > 0)) {
+        set_error(err, err_size, "AOSP source range exceeds current file", path);
+        free(source);
+        return NULL;
+    }
+    source[length] = '\0';
+    return source;
+}
+
+int cbm_aosp_read_source_snippet(const cbm_aosp_workspace_t *workspace, const char *global_id,
+                                 cbm_aosp_source_snippet_t *out, char *err, size_t err_size) {
+    if (!workspace || !global_id || !global_id[0] || !out) {
+        set_error(err, err_size, "AOSP source snippet requires workspace and global id", NULL);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    cbm_aosp_symbol_resolution_t resolution;
+    if (cbm_aosp_resolve_symbol(workspace, global_id, &resolution, err, err_size) != 0) {
+        return -1;
+    }
+    if (resolution.status != CBM_AOSP_SYMBOL_RESOLVED || resolution.candidate_count != 1) {
+        set_error(err, err_size, "AOSP symbol not found in workspace catalog", global_id);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        return -1;
+    }
+    const cbm_aosp_symbol_t *catalog_symbol = &resolution.candidates[0];
+    cbm_aosp_shard_route_t route;
+    if (cbm_aosp_shard_route_symbol(workspace, catalog_symbol, &route, err, err_size) != 0) {
+        cbm_aosp_symbol_resolution_free(&resolution);
+        return -1;
+    }
+    if (cbm_aosp_shard_read_node(&route, &out->symbol, err, err_size) != 0) {
+        cbm_aosp_shard_route_close(&route);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        return -1;
+    }
+    cbm_aosp_shard_route_close(&route);
+    if (strcmp(out->symbol.qualified_name, catalog_symbol->qualified_name) != 0 ||
+        strcmp(out->symbol.label, catalog_symbol->label) != 0) {
+        set_error(err, err_size, "AOSP symbol catalog is stale", global_id);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    const cbm_aosp_repo_t *repo = find_workspace_repo(workspace, out->symbol.repo_id);
+    if (!repo || !repo->exists || !repo->abs_path || !repo->abs_path[0]) {
+        set_error(err, err_size, "AOSP symbol repository is missing", out->symbol.repo_id);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    if (!out->symbol.file_path || !out->symbol.file_path[0] || out->symbol.start_line < 1 ||
+        out->symbol.end_line < out->symbol.start_line) {
+        set_error(err, err_size, "AOSP symbol has no exact source range", global_id);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    if (replace_owned_string(&out->symbol.repo_path, repo->path) != 0 ||
+        replace_owned_string(&out->symbol.manifest_name, repo->name) != 0 ||
+        replace_owned_string(&out->symbol.language, catalog_symbol->language) != 0) {
+        set_error(err, err_size, "out of memory", NULL);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    size_t absolute_size = strlen(repo->abs_path) + strlen(out->symbol.file_path) + 2;
+    char *candidate_path = malloc(absolute_size);
+    if (!candidate_path) {
+        set_error(err, err_size, "out of memory", NULL);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    (void)snprintf(candidate_path, absolute_size, "%s/%s", repo->abs_path, out->symbol.file_path);
+    char canonical_root[AOSP_PATH_BUF];
+    char canonical_file[AOSP_PATH_BUF];
+    bool canonicalized =
+        cbm_canonical_path(repo->abs_path, canonical_root, sizeof(canonical_root)) &&
+        cbm_canonical_path(candidate_path, canonical_file, sizeof(canonical_file));
+    if (!canonicalized || !path_under_root(canonical_root, canonical_file)) {
+        set_error(err, err_size, "AOSP source path escapes repository root", out->symbol.file_path);
+        free(candidate_path);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    free(candidate_path);
+    size_t workspace_size = strlen(repo->path) + strlen(out->symbol.file_path) + 2;
+    out->workspace_file_path = malloc(workspace_size);
+    out->absolute_file_path = strdup(canonical_file);
+    if (!out->workspace_file_path || !out->absolute_file_path) {
+        set_error(err, err_size, "out of memory", NULL);
+        cbm_aosp_symbol_resolution_free(&resolution);
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    (void)snprintf(out->workspace_file_path, workspace_size, "%s/%s", repo->path,
+                   out->symbol.file_path);
+    out->source = read_exact_source_lines(canonical_file, out->symbol.start_line,
+                                          out->symbol.end_line, err, err_size);
+    cbm_aosp_symbol_resolution_free(&resolution);
+    if (!out->source) {
+        cbm_aosp_source_snippet_free(out);
+        return -1;
+    }
+    return 0;
+}
+
 int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                          const char *start_global_id,
                          const cbm_aosp_query_graph_options_t *options,
@@ -2437,7 +2640,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
         return -1;
     }
     if (sqlite3_prepare_v2(master,
-            "SELECT repo_id, local_node_id, qualified_name, label, file_path, start_line "
+            "SELECT repo_id, local_node_id, name, qualified_name, label, file_path, start_line "
             "FROM symbols WHERE workspace_id=?1 AND global_id=?2;",
             -1, &sym_lookup, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(master,
@@ -2595,14 +2798,13 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
             sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(sym_lookup, 2, item.node_id, -1, SQLITE_TRANSIENT);
             if (sqlite3_step(sym_lookup) == SQLITE_ROW) {
+                free(qn->name);
                 free(qn->qualified_name);
                 free(qn->file_path);
-                qn->qualified_name = dup_column(sym_lookup, 2);
-                qn->file_path = dup_column(sym_lookup, 4);
-                qn->start_line = sqlite3_column_int(sym_lookup, 5);
-                const char *label = (const char *)sqlite3_column_text(sym_lookup, 3);
-                free(qn->name);
-                qn->name = strdup(label ? label : "");
+                qn->name = dup_column(sym_lookup, 2);
+                qn->qualified_name = dup_column(sym_lookup, 3);
+                qn->file_path = dup_column(sym_lookup, 5);
+                qn->start_line = sqlite3_column_int(sym_lookup, 6);
             }
         } else if (item.kind == CBM_AOSP_QUERY_KIND_MODULE) {
             sqlite3_reset(mod_by_id);
@@ -2762,7 +2964,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
             sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(sym_lookup, 2, item.node_id, -1, SQLITE_TRANSIENT);
             if (sqlite3_step(sym_lookup) == SQLITE_ROW) {
-                const char *file = (const char *)sqlite3_column_text(sym_lookup, 4);
+                const char *file = (const char *)sqlite3_column_text(sym_lookup, 5);
                 if (file && file[0]) {
                     sqlite3_reset(mod_by_file);
                     sqlite3_clear_bindings(mod_by_file);
@@ -2914,6 +3116,142 @@ done:
     return rc;
 }
 
+static const char *aosp_resolution_status_name(cbm_aosp_symbol_resolution_status_t status) {
+    switch (status) {
+        case CBM_AOSP_SYMBOL_RESOLVED: return "resolved";
+        case CBM_AOSP_SYMBOL_AMBIGUOUS: return "ambiguous";
+        case CBM_AOSP_SYMBOL_NOT_FOUND: return "not_found";
+    }
+    return "not_found";
+}
+
+static const char *aosp_match_kind_name(cbm_aosp_symbol_match_kind_t kind) {
+    switch (kind) {
+        case CBM_AOSP_SYMBOL_MATCH_GLOBAL_ID: return "global_id";
+        case CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME: return "exact_qualified_name";
+        case CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX: return "qualified_suffix";
+        case CBM_AOSP_SYMBOL_MATCH_EXACT_NAME: return "exact_name";
+        case CBM_AOSP_SYMBOL_MATCH_NONE: return "none";
+    }
+    return "none";
+}
+
+static const char *aosp_trace_direction_name(cbm_aosp_trace_direction_t direction) {
+    switch (direction) {
+        case CBM_AOSP_TRACE_OUTGOING: return "outgoing";
+        case CBM_AOSP_TRACE_INCOMING: return "incoming";
+        case CBM_AOSP_TRACE_BOTH: return "both";
+    }
+    return "outgoing";
+}
+
+static const char *aosp_query_kind_name(cbm_aosp_query_kind_t kind) {
+    switch (kind) {
+        case CBM_AOSP_QUERY_KIND_SYMBOL: return "symbol";
+        case CBM_AOSP_QUERY_KIND_MODULE: return "module";
+        case CBM_AOSP_QUERY_KIND_PROTOCOL: return "protocol";
+    }
+    return "symbol";
+}
+
+static int aosp_parse_direction(const char *value, cbm_aosp_trace_direction_t *out) {
+    if (!value || !out) return -1;
+    if (strcmp(value, "outgoing") == 0 || strcmp(value, "out") == 0) {
+        *out = CBM_AOSP_TRACE_OUTGOING;
+    } else if (strcmp(value, "incoming") == 0 || strcmp(value, "in") == 0) {
+        *out = CBM_AOSP_TRACE_INCOMING;
+    } else if (strcmp(value, "both") == 0) {
+        *out = CBM_AOSP_TRACE_BOTH;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static int aosp_parse_query_kind(const char *value, size_t length,
+                                 cbm_aosp_query_kind_t *out) {
+    if (!value || !out) return -1;
+    if (length == strlen("symbol") && strncmp(value, "symbol", length) == 0) {
+        *out = CBM_AOSP_QUERY_KIND_SYMBOL;
+    } else if (length == strlen("module") && strncmp(value, "module", length) == 0) {
+        *out = CBM_AOSP_QUERY_KIND_MODULE;
+    } else if (length == strlen("protocol") && strncmp(value, "protocol", length) == 0) {
+        *out = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static int aosp_parse_query_hop(const char *spec, cbm_aosp_query_hop_t *out,
+                                char **owned_edge_type) {
+    if (!spec || !out || !owned_edge_type) return -1;
+    const char *first = strchr(spec, ':');
+    if (!first || first == spec || first[1] == '\0') return -1;
+    const char *second = strchr(first + 1, ':');
+    size_t direction_length = second ? (size_t)(second - first - 1) : strlen(first + 1);
+    char direction[16];
+    if (direction_length == 0 || direction_length >= sizeof(direction)) return -1;
+    memcpy(direction, first + 1, direction_length);
+    direction[direction_length] = '\0';
+    if (aosp_parse_query_kind(spec, (size_t)(first - spec), &out->kind) != 0 ||
+        aosp_parse_direction(direction, &out->direction) != 0) {
+        return -1;
+    }
+    *owned_edge_type = NULL;
+    out->edge_type = NULL;
+    if (second) {
+        if (second[1] == '\0') return -1;
+        *owned_edge_type = strdup(second + 1);
+        if (!*owned_edge_type) return -1;
+        out->edge_type = *owned_edge_type;
+    }
+    return 0;
+}
+
+static void aosp_free_query_edges(char **edge_types, int count) {
+    if (!edge_types) return;
+    for (int i = 0; i < count; i++) free(edge_types[i]);
+}
+
+static int aosp_parse_int(const char *value, int minimum, int maximum, int *out) {
+    if (!value || !value[0] || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < minimum || parsed > maximum) {
+        return -1;
+    }
+    *out = (int)parsed;
+    return 0;
+}
+
+static int aosp_resolve_query_start(const cbm_aosp_workspace_t *workspace,
+                                    const char *reference, char **global_id,
+                                    char *err, size_t err_size) {
+    cbm_aosp_symbol_resolution_t resolution;
+    if (!global_id) return -1;
+    *global_id = NULL;
+    if (cbm_aosp_resolve_symbol(workspace, reference, &resolution, err, err_size) != 0) {
+        return -1;
+    }
+    if (resolution.status == CBM_AOSP_SYMBOL_NOT_FOUND) {
+        set_error(err, err_size, "symbol not found", reference);
+    } else if (resolution.status == CBM_AOSP_SYMBOL_AMBIGUOUS) {
+        char detail[128];
+        (void)snprintf(detail, sizeof(detail), "%s (%d candidates)", reference,
+                       resolution.total_candidate_count);
+        set_error(err, err_size, "ambiguous symbol reference", detail);
+    } else if (resolution.candidate_count != 1 || !resolution.candidates[0].global_id) {
+        set_error(err, err_size, "invalid symbol resolution", reference);
+    } else {
+        *global_id = strdup(resolution.candidates[0].global_id);
+    }
+    cbm_aosp_symbol_resolution_free(&resolution);
+    if (!*global_id && (!err || !err[0])) set_error(err, err_size, "out of memory", NULL);
+    return *global_id ? 0 : -1;
+}
+
 static void print_aosp_usage(FILE *stream) {
     (void)fprintf(stream,
         "Usage:\n"
@@ -2926,7 +3264,13 @@ static void print_aosp_usage(FILE *stream) {
         "  codebase-memory-mcp aosp protocols [root] [--query text] [--limit N]\n"
         "  codebase-memory-mcp aosp status [root]\n"
         "  codebase-memory-mcp aosp repos [root]\n"
-        "  codebase-memory-mcp aosp search <query> [root] [--limit N]\n");
+        "  codebase-memory-mcp aosp search <query> [root] [--limit N]\n"
+        "  codebase-memory-mcp aosp resolve <reference> [root]\n"
+        "  codebase-memory-mcp aosp snippet <global-id> [root]\n"
+        "  codebase-memory-mcp aosp trace <reference> [root] [--depth N] "
+        "[--direction outgoing|incoming|both] [--limit N]\n"
+        "  codebase-memory-mcp aosp query <reference> [root] "
+        "--hop kind:direction[:edge-type] [--hop ...] [--limit N]\n");
 }
 
 int cbm_cmd_aosp(int argc, char **argv) {
@@ -2939,6 +3283,12 @@ int cbm_cmd_aosp(int argc, char **argv) {
     const char *repo_filter = NULL;
     const char *search_query = NULL;
     int search_limit = 20;
+    const char *query_reference = NULL;
+    int trace_depth = 3;
+    cbm_aosp_trace_direction_t trace_direction = CBM_AOSP_TRACE_OUTGOING;
+    cbm_aosp_query_hop_t query_hops[64] = {0};
+    char *query_edge_types[64] = {0};
+    int query_hop_count = 0;
     if (strcmp(action, "search") == 0) {
         if (argc < 2) {
             print_aosp_usage(stderr);
@@ -2954,6 +3304,58 @@ int cbm_cmd_aosp(int argc, char **argv) {
                 print_aosp_usage(stderr);
                 return 1;
             }
+        }
+    } else if (strcmp(action, "resolve") == 0 || strcmp(action, "snippet") == 0 ||
+               strcmp(action, "trace") == 0 || strcmp(action, "query") == 0) {
+        if (argc < 2) {
+            print_aosp_usage(stderr);
+            return 1;
+        }
+        query_reference = argv[1];
+        bool root_set = false;
+        for (int i = 2; i < argc; i++) {
+            if ((strcmp(action, "trace") == 0 || strcmp(action, "query") == 0) &&
+                strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+                if (aosp_parse_int(argv[++i], 1, 10000, &search_limit) != 0) {
+                    (void)fprintf(stderr, "error: --limit must be between 1 and 10000\n");
+                    aosp_free_query_edges(query_edge_types, query_hop_count);
+                    return 1;
+                }
+            } else if (strcmp(action, "trace") == 0 &&
+                       strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
+                if (aosp_parse_int(argv[++i], 0, 1000, &trace_depth) != 0) {
+                    (void)fprintf(stderr, "error: --depth must be between 0 and 1000\n");
+                    return 1;
+                }
+            } else if (strcmp(action, "trace") == 0 &&
+                       strcmp(argv[i], "--direction") == 0 && i + 1 < argc) {
+                if (aosp_parse_direction(argv[++i], &trace_direction) != 0) {
+                    (void)fprintf(stderr, "error: invalid trace direction\n");
+                    return 1;
+                }
+            } else if (strcmp(action, "query") == 0 && strcmp(argv[i], "--hop") == 0 &&
+                       i + 1 < argc) {
+                if (query_hop_count >= (int)(sizeof(query_hops) / sizeof(query_hops[0])) ||
+                    aosp_parse_query_hop(argv[++i], &query_hops[query_hop_count],
+                                         &query_edge_types[query_hop_count]) != 0) {
+                    (void)fprintf(stderr,
+                                  "error: --hop must be kind:direction[:edge-type]\n");
+                    aosp_free_query_edges(query_edge_types, query_hop_count);
+                    return 1;
+                }
+                query_hop_count++;
+            } else if (argv[i][0] != '-' && !root_set) {
+                root = argv[i];
+                root_set = true;
+            } else {
+                print_aosp_usage(stderr);
+                aosp_free_query_edges(query_edge_types, query_hop_count);
+                return 1;
+            }
+        }
+        if (strcmp(action, "query") == 0 && query_hop_count == 0) {
+            (void)fprintf(stderr, "error: query requires at least one --hop\n");
+            return 1;
         }
     } else if (strcmp(action, "index") == 0) {
         for (int i = 1; i < argc; i++) {
@@ -2986,6 +3388,7 @@ int cbm_cmd_aosp(int argc, char **argv) {
     char err[1024] = {0};
     if (cbm_aosp_discover(root, &workspace, err, sizeof(err)) != 0) {
         (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP discovery failed");
+        aosp_free_query_edges(query_edge_types, query_hop_count);
         return 1;
     }
     int exit_code = 0;
@@ -3146,17 +3549,127 @@ int cbm_cmd_aosp(int argc, char **argv) {
         } else {
             for (int i = 0; i < count; i++) {
                 const cbm_aosp_symbol_t *symbol = &results[i];
-                printf("%s\t%s\t%s\t%s\t%s:%d\n", symbol->repo_path,
+                printf("%s\t%s\t%s\t%s\t%s:%d\t%s\n", symbol->repo_path,
                        symbol->project_name, symbol->label, symbol->qualified_name,
-                       symbol->file_path, symbol->start_line);
+                       symbol->file_path, symbol->start_line, symbol->global_id);
             }
             printf("%d symbol%s\n", count, count == 1 ? "" : "s");
         }
         cbm_aosp_symbols_free(results, count);
+    } else if (strcmp(action, "resolve") == 0) {
+        cbm_aosp_symbol_resolution_t resolution;
+        if (cbm_aosp_resolve_symbol(&workspace, query_reference, &resolution,
+                                    err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n",
+                          err[0] ? err : "AOSP symbol resolution failed");
+            exit_code = 1;
+        } else {
+            printf("%s\t%s\t%d%s\n", aosp_resolution_status_name(resolution.status),
+                   aosp_match_kind_name(resolution.match_kind),
+                   resolution.total_candidate_count, resolution.truncated ? "\ttruncated" : "");
+            for (int i = 0; i < resolution.candidate_count; i++) {
+                const cbm_aosp_symbol_t *symbol = &resolution.candidates[i];
+                printf("%s\t%s\t%s\t%s\t%s:%d\n", symbol->global_id,
+                       symbol->repo_path, symbol->label, symbol->qualified_name,
+                       symbol->file_path, symbol->start_line);
+            }
+            exit_code = resolution.status == CBM_AOSP_SYMBOL_RESOLVED ? 0 : 2;
+            cbm_aosp_symbol_resolution_free(&resolution);
+        }
+    } else if (strcmp(action, "snippet") == 0) {
+        cbm_aosp_source_snippet_t snippet;
+        if (cbm_aosp_read_source_snippet(&workspace, query_reference, &snippet,
+                                         err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n",
+                          err[0] ? err : "AOSP source snippet read failed");
+            exit_code = 1;
+        } else {
+            printf("%s\t%s\t%s:%d-%d\t%s\n", snippet.symbol.global_id,
+                   snippet.symbol.repo_path, snippet.workspace_file_path,
+                   snippet.symbol.start_line, snippet.symbol.end_line,
+                   snippet.symbol.qualified_name);
+            (void)fputs(snippet.source, stdout);
+            if (snippet.source[0] && snippet.source[strlen(snippet.source) - 1] != '\n') {
+                (void)fputc('\n', stdout);
+            }
+            cbm_aosp_source_snippet_free(&snippet);
+        }
+    } else if (strcmp(action, "trace") == 0) {
+        char *global_id = NULL;
+        if (aosp_resolve_query_start(&workspace, query_reference, &global_id,
+                                     err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP start resolution failed");
+            exit_code = 1;
+        } else {
+            cbm_aosp_trace_options_t options = {
+                .max_depth = trace_depth,
+                .direction = trace_direction,
+                .result_budget = search_limit,
+                .cancel_flag = NULL,
+            };
+            cbm_aosp_trace_result_t result;
+            if (cbm_aosp_trace_path(&workspace, global_id, &options, &result,
+                                    err, sizeof(err)) != 0) {
+                (void)fprintf(stderr, "error: %s\n",
+                              err[0] ? err : "AOSP trace failed");
+                exit_code = 1;
+            } else {
+                printf("direction:%s\tnodes:%d\tmax-depth:%d%s\n",
+                       aosp_trace_direction_name(trace_direction), result.node_count,
+                       result.max_depth_reached, result.truncated ? "\ttruncated" : "");
+                for (int i = 0; i < result.node_count; i++) {
+                    const cbm_aosp_trace_node_t *node = &result.nodes[i];
+                    printf("%d\t%s\t%s\t%s\t%s:%d\t%s\t%.3f\t%s\t%s\n",
+                           node->depth, node->global_id, node->repo_id,
+                           node->qualified_name, node->file_path, node->start_line,
+                           node->edge_type ? node->edge_type : "start", node->confidence,
+                           node->cross_repo ? "cross-repo" : "local",
+                           node->edge_evidence ? node->edge_evidence : "");
+                }
+                cbm_aosp_trace_result_free(&result);
+            }
+        }
+        free(global_id);
+    } else if (strcmp(action, "query") == 0) {
+        char *global_id = NULL;
+        if (aosp_resolve_query_start(&workspace, query_reference, &global_id,
+                                     err, sizeof(err)) != 0) {
+            (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP start resolution failed");
+            exit_code = 1;
+        } else {
+            cbm_aosp_query_graph_options_t options = {
+                .hops = query_hops,
+                .hop_count = query_hop_count,
+                .max_results = search_limit,
+            };
+            cbm_aosp_query_graph_result_t result;
+            if (cbm_aosp_query_graph(&workspace, global_id, &options, &result,
+                                     err, sizeof(err)) != 0) {
+                (void)fprintf(stderr, "error: %s\n",
+                              err[0] ? err : "AOSP federated query failed");
+                exit_code = 1;
+            } else {
+                printf("nodes:%d\thops:%d%s\n", result.node_count, query_hop_count,
+                       result.truncated ? "\ttruncated" : "");
+                for (int i = 0; i < result.node_count; i++) {
+                    const cbm_aosp_query_node_t *node = &result.nodes[i];
+                    printf("%d\t%s\t%s\t%s\t%s\t%s:%d\t%s\t%.3f\t%s\n",
+                           node->hop_index, aosp_query_kind_name(node->kind), node->node_id,
+                           node->repo_id ? node->repo_id : "",
+                           node->qualified_name ? node->qualified_name : node->name,
+                           node->file_path ? node->file_path : "", node->start_line,
+                           node->edge_type ? node->edge_type : "start", node->confidence,
+                           node->cross_repo ? "cross-repo" : "local");
+                }
+                cbm_aosp_query_graph_result_free(&result);
+            }
+        }
+        free(global_id);
     } else {
         print_aosp_usage(stderr);
         exit_code = 1;
     }
     cbm_aosp_workspace_free(&workspace);
+    aosp_free_query_edges(query_edge_types, query_hop_count);
     return exit_code;
 }

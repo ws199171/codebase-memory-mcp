@@ -137,9 +137,9 @@ Each candidate carries its global ID, repository ID and path, shard project name
 local node ID, label, language, qualified name, file, and source range. Results are
 ordered by qualified name, repository path, and global ID. At most 200 candidates
 are materialized; `total_candidate_count` and `truncated` preserve explicit
-ambiguity when a common short name has more matches. The resolver is the internal
-Q1 contract used by later shard routing and traversal tasks; public workspace-aware
-CLI and MCP compatibility is introduced by Q6.
+ambiguity when a common short name has more matches. The resolver is the Q1
+contract used by shard routing and traversal and is exposed by the Q6 CLI/MCP
+workspace query surfaces.
 
 ## Shard Routing
 
@@ -220,8 +220,58 @@ Cycle detection uses a visited set keyed by `"K:node_id"` where K is the node
 kind prefix (S/M/P), preventing revisits across different relationship types.
 The result budget provides early termination with a `truncated` flag.
 
-This is the internal Q4 contract. Public workspace-aware CLI and MCP
-compatibility is introduced by Q6.
+This Q4 contract is exposed by the Q6 CLI/MCP workspace query surfaces.
+
+## Workspace Source Snippets
+
+`cbm_aosp_read_source_snippet` accepts an exact Master `global_id`, including the
+IDs returned by `cbm_aosp_search_symbols`, and returns the symbol's inclusive
+source range from its owning manifest repository. The result carries the
+authoritative shard node, repository-relative and workspace-relative file paths,
+the canonical absolute path, and the verbatim source bytes for `start_line`
+through `end_line`.
+
+The reader resolves the global ID through the Master, opens the indexed shard
+read-only, and re-reads the local node before opening source. A qualified-name or
+label mismatch between Master and shard is reported as a stale catalog instead of
+returning source for a different node that reused the local ID. File paths are
+canonicalized and must remain beneath the owning repository root, so a resolved
+path outside that repository cannot expose another repository or workspace file.
+Missing repositories, unindexed or unreadable shards, absent files, invalid or
+outdated line ranges, binary NUL bytes, and oversized snippets are explicit
+errors; the API never substitutes a guessed range or partial source.
+
+This Q5 contract is exposed by the Q6 CLI/MCP workspace query surfaces.
+
+## Public Workspace Query Contracts
+
+Q6 exposes Q1-Q5 through AOSP-specific names, leaving the existing single-project
+`query_graph`, `trace_path`, and `get_code_snippet` tools unchanged.
+
+CLI commands:
+
+```text
+codebase-memory-mcp aosp resolve <reference> [root]
+codebase-memory-mcp aosp snippet <global-id> [root]
+codebase-memory-mcp aosp trace <reference> [root] [--depth N] [--direction outgoing|incoming|both] [--limit N]
+codebase-memory-mcp aosp query <reference> [root] --hop kind:direction[:edge-type] [--hop ...] [--limit N]
+```
+
+MCP tools:
+
+| Tool | Contract |
+|---|---|
+| `aosp_resolve_symbol` | Returns deterministic resolution status, match tier, truncation, and all best-tier candidates. |
+| `aosp_get_source_snippet` | Accepts an exact search/resolution `global_id` and returns the verified source range. |
+| `aosp_trace_path` | Accepts a global ID or unambiguous reference and returns bounded code traversal with evidence. |
+| `aosp_query_graph` | Accepts a global ID or unambiguous reference plus ordered symbol/module/protocol hops. |
+
+`aosp_search_symbols` now includes `global_id` and `repo_id` in every result, so a
+caller can pass a search hit directly to `aosp_get_source_snippet`. Trace and query
+starts may also use qualified references, but ambiguous references fail with an
+explicit instruction to call `aosp_resolve_symbol`; no candidate is selected by
+repository order. The AOSP-specific tools are read-only and do not alter the
+behavior or schemas of single-project callers.
 
 ## Schema Compatibility
 

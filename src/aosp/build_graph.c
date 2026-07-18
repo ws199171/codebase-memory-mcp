@@ -1,6 +1,7 @@
 /* AOSP Soong/Make build graph extraction. */
 #include "aosp/build_graph.h"
 
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/sha256.h"
 
@@ -496,7 +497,7 @@ static bool parse_android_mk(char *source, const char *file_path, module_vec_t *
             while (build && (isupper((unsigned char)build[build_len]) || build[build_len] == '_')) {
                 build_len++;
             }
-            current.type = build_len ? strndup(build, build_len) : strdup("android_make");
+            current.type = build_len ? cbm_strndup(build, build_len) : strdup("android_make");
             if (!current.type || !module_vec_add(modules, &current)) {
                 module_free(&current);
                 str_vec_free(&logical);

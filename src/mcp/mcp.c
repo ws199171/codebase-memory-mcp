@@ -607,6 +607,48 @@ static const tool_def_t TOOLS[] = {
      "\"limit\":{\"type\":\"integer\",\"default\":20,\"maximum\":200}},"
      "\"required\":[\"workspace_root\",\"query\"]}"},
 
+    {"aosp_resolve_symbol", "Resolve AOSP symbol",
+     "Resolve a global ID or qualified symbol reference against the AOSP workspace Master "
+     "catalog. Ambiguous best-tier matches are returned explicitly and are never auto-selected.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"reference\":{\"type\":\"string\",\"description\":\"Global ID, qualified name, suffix, or exact name\"}},"
+     "\"required\":[\"workspace_root\",\"reference\"]}"},
+
+    {"aosp_get_source_snippet", "Get AOSP source snippet",
+     "Read the exact indexed source range for a Master global symbol ID from its owning "
+     "manifest repository. Stale catalogs, invalid ranges, missing shards, and paths outside "
+     "the repository are returned as errors.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"global_id\":{\"type\":\"string\",\"description\":\"Exact global_id returned by AOSP search or resolution\"}},"
+     "\"required\":[\"workspace_root\",\"global_id\"]}"},
+
+    {"aosp_trace_path", "Trace AOSP path",
+     "Traverse local and cross-repository code edges from an AOSP symbol reference. Returns "
+     "repository, source location, edge type, confidence, and evidence for each hop.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol reference\"},"
+     "\"max_depth\":{\"type\":\"integer\",\"default\":3,\"minimum\":0,\"maximum\":1000},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":\"outgoing\"},"
+     "\"result_budget\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":10000}},"
+     "\"required\":[\"workspace_root\",\"start\"]}"},
+
+    {"aosp_query_graph", "Query AOSP graph",
+     "Execute an ordered federated pattern across code symbols, build modules, and protocol "
+     "nodes without changing the existing single-project query_graph contract.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
+     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol reference\"},"
+     "\"hops\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":64,\"items\":{"
+     "\"type\":\"object\",\"properties\":{"
+     "\"kind\":{\"type\":\"string\",\"enum\":[\"symbol\",\"module\",\"protocol\"]},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":\"outgoing\"},"
+     "\"edge_type\":{\"type\":\"string\"}},\"required\":[\"kind\"]}},"
+     "\"max_results\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":10000}},"
+     "\"required\":[\"workspace_root\",\"start\",\"hops\"]}"},
+
     {"aosp_get_architecture", "Get AOSP architecture",
      "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
      "counts and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
@@ -663,6 +705,10 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"manage_adr", false, true, false, false},
     {"aosp_get_status", true, false, true, false},
     {"aosp_search_symbols", true, false, true, false},
+    {"aosp_resolve_symbol", true, false, true, false},
+    {"aosp_get_source_snippet", true, false, true, false},
+    {"aosp_trace_path", true, false, true, false},
+    {"aosp_query_graph", true, false, true, false},
     {"aosp_get_architecture", true, false, true, false},
     {"aosp_trace_protocol", true, false, true, false},
     {"ingest_traces", false, false, false, false},
@@ -716,6 +762,10 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
         "index_status",     "check_index_coverage", "detect_changes", "aosp_get_status",
         "aosp_search_symbols",
+        "aosp_resolve_symbol",
+        "aosp_get_source_snippet",
+        "aosp_trace_path",
+        "aosp_query_graph",
         "aosp_get_architecture",
         "aosp_trace_protocol",
     };
@@ -723,6 +773,9 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
         "list_projects", "index_status", "check_index_coverage", "aosp_get_status",
         "aosp_search_symbols",
+        "aosp_resolve_symbol",
+        "aosp_get_source_snippet",
+        "aosp_trace_path",
         "aosp_get_architecture",
         "aosp_trace_protocol",
     };
@@ -7914,6 +7967,8 @@ static char *handle_aosp_search_symbols(const char *args) {
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "global_id", symbols[i].global_id);
+        yyjson_mut_obj_add_strcpy(doc, item, "repo_id", symbols[i].repo_id);
         yyjson_mut_obj_add_strcpy(doc, item, "repo", symbols[i].repo_path);
         yyjson_mut_obj_add_strcpy(doc, item, "manifest_name", symbols[i].manifest_name);
         yyjson_mut_obj_add_strcpy(doc, item, "project", symbols[i].project_name);
@@ -7932,6 +7987,401 @@ static char *handle_aosp_search_symbols(const char *args) {
     cbm_aosp_workspace_free(&workspace);
     free(workspace_root);
     free(query);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static const char *mcp_aosp_resolution_status_name(cbm_aosp_symbol_resolution_status_t status) {
+    switch (status) {
+        case CBM_AOSP_SYMBOL_RESOLVED: return "resolved";
+        case CBM_AOSP_SYMBOL_AMBIGUOUS: return "ambiguous";
+        case CBM_AOSP_SYMBOL_NOT_FOUND: return "not_found";
+    }
+    return "not_found";
+}
+
+static const char *mcp_aosp_match_kind_name(cbm_aosp_symbol_match_kind_t kind) {
+    switch (kind) {
+        case CBM_AOSP_SYMBOL_MATCH_GLOBAL_ID: return "global_id";
+        case CBM_AOSP_SYMBOL_MATCH_EXACT_QUALIFIED_NAME: return "exact_qualified_name";
+        case CBM_AOSP_SYMBOL_MATCH_QUALIFIED_SUFFIX: return "qualified_suffix";
+        case CBM_AOSP_SYMBOL_MATCH_EXACT_NAME: return "exact_name";
+        case CBM_AOSP_SYMBOL_MATCH_NONE: return "none";
+    }
+    return "none";
+}
+
+static const char *mcp_aosp_query_kind_name(cbm_aosp_query_kind_t kind) {
+    switch (kind) {
+        case CBM_AOSP_QUERY_KIND_SYMBOL: return "symbol";
+        case CBM_AOSP_QUERY_KIND_MODULE: return "module";
+        case CBM_AOSP_QUERY_KIND_PROTOCOL: return "protocol";
+    }
+    return "symbol";
+}
+
+static int mcp_aosp_parse_direction(const char *value, cbm_aosp_trace_direction_t *out) {
+    if (!value || !out) return -1;
+    if (strcmp(value, "outgoing") == 0) {
+        *out = CBM_AOSP_TRACE_OUTGOING;
+    } else if (strcmp(value, "incoming") == 0) {
+        *out = CBM_AOSP_TRACE_INCOMING;
+    } else if (strcmp(value, "both") == 0) {
+        *out = CBM_AOSP_TRACE_BOTH;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static int mcp_aosp_parse_query_kind(const char *value, cbm_aosp_query_kind_t *out) {
+    if (!value || !out) return -1;
+    if (strcmp(value, "symbol") == 0) {
+        *out = CBM_AOSP_QUERY_KIND_SYMBOL;
+    } else if (strcmp(value, "module") == 0) {
+        *out = CBM_AOSP_QUERY_KIND_MODULE;
+    } else if (strcmp(value, "protocol") == 0) {
+        *out = CBM_AOSP_QUERY_KIND_PROTOCOL;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static void mcp_aosp_add_symbol(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                const cbm_aosp_symbol_t *symbol) {
+    yyjson_mut_obj_add_strcpy(doc, item, "global_id", symbol->global_id ? symbol->global_id : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "repo_id", symbol->repo_id ? symbol->repo_id : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "repo", symbol->repo_path ? symbol->repo_path : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "project",
+                              symbol->project_name ? symbol->project_name : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "name", symbol->name ? symbol->name : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                              symbol->qualified_name ? symbol->qualified_name : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "label", symbol->label ? symbol->label : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "language",
+                              symbol->language ? symbol->language : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "file", symbol->file_path ? symbol->file_path : "");
+    yyjson_mut_obj_add_int(doc, item, "start_line", symbol->start_line);
+    yyjson_mut_obj_add_int(doc, item, "end_line", symbol->end_line);
+}
+
+static int mcp_aosp_resolve_start(const cbm_aosp_workspace_t *workspace,
+                                  const char *reference, char **global_id,
+                                  char *err, size_t err_size) {
+    cbm_aosp_symbol_resolution_t resolution;
+    *global_id = NULL;
+    if (cbm_aosp_resolve_symbol(workspace, reference, &resolution, err, err_size) != 0) return -1;
+    if (resolution.status == CBM_AOSP_SYMBOL_NOT_FOUND) {
+        (void)snprintf(err, err_size, "symbol not found: %s", reference);
+    } else if (resolution.status == CBM_AOSP_SYMBOL_AMBIGUOUS) {
+        (void)snprintf(err, err_size,
+                       "ambiguous symbol reference: %s (%d candidates); use aosp_resolve_symbol",
+                       reference, resolution.total_candidate_count);
+    } else if (resolution.candidate_count == 1 && resolution.candidates[0].global_id) {
+        *global_id = heap_strdup(resolution.candidates[0].global_id);
+    }
+    cbm_aosp_symbol_resolution_free(&resolution);
+    if (!*global_id && !err[0]) (void)snprintf(err, err_size, "out of memory");
+    return *global_id ? 0 : -1;
+}
+
+static char *handle_aosp_resolve_symbol(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *reference = cbm_mcp_get_string_arg(args, "reference");
+    if (!workspace_root || !workspace_root[0] || !reference || !reference[0]) {
+        free(workspace_root);
+        free(reference);
+        return cbm_mcp_text_result("workspace_root and reference are required", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    cbm_aosp_symbol_resolution_t resolution;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        cbm_aosp_resolve_symbol(&workspace, reference, &resolution, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(reference);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP symbol resolution failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_strcpy(doc, root, "reference", reference);
+    yyjson_mut_obj_add_str(doc, root, "status",
+                           mcp_aosp_resolution_status_name(resolution.status));
+    yyjson_mut_obj_add_str(doc, root, "match_kind",
+                           mcp_aosp_match_kind_name(resolution.match_kind));
+    yyjson_mut_obj_add_int(doc, root, "candidate_count", resolution.candidate_count);
+    yyjson_mut_obj_add_int(doc, root, "total_candidate_count", resolution.total_candidate_count);
+    yyjson_mut_obj_add_bool(doc, root, "truncated", resolution.truncated);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < resolution.candidate_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        mcp_aosp_add_symbol(doc, item, &resolution.candidates[i]);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "candidates", items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_symbol_resolution_free(&resolution);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(reference);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static char *handle_aosp_get_source_snippet(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *global_id = cbm_mcp_get_string_arg(args, "global_id");
+    if (!workspace_root || !workspace_root[0] || !global_id || !global_id[0]) {
+        free(workspace_root);
+        free(global_id);
+        return cbm_mcp_text_result("workspace_root and global_id are required", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    cbm_aosp_source_snippet_t snippet;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        cbm_aosp_read_source_snippet(&workspace, global_id, &snippet, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(global_id);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP source snippet read failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    mcp_aosp_add_symbol(doc, root, &snippet.symbol);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_file",
+                              snippet.workspace_file_path ? snippet.workspace_file_path : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "absolute_file",
+                              snippet.absolute_file_path ? snippet.absolute_file_path : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "source", snippet.source ? snippet.source : "");
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_source_snippet_free(&snippet);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(global_id);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static char *handle_aosp_trace_path(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *start = cbm_mcp_get_string_arg(args, "start");
+    char *direction_text = cbm_mcp_get_string_arg(args, "direction");
+    int max_depth = cbm_mcp_get_int_arg(args, "max_depth", 3);
+    int result_budget = cbm_mcp_get_int_arg(args, "result_budget", 100);
+    cbm_aosp_trace_direction_t direction = CBM_AOSP_TRACE_OUTGOING;
+    if (!workspace_root || !workspace_root[0] || !start || !start[0]) {
+        free(workspace_root);
+        free(start);
+        free(direction_text);
+        return cbm_mcp_text_result("workspace_root and start are required", true);
+    }
+    if ((direction_text && mcp_aosp_parse_direction(direction_text, &direction) != 0) ||
+        max_depth < 0 || max_depth > 1000 || result_budget < 1 || result_budget > 10000) {
+        free(workspace_root);
+        free(start);
+        free(direction_text);
+        return cbm_mcp_text_result("invalid direction, max_depth, or result_budget", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    char *global_id = NULL;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        mcp_aosp_resolve_start(&workspace, start, &global_id, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(start);
+        free(direction_text);
+        free(global_id);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP trace start resolution failed", true);
+    }
+    cbm_aosp_trace_options_t options = {
+        .max_depth = max_depth,
+        .direction = direction,
+        .result_budget = result_budget,
+        .cancel_flag = NULL,
+    };
+    cbm_aosp_trace_result_t trace;
+    if (cbm_aosp_trace_path(&workspace, global_id, &options, &trace, err, sizeof(err)) != 0) {
+        cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(start);
+        free(direction_text);
+        free(global_id);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP trace failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_strcpy(doc, root, "start_global_id", global_id);
+    yyjson_mut_obj_add_int(doc, root, "count", trace.node_count);
+    yyjson_mut_obj_add_int(doc, root, "max_depth_reached", trace.max_depth_reached);
+    yyjson_mut_obj_add_bool(doc, root, "truncated", trace.truncated);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < trace.node_count; i++) {
+        const cbm_aosp_trace_node_t *node = &trace.nodes[i];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "global_id", node->global_id ? node->global_id : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "repo_id", node->repo_id ? node->repo_id : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                  node->qualified_name ? node->qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "label", node->label ? node->label : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file", node->file_path ? node->file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", node->start_line);
+        yyjson_mut_obj_add_int(doc, item, "depth", node->depth);
+        yyjson_mut_obj_add_strcpy(doc, item, "edge_type",
+                                  node->edge_type ? node->edge_type : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "evidence",
+                                  node->edge_evidence ? node->edge_evidence : "");
+        yyjson_mut_obj_add_real(doc, item, "confidence", node->confidence);
+        yyjson_mut_obj_add_bool(doc, item, "cross_repo", node->cross_repo);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "nodes", items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_trace_result_free(&trace);
+    cbm_aosp_workspace_free(&workspace);
+    free(workspace_root);
+    free(start);
+    free(direction_text);
+    free(global_id);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
+    free(json);
+    return result;
+}
+
+static char *handle_aosp_query_graph(const char *args) {
+    char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
+    char *start = cbm_mcp_get_string_arg(args, "start");
+    int max_results = cbm_mcp_get_int_arg(args, "max_results", 100);
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *hops_value = args_root ? yyjson_obj_get(args_root, "hops") : NULL;
+    size_t hop_count = hops_value && yyjson_is_arr(hops_value) ? yyjson_arr_size(hops_value) : 0;
+    if (!workspace_root || !workspace_root[0] || !start || !start[0] ||
+        hop_count == 0 || hop_count > 64 || max_results < 1 || max_results > 10000) {
+        yyjson_doc_free(args_doc);
+        free(workspace_root);
+        free(start);
+        return cbm_mcp_text_result(
+            "workspace_root, start, and 1-64 valid hops are required; max_results must be 1-10000",
+            true);
+    }
+    cbm_aosp_query_hop_t *hops = calloc(hop_count, sizeof(*hops));
+    if (!hops) {
+        yyjson_doc_free(args_doc);
+        free(workspace_root);
+        free(start);
+        return cbm_mcp_text_result("out of memory", true);
+    }
+    size_t index = 0;
+    size_t maximum = 0;
+    yyjson_val *hop_value = NULL;
+    bool valid_hops = true;
+    yyjson_arr_foreach(hops_value, index, maximum, hop_value) {
+        yyjson_val *kind_value = yyjson_is_obj(hop_value) ? yyjson_obj_get(hop_value, "kind") : NULL;
+        yyjson_val *direction_value = yyjson_is_obj(hop_value)
+                                           ? yyjson_obj_get(hop_value, "direction")
+                                           : NULL;
+        yyjson_val *edge_value = yyjson_is_obj(hop_value)
+                                      ? yyjson_obj_get(hop_value, "edge_type")
+                                      : NULL;
+        const char *kind = kind_value && yyjson_is_str(kind_value) ? yyjson_get_str(kind_value) : NULL;
+        const char *direction = direction_value && yyjson_is_str(direction_value)
+                                    ? yyjson_get_str(direction_value)
+                                    : "outgoing";
+        if (mcp_aosp_parse_query_kind(kind, &hops[index].kind) != 0 ||
+            mcp_aosp_parse_direction(direction, &hops[index].direction) != 0 ||
+            (edge_value && (!yyjson_is_str(edge_value) || !yyjson_get_str(edge_value)[0]))) {
+            valid_hops = false;
+            break;
+        }
+        hops[index].edge_type = edge_value ? yyjson_get_str(edge_value) : NULL;
+    }
+    if (!valid_hops) {
+        free(hops);
+        yyjson_doc_free(args_doc);
+        free(workspace_root);
+        free(start);
+        return cbm_mcp_text_result("each hop requires a valid kind, direction, and edge_type", true);
+    }
+    cbm_aosp_workspace_t workspace = {0};
+    char *global_id = NULL;
+    char err[CBM_SZ_1K] = {0};
+    if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
+        mcp_aosp_resolve_start(&workspace, start, &global_id, err, sizeof(err)) != 0) {
+        if (workspace.root) cbm_aosp_workspace_free(&workspace);
+        free(hops);
+        yyjson_doc_free(args_doc);
+        free(workspace_root);
+        free(start);
+        free(global_id);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP query start resolution failed", true);
+    }
+    cbm_aosp_query_graph_options_t options = {
+        .hops = hops,
+        .hop_count = (int)hop_count,
+        .max_results = max_results,
+    };
+    cbm_aosp_query_graph_result_t query;
+    if (cbm_aosp_query_graph(&workspace, global_id, &options, &query, err, sizeof(err)) != 0) {
+        cbm_aosp_workspace_free(&workspace);
+        free(global_id);
+        free(hops);
+        yyjson_doc_free(args_doc);
+        free(workspace_root);
+        free(start);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP federated query failed", true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "workspace_id", workspace.workspace_id);
+    yyjson_mut_obj_add_strcpy(doc, root, "start_global_id", global_id);
+    yyjson_mut_obj_add_int(doc, root, "count", query.node_count);
+    yyjson_mut_obj_add_bool(doc, root, "truncated", query.truncated);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (int i = 0; i < query.node_count; i++) {
+        const cbm_aosp_query_node_t *node = &query.nodes[i];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "node_id", node->node_id ? node->node_id : "");
+        yyjson_mut_obj_add_str(doc, item, "kind", mcp_aosp_query_kind_name(node->kind));
+        yyjson_mut_obj_add_strcpy(doc, item, "repo_id", node->repo_id ? node->repo_id : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "name", node->name ? node->name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                  node->qualified_name ? node->qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file", node->file_path ? node->file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", node->start_line);
+        yyjson_mut_obj_add_strcpy(doc, item, "edge_type",
+                                  node->edge_type ? node->edge_type : "");
+        yyjson_mut_obj_add_real(doc, item, "confidence", node->confidence);
+        yyjson_mut_obj_add_int(doc, item, "hop_index", node->hop_index);
+        yyjson_mut_obj_add_bool(doc, item, "cross_repo", node->cross_repo);
+        yyjson_mut_arr_add_val(items, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "nodes", items);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_aosp_query_graph_result_free(&query);
+    cbm_aosp_workspace_free(&workspace);
+    free(global_id);
+    free(hops);
+    yyjson_doc_free(args_doc);
+    free(workspace_root);
+    free(start);
     char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
     free(json);
     return result;
@@ -8173,6 +8623,18 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "aosp_search_symbols") == 0) {
         return handle_aosp_search_symbols(args_json);
+    }
+    if (strcmp(tool_name, "aosp_resolve_symbol") == 0) {
+        return handle_aosp_resolve_symbol(args_json);
+    }
+    if (strcmp(tool_name, "aosp_get_source_snippet") == 0) {
+        return handle_aosp_get_source_snippet(args_json);
+    }
+    if (strcmp(tool_name, "aosp_trace_path") == 0) {
+        return handle_aosp_trace_path(args_json);
+    }
+    if (strcmp(tool_name, "aosp_query_graph") == 0) {
+        return handle_aosp_query_graph(args_json);
     }
     if (strcmp(tool_name, "aosp_get_status") == 0) {
         return handle_aosp_get_status(args_json);

@@ -285,7 +285,22 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                          char *err, size_t err_size);
 void cbm_aosp_query_graph_result_free(cbm_aosp_query_graph_result_t *result);
 
-/* `codebase-memory-mcp aosp init|index|build|link|federate|status|repos|search ...`. */
+/* Q5: Route an exact Master search result to its repository shard and source.
+ * Pass a global_id returned by cbm_aosp_search_symbols or the Q1 resolver.
+ * The shard node is re-read so stale catalog identity is detected before any
+ * source file is opened. */
+typedef struct {
+    cbm_aosp_symbol_t symbol; /* authoritative shard node plus Master metadata */
+    char *workspace_file_path;
+    char *absolute_file_path;
+    char *source;             /* exact inclusive symbol line range */
+} cbm_aosp_source_snippet_t;
+
+int cbm_aosp_read_source_snippet(const cbm_aosp_workspace_t *workspace, const char *global_id,
+                                 cbm_aosp_source_snippet_t *out, char *err, size_t err_size);
+void cbm_aosp_source_snippet_free(cbm_aosp_source_snippet_t *snippet);
+
+/* AOSP workspace control and Q6 query-plane CLI entry point. */
 int cbm_cmd_aosp(int argc, char **argv);
 
 #endif /* CBM_AOSP_H */
