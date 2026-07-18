@@ -40,8 +40,8 @@ complete:
 
 ## Current Queue
 
-- Current task: `B2` - expand `defaults` inheritance with provenance and cycle detection.
-- Next task: `B3` - model target, arch, multilib, product-variable, and configurable variants.
+- Current task: `B3` - model target, arch, multilib, product-variable, and configurable variants.
+- Next task: `B4` - model `soong_namespace`, imports, visibility, and package boundaries.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -56,7 +56,12 @@ complete:
     and module-property references; 19 AOSP tests, exact dependency golden check,
     production `-Werror` build, and production CLI smoke pass; Linux ASan/UBSan
     execution remains required before verification completion.
-- Worktree baseline: Q7 query-plane fault coverage checkpoint `e0c3c03` on
+  - `B2` transitive defaults expansion, direct-dependency precedence, stable
+    same-repository resolution, per-edge inheritance provenance, and canonical
+    cycle diagnostics; 20 AOSP tests, 159 MCP tests, production `-Werror` build,
+    and production CLI/MCP smoke pass; Linux ASan/UBSan execution remains required
+    before verification completion.
+- Worktree baseline: B1 Blueprint variable evaluation checkpoint `720f6dc` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -252,3 +257,4 @@ unaccepted critical coverage gap.
 | `Q4` | `5d6b4cb` | Multi-hop federated query_graph across code/module/protocol relationships, SYMBOL→SYMBOL/MODULE/PROTOCOL transitions, module dependency and protocol edge traversal, edge-type filter, result budget, 182 focused tests, production `-Werror` build |
 | `Q5-Q6` | `ab0913f` | Exact workspace source routing plus CLI/MCP query contracts; focused Windows tests, production `-Werror` build and smoke pass; Linux sanitizers deferred |
 | `Q7` | `e0c3c03` | Three-repository mixed path, public fault coverage, query evidence propagation, focused Windows tests, production `-Werror` build and smoke pass; Linux sanitizers deferred |
+| `B1` | `720f6dc` | Blueprint string/list variables, `+`/`+=`, references, exact dependency golden check, production `-Werror` build and CLI smoke; Linux sanitizers deferred |

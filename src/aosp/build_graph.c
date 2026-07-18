@@ -6,6 +6,7 @@
 #include "foundation/sha256.h"
 
 #include <sqlite3.h>
+#include <yyjson/yyjson.h>
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -40,6 +41,9 @@ typedef struct {
 typedef struct {
     char *name;
     char *kind;
+    char *inherited_from;
+    char *inheritance_path;
+    int inheritance_depth;
 } dep_decl_t;
 
 typedef struct {
@@ -49,6 +53,8 @@ typedef struct {
     dep_decl_t *deps;
     int dep_count;
     int dep_cap;
+    int defaults_state;
+    char *defaults_cycle;
 } module_decl_t;
 
 typedef struct {
@@ -220,6 +226,7 @@ static bool module_add_dep(module_decl_t *module, const char *name, const char *
         module->dep_cap = new_cap;
     }
     dep_decl_t *dep = &module->deps[module->dep_count];
+    memset(dep, 0, sizeof(*dep));
     dep->name = strdup(name);
     dep->kind = strdup(kind);
     if (!dep->name || !dep->kind) {
@@ -231,14 +238,45 @@ static bool module_add_dep(module_decl_t *module, const char *name, const char *
     return true;
 }
 
+static bool module_add_inherited_dep(module_decl_t *module, const dep_decl_t *source,
+                                     const char *defaults_name) {
+    if (!module || !source || !defaults_name) return false;
+    for (int i = 0; i < module->dep_count; i++) {
+        if (strcmp(module->deps[i].name, source->name) == 0 &&
+            strcmp(module->deps[i].kind, source->kind) == 0) {
+            return true;
+        }
+    }
+    if (!module_add_dep(module, source->name, source->kind)) return false;
+    dep_decl_t *dep = &module->deps[module->dep_count - 1];
+    const char *origin = source->inherited_from ? source->inherited_from : defaults_name;
+    dep->inherited_from = strdup(origin);
+    size_t path_size = strlen(defaults_name) + 1;
+    if (source->inheritance_path) path_size += strlen(source->inheritance_path) + 1;
+    dep->inheritance_path = malloc(path_size);
+    if (dep->inheritance_path) {
+        if (source->inheritance_path) {
+            (void)snprintf(dep->inheritance_path, path_size, "%s>%s", defaults_name,
+                           source->inheritance_path);
+        } else {
+            (void)snprintf(dep->inheritance_path, path_size, "%s", defaults_name);
+        }
+    }
+    dep->inheritance_depth = source->inheritance_depth + 1;
+    return dep->inherited_from && dep->inheritance_path;
+}
+
 static void module_free(module_decl_t *module) {
     if (!module) return;
     free(module->name);
     free(module->type);
     free(module->file_path);
+    free(module->defaults_cycle);
     for (int i = 0; i < module->dep_count; i++) {
         free(module->deps[i].name);
         free(module->deps[i].kind);
+        free(module->deps[i].inherited_from);
+        free(module->deps[i].inheritance_path);
     }
     free(module->deps);
     memset(module, 0, sizeof(*module));
@@ -716,6 +754,151 @@ static bool is_nested_repo_boundary(const scan_ctx_t *ctx, const char *abs_path)
     return false;
 }
 
+typedef struct {
+    module_decl_t **items;
+    int count;
+    int cap;
+} module_stack_t;
+
+static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, char out[65]);
+
+static bool module_stack_push(module_stack_t *stack, module_decl_t *module) {
+    if (stack->count == stack->cap) {
+        int new_cap = stack->cap ? stack->cap * 2 : 16;
+        module_decl_t **items = realloc(stack->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        stack->items = items;
+        stack->cap = new_cap;
+    }
+    stack->items[stack->count++] = module;
+    return true;
+}
+
+static module_decl_t *find_defaults_module(scan_ctx_t *contexts, int context_count,
+                                           scan_ctx_t *source_ctx, const char *name,
+                                           scan_ctx_t **target_ctx) {
+    if (target_ctx) *target_ctx = NULL;
+    module_decl_t *best = NULL;
+    char best_id[65] = {0};
+    for (int i = 0; source_ctx && i < source_ctx->modules.count; i++) {
+        if (strcmp(source_ctx->modules.items[i].name, name) == 0) {
+            char candidate_id[65];
+            module_id(source_ctx->repo, &source_ctx->modules.items[i], candidate_id);
+            if (!best || strcmp(candidate_id, best_id) < 0) {
+                best = &source_ctx->modules.items[i];
+                (void)memcpy(best_id, candidate_id, sizeof(best_id));
+            }
+        }
+    }
+    if (best) {
+        if (target_ctx) *target_ctx = source_ctx;
+        return best;
+    }
+    scan_ctx_t *best_ctx = NULL;
+    for (int c = 0; c < context_count; c++) {
+        if (&contexts[c] == source_ctx) continue;
+        for (int i = 0; i < contexts[c].modules.count; i++) {
+            if (strcmp(contexts[c].modules.items[i].name, name) == 0) {
+                char candidate_id[65];
+                module_id(contexts[c].repo, &contexts[c].modules.items[i], candidate_id);
+                if (!best || strcmp(candidate_id, best_id) < 0) {
+                    best = &contexts[c].modules.items[i];
+                    best_ctx = &contexts[c];
+                    (void)memcpy(best_id, candidate_id, sizeof(best_id));
+                }
+            }
+        }
+    }
+    if (target_ctx) *target_ctx = best_ctx;
+    return best;
+}
+
+static bool mark_defaults_cycle(module_stack_t *stack, module_decl_t *target) {
+    int start = -1;
+    for (int i = 0; i < stack->count; i++) {
+        if (stack->items[i] == target) start = i;
+    }
+    if (start < 0) return true;
+    int canonical = start;
+    size_t path_size = 1;
+    for (int i = start; i < stack->count; i++) {
+        path_size += strlen(stack->items[i]->name) + 1;
+        if (strcmp(stack->items[i]->name, stack->items[canonical]->name) < 0) canonical = i;
+    }
+    path_size += strlen(stack->items[canonical]->name);
+    char *path = malloc(path_size);
+    if (!path) return false;
+    path[0] = '\0';
+    int cycle_count = stack->count - start;
+    for (int offset = 0; offset < cycle_count; offset++) {
+        int i = start + ((canonical - start + offset) % cycle_count);
+        if (path[0]) (void)strcat(path, ">");
+        (void)strcat(path, stack->items[i]->name);
+    }
+    (void)strcat(path, ">");
+    (void)strcat(path, stack->items[canonical]->name);
+    for (int i = start; i < stack->count; i++) {
+        if (!stack->items[i]->defaults_cycle) {
+            stack->items[i]->defaults_cycle = strdup(path);
+            if (!stack->items[i]->defaults_cycle) {
+                free(path);
+                return false;
+            }
+        }
+    }
+    free(path);
+    return true;
+}
+
+static bool expand_module_defaults(scan_ctx_t *contexts, int context_count,
+                                   scan_ctx_t *ctx, module_decl_t *module,
+                                   module_stack_t *stack) {
+    if (module->defaults_state == 2) return true;
+    if (module->defaults_state == 1) return mark_defaults_cycle(stack, module);
+    module->defaults_state = 1;
+    if (!module_stack_push(stack, module)) return false;
+    int direct_dep_count = module->dep_count;
+    for (int i = 0; i < direct_dep_count; i++) {
+        dep_decl_t *defaults_dep = &module->deps[i];
+        if (strcmp(defaults_dep->kind, "DEFAULTS") != 0) continue;
+        scan_ctx_t *target_ctx = NULL;
+        module_decl_t *target = find_defaults_module(contexts, context_count, ctx,
+                                                     defaults_dep->name, &target_ctx);
+        if (!target) continue;
+        if (target->defaults_state == 1) {
+            if (!mark_defaults_cycle(stack, target)) return false;
+            continue;
+        }
+        if (!expand_module_defaults(contexts, context_count, target_ctx, target, stack)) return false;
+        if (target->defaults_cycle && !module->defaults_cycle) {
+            module->defaults_cycle = strdup(target->defaults_cycle);
+            if (!module->defaults_cycle) return false;
+        }
+        for (int d = 0; d < target->dep_count; d++) {
+            if (strcmp(target->deps[d].kind, "DEFAULTS") != 0 &&
+                !module_add_inherited_dep(module, &target->deps[d], target->name)) {
+                return false;
+            }
+        }
+    }
+    stack->count--;
+    module->defaults_state = 2;
+    return true;
+}
+
+static bool expand_all_defaults(scan_ctx_t *contexts, int context_count) {
+    module_stack_t stack = {0};
+    bool ok = true;
+    for (int c = 0; c < context_count && ok; c++) {
+        for (int i = 0; i < contexts[c].modules.count && ok; i++) {
+            ok = expand_module_defaults(contexts, context_count, &contexts[c],
+                                        &contexts[c].modules.items[i], &stack);
+        }
+    }
+    free(stack.items);
+    return ok;
+}
+
 static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, int depth) {
     if (depth > BG_MAX_WALK_DEPTH) {
         bg_error(ctx->err, ctx->err_size, "AOSP build scan depth exceeded", rel_dir);
@@ -791,6 +974,38 @@ static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, 
     out[64] = '\0';
 }
 
+static char *module_properties_json(const module_decl_t *module) {
+    if (!module->defaults_cycle) return strdup("{}");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "defaults_cycle", module->defaults_cycle);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *dependency_properties_json(const dep_decl_t *dep) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    if (dep->inherited_from) {
+        yyjson_mut_obj_add_strcpy(doc, root, "origin", "defaults");
+        yyjson_mut_obj_add_strcpy(doc, root, "inherited_from", dep->inherited_from);
+        yyjson_mut_obj_add_strcpy(doc, root, "inheritance_path", dep->inheritance_path);
+        yyjson_mut_obj_add_int(doc, root, "inheritance_depth", dep->inheritance_depth);
+    } else {
+        yyjson_mut_obj_add_strcpy(doc, root, "origin", "direct");
+    }
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
 static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t *contexts,
                                int context_count, char *err, size_t err_size) {
     char path[BG_PATH_MAX];
@@ -832,9 +1047,10 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR IGNORE INTO modules(module_id,workspace_id,repo_id,name,module_type,file_path,properties)"
-            " VALUES(?1,?2,?3,?4,?5,?6,'{}');", -1, &insert_module, NULL) != SQLITE_OK ||
+            " VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_module, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type) VALUES(?1,?2,?3);",
+            "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type,properties) "
+            "VALUES(?1,?2,?3,?4);",
             -1, &insert_dep, NULL) != SQLITE_OK) goto fail_insert;
     for (int c = 0; c < context_count; c++) {
         for (int i = 0; i < contexts[c].modules.count; i++) {
@@ -849,14 +1065,24 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             sqlite3_bind_text(insert_module, 4, module->name, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(insert_module, 5, module->type, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(insert_module, 6, module->file_path, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(insert_module) != SQLITE_DONE) goto fail_insert;
+            char *module_properties = module_properties_json(module);
+            if (!module_properties) goto fail_insert;
+            sqlite3_bind_text(insert_module, 7, module_properties, -1, SQLITE_TRANSIENT);
+            int module_step = sqlite3_step(insert_module);
+            free(module_properties);
+            if (module_step != SQLITE_DONE) goto fail_insert;
             for (int d = 0; d < module->dep_count; d++) {
                 sqlite3_reset(insert_dep);
                 sqlite3_clear_bindings(insert_dep);
                 sqlite3_bind_text(insert_dep, 1, id, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(insert_dep, 2, module->deps[d].name, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(insert_dep, 3, module->deps[d].kind, -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(insert_dep) != SQLITE_DONE) goto fail_insert;
+                char *dep_properties = dependency_properties_json(&module->deps[d]);
+                if (!dep_properties) goto fail_insert;
+                sqlite3_bind_text(insert_dep, 4, dep_properties, -1, SQLITE_TRANSIENT);
+                int dep_step = sqlite3_step(insert_dep);
+                free(dep_properties);
+                if (dep_step != SQLITE_DONE) goto fail_insert;
             }
         }
     }
@@ -886,7 +1112,7 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
-            "SELECT source_id,target_id,type,'{}' FROM module_dependencies WHERE target_id IS NOT NULL "
+            "SELECT source_id,target_id,type,properties FROM module_dependencies WHERE target_id IS NOT NULL "
             "AND source_id IN (SELECT module_id FROM modules WHERE workspace_id=?1);",
             -1, &stmt, NULL) != SQLITE_OK) goto fail;
     sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
@@ -927,7 +1153,11 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "SELECT (SELECT count(*) FROM modules WHERE workspace_id=?1),"
         "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1),"
         "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1 AND d.resolved=1),"
-        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1 AND d.resolved=0);";
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id WHERE m.workspace_id=?1 AND d.resolved=0),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND d.properties LIKE '%\"origin\":\"defaults\"%'),"
+        "(SELECT count(*) FROM modules WHERE workspace_id=?1 "
+        "AND properties LIKE '%\"defaults_cycle\":%');";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -939,6 +1169,8 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->dependency_count = sqlite3_column_int(stmt, 1);
             stats->resolved_count = sqlite3_column_int(stmt, 2);
             stats->unresolved_count = sqlite3_column_int(stmt, 3);
+            stats->inherited_dependency_count = sqlite3_column_int(stmt, 4);
+            stats->defaults_cycle_count = sqlite3_column_int(stmt, 5);
             rc = 0;
         }
     }
@@ -966,6 +1198,10 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
             file_stats.make_files += contexts[i].stats.make_files;
             file_stats.aidl_files += contexts[i].stats.aidl_files;
         }
+    }
+    if (rc == 0 && !expand_all_defaults(contexts, workspace->repo_count)) {
+        bg_error(err, err_size, "cannot expand AOSP defaults", "out of memory");
+        rc = -1;
     }
     if (rc == 0) rc = persist_build_graph(workspace, contexts, workspace->repo_count, err, err_size);
     if (rc == 0) {

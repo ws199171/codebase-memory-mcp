@@ -10,6 +10,8 @@ typedef struct {
     int dependency_count;
     int resolved_count;
     int unresolved_count;
+    int inherited_dependency_count;
+    int defaults_cycle_count;
     int blueprint_files;
     int make_files;
     int aidl_files;

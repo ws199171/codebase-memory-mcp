@@ -143,6 +143,50 @@ static int create_q7_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_defaults_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_defaults_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "project") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/defaults\" path=\"project\"/></manifest>") != 0 ||
+        write_relative(root, "project/Android.bp",
+            "cc_defaults {\n"
+            "  name: \"base_defaults\",\n"
+            "  shared_libs: [\"libbase\", \"libdirect\"],\n"
+            "  static_libs: [\"libstatic\"],\n"
+            "}\n"
+            "cc_defaults {\n"
+            "  name: \"mid_defaults\",\n"
+            "  defaults: [\"base_defaults\"],\n"
+            "  shared_libs: [\"libmid\"],\n"
+            "}\n"
+            "cc_library {\n"
+            "  name: \"libconsumer\",\n"
+            "  defaults: [\"mid_defaults\"],\n"
+            "  shared_libs: [\"libdirect\"],\n"
+            "}\n"
+            "cc_defaults { name: \"cycle_a\", defaults: [\"cycle_b\"], shared_libs: [\"libcycle_a\"] }\n"
+            "cc_defaults { name: \"cycle_b\", defaults: [\"cycle_a\"], shared_libs: [\"libcycle_b\"] }\n"
+            "cc_library { name: \"libcycle_consumer\", defaults: [\"cycle_a\"] }\n"
+            "cc_library { name: \"libbase\" }\n"
+            "cc_library { name: \"libstatic\" }\n"
+            "cc_library { name: \"libmid\" }\n"
+            "cc_library { name: \"libdirect\" }\n"
+            "cc_library { name: \"libcycle_a\" }\n"
+            "cc_library { name: \"libcycle_b\" }\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1549,6 +1593,98 @@ TEST(aosp_build_graph_resolves_cross_repo_modules) {
     PASS();
 }
 
+TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles) {
+    char *root = NULL;
+    ASSERT_EQ(create_defaults_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.module_count, 12);
+    ASSERT_EQ(stats.dependency_count, 21);
+    ASSERT_EQ(stats.resolved_count, 21);
+    ASSERT_EQ(stats.unresolved_count, 0);
+    ASSERT_EQ(stats.inherited_dependency_count, 9);
+    ASSERT_EQ(stats.defaults_cycle_count, 3);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(d.properties,'$.origin'),"
+                  "json_extract(d.properties,'$.inherited_from'),"
+                  "json_extract(d.properties,'$.inheritance_path'),"
+                  "json_extract(d.properties,'$.inheritance_depth') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libconsumer' AND d.target_name='libbase';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "defaults");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "base_defaults");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "mid_defaults>base_defaults");
+    ASSERT_EQ(sqlite3_column_int(stmt, 3), 2);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(d.properties,'$.origin') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libconsumer' AND d.target_name='libdirect';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "direct");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(name,',') FROM (SELECT name FROM modules "
+                  "WHERE workspace_id=?1 AND json_extract(properties,'$.defaults_cycle')="
+                  "'cycle_a>cycle_b>cycle_a' ORDER BY name);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "cycle_a,cycle_b,libcycle_consumer");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(e.properties,'$.inheritance_path') "
+                  "FROM module_edges e JOIN modules m ON m.module_id=e.source_id "
+                  "JOIN modules t ON t.module_id=e.target_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libconsumer' AND t.name='libbase';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "mid_defaults>base_defaults");
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"libconsumer\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"dependencies_inherited\":9"));
+    ASSERT_NOT_NULL(strstr(response, "\"defaults_cycles\":3"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2671,6 +2807,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_trace_path_traverses_local_and_cross_repo_edges);
     RUN_TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
+    RUN_TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
