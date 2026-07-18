@@ -28,6 +28,10 @@ typedef struct {
     int source_file_count;
     int generated_output_count;
     int tool_file_count;
+    int make_include_count;
+    int make_condition_count;
+    int make_macro_count;
+    int make_unsupported_count;
     int blueprint_files;
     int make_files;
     int aidl_files;

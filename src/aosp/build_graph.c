@@ -67,6 +67,20 @@ typedef struct {
 } file_decl_t;
 
 typedef struct {
+    char *file_path;
+    str_vec_t includes;
+    str_vec_t unsupported;
+    int condition_count;
+    int macro_count;
+} make_file_decl_t;
+
+typedef struct {
+    make_file_decl_t *items;
+    int count;
+    int cap;
+} make_file_vec_t;
+
+typedef struct {
     char *name;
     char *type;
     char *file_path;
@@ -82,6 +96,8 @@ typedef struct {
     char *visibility_source_package;
     char *filegroup_path;
     char *generator_command;
+    char *make_build_rule;
+    char *make_module_class;
     str_vec_t declared_visibility;
     str_vec_t effective_visibility;
     str_vec_t namespace_imports;
@@ -148,6 +164,7 @@ typedef struct {
     module_vec_t modules;
     scope_vec_t namespaces;
     scope_vec_t packages;
+    make_file_vec_t make_files;
     cbm_aosp_build_stats_t stats;
     char *err;
     size_t err_size;
@@ -274,6 +291,36 @@ static void scope_vec_free(scope_vec_t *vec) {
         free(vec->items[i].path);
         free(vec->items[i].file_path);
         str_vec_free(&vec->items[i].values);
+    }
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static make_file_decl_t *make_file_vec_add(make_file_vec_t *vec,
+                                           const char *file_path) {
+    if (!vec || !file_path) return NULL;
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 8;
+        make_file_decl_t *items =
+            realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return NULL;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    make_file_decl_t *decl = &vec->items[vec->count];
+    memset(decl, 0, sizeof(*decl));
+    decl->file_path = strdup(file_path);
+    if (!decl->file_path) return NULL;
+    vec->count++;
+    return decl;
+}
+
+static void make_file_vec_free(make_file_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) {
+        free(vec->items[i].file_path);
+        str_vec_free(&vec->items[i].includes);
+        str_vec_free(&vec->items[i].unsupported);
     }
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
@@ -607,6 +654,8 @@ static void module_free(module_decl_t *module) {
     free(module->visibility_source_package);
     free(module->filegroup_path);
     free(module->generator_command);
+    free(module->make_build_rule);
+    free(module->make_module_class);
     str_vec_free(&module->declared_visibility);
     str_vec_free(&module->effective_visibility);
     str_vec_free(&module->namespace_imports);
@@ -1187,11 +1236,426 @@ static char *trim(char *text) {
     return text;
 }
 
-static void make_add_words(module_decl_t *module, char *value, const char *kind) {
-    char *save = NULL;
-    for (char *word = strtok_r(value, " \t", &save); word; word = strtok_r(NULL, " \t", &save)) {
-        (void)module_add_dep(module, word, kind);
+typedef struct {
+    char *name;
+    char *value;
+    bool recursive;
+} make_var_t;
+
+typedef struct {
+    make_var_t *items;
+    int count;
+    int cap;
+} make_var_vec_t;
+
+typedef struct {
+    bool parent_active;
+    bool active;
+    bool matched;
+    bool known;
+    bool else_seen;
+} make_condition_t;
+
+typedef struct {
+    scan_ctx_t *ctx;
+    make_file_decl_t *coverage;
+    make_var_vec_t vars;
+    str_vec_t include_stack;
+    const char *current_file;
+    make_condition_t conditions[64];
+    int condition_depth;
+} make_eval_t;
+
+static make_var_t *make_var_find(make_var_vec_t *vars, const char *name) {
+    for (int i = 0; vars && i < vars->count; i++) {
+        if (strcmp(vars->items[i].name, name) == 0) return &vars->items[i];
     }
+    return NULL;
+}
+
+static bool make_var_set(make_var_vec_t *vars, const char *name, const char *value,
+                         bool recursive, bool append, bool only_if_missing) {
+    make_var_t *var = make_var_find(vars, name);
+    if (var && only_if_missing) return true;
+    if (!var) {
+        if (vars->count == vars->cap) {
+            int new_cap = vars->cap ? vars->cap * 2 : 32;
+            make_var_t *items = realloc(vars->items, (size_t)new_cap * sizeof(*items));
+            if (!items) return false;
+            vars->items = items;
+            vars->cap = new_cap;
+        }
+        var = &vars->items[vars->count++];
+        memset(var, 0, sizeof(*var));
+        var->name = strdup(name);
+        if (!var->name) return false;
+        var->recursive = recursive;
+    }
+    if (append && var->value && var->value[0]) {
+        size_t length = strlen(var->value) + strlen(value) + 2;
+        char *combined = malloc(length);
+        if (!combined) return false;
+        (void)snprintf(combined, length, "%s %s", var->value, value);
+        free(var->value);
+        var->value = combined;
+        return true;
+    }
+    char *copy = strdup(value ? value : "");
+    if (!copy) return false;
+    free(var->value);
+    var->value = copy;
+    var->recursive = recursive;
+    return true;
+}
+
+static void make_vars_clear_local(make_var_vec_t *vars) {
+    for (int i = 0; vars && i < vars->count;) {
+        if (strncmp(vars->items[i].name, "LOCAL_", 6) != 0) {
+            i++;
+            continue;
+        }
+        free(vars->items[i].name);
+        free(vars->items[i].value);
+        memmove(&vars->items[i], &vars->items[i + 1],
+                (size_t)(vars->count - i - 1) * sizeof(*vars->items));
+        vars->count--;
+    }
+}
+
+static void make_var_vec_free(make_var_vec_t *vars) {
+    if (!vars) return;
+    for (int i = 0; i < vars->count; i++) {
+        free(vars->items[i].name);
+        free(vars->items[i].value);
+    }
+    free(vars->items);
+    memset(vars, 0, sizeof(*vars));
+}
+
+static bool make_append(char **buffer, size_t *length, size_t *capacity,
+                        const char *text, size_t text_length) {
+    if (*length + text_length + 1 > *capacity) {
+        size_t new_cap = *capacity ? *capacity : 64;
+        while (new_cap < *length + text_length + 1) new_cap *= 2;
+        char *grown = realloc(*buffer, new_cap);
+        if (!grown) return false;
+        *buffer = grown;
+        *capacity = new_cap;
+    }
+    memcpy(*buffer + *length, text, text_length);
+    *length += text_length;
+    (*buffer)[*length] = '\0';
+    return true;
+}
+
+static bool make_record_unsupported(make_eval_t *eval, const char *expression) {
+    return !eval || !eval->coverage ||
+           str_vec_add_unique(&eval->coverage->unsupported, expression);
+}
+
+static char *make_expand_text(make_eval_t *eval, const char *input, int depth,
+                              bool *complete);
+
+static bool make_split_args(const char *text, str_vec_t *args) {
+    int nesting = 0;
+    const char *start = text;
+    for (const char *p = text;; p++) {
+        if (*p == '(' || *p == '{') nesting++;
+        if ((*p == ')' || *p == '}') && nesting > 0) nesting--;
+        if ((*p == ',' && nesting == 0) || *p == '\0') {
+            char *part = cbm_strndup(start, (size_t)(p - start));
+            if (!part) return false;
+            char *clean = trim(part);
+            bool ok = str_vec_add(args, clean);
+            free(part);
+            if (!ok) return false;
+            if (!*p) break;
+            start = p + 1;
+        }
+    }
+    return true;
+}
+
+static char *make_normalize_words(const char *text) {
+    char *copy = strdup(text ? text : "");
+    if (!copy) return NULL;
+    char *result = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    char *save = NULL;
+    for (char *word = strtok_r(copy, " \t\r\n", &save); word;
+         word = strtok_r(NULL, " \t\r\n", &save)) {
+        if (length && !make_append(&result, &length, &capacity, " ", 1)) goto fail;
+        if (!make_append(&result, &length, &capacity, word, strlen(word))) goto fail;
+    }
+    free(copy);
+    if (!result) result = strdup("");
+    return result;
+fail:
+    free(copy);
+    free(result);
+    return NULL;
+}
+
+static char *make_replace_all(const char *text, const char *needle,
+                              const char *replacement) {
+    char *result = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    size_t needle_length = strlen(needle);
+    const char *cursor = text;
+    while (needle_length && strstr(cursor, needle)) {
+        const char *match = strstr(cursor, needle);
+        if (!make_append(&result, &length, &capacity, cursor,
+                         (size_t)(match - cursor)) ||
+            !make_append(&result, &length, &capacity, replacement,
+                         strlen(replacement))) {
+            free(result);
+            return NULL;
+        }
+        cursor = match + needle_length;
+    }
+    if (!make_append(&result, &length, &capacity, cursor, strlen(cursor))) {
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
+static char *make_expand_call(make_eval_t *eval, const str_vec_t *args, int depth,
+                              bool *complete) {
+    if (args->count == 0) {
+        *complete = false;
+        return strdup("");
+    }
+    bool name_complete = true;
+    char *name = make_expand_text(eval, args->items[0], depth + 1, &name_complete);
+    if (!name) return NULL;
+    char *clean_name = trim(name);
+    if (strcmp(clean_name, "my-dir") == 0) {
+        const char *slash = eval->current_file ? strrchr(eval->current_file, '/') : NULL;
+        char *directory = slash ? cbm_strndup(eval->current_file,
+                                               (size_t)(slash - eval->current_file))
+                                : strdup(".");
+        free(name);
+        *complete = name_complete;
+        return directory;
+    }
+    make_var_t *macro = make_var_find(&eval->vars, clean_name);
+    if (!macro || !macro->value) {
+        free(name);
+        *complete = false;
+        return strdup("");
+    }
+    char *expanded_macro = strdup(macro->value);
+    if (!expanded_macro) {
+        free(name);
+        return NULL;
+    }
+    for (int i = 0; i < args->count && i < 10; i++) {
+        char marker[8];
+        (void)snprintf(marker, sizeof(marker), "$(%d)", i);
+        bool arg_complete = true;
+        char *argument = i == 0 ? strdup(clean_name)
+                                : make_expand_text(eval, args->items[i], depth + 1,
+                                                   &arg_complete);
+        if (!argument) {
+            free(expanded_macro);
+            free(name);
+            return NULL;
+        }
+        char *replaced = make_replace_all(expanded_macro, marker, argument);
+        free(argument);
+        free(expanded_macro);
+        if (!replaced) {
+            free(name);
+            return NULL;
+        }
+        expanded_macro = replaced;
+        name_complete = name_complete && arg_complete;
+    }
+    char *result = make_expand_text(eval, expanded_macro, depth + 1, complete);
+    *complete = *complete && name_complete;
+    free(expanded_macro);
+    free(name);
+    return result;
+}
+
+static char *make_expand_function(make_eval_t *eval, const char *expression,
+                                  int depth, bool *complete) {
+    const char *separator = expression;
+    while (*separator && !isspace((unsigned char)*separator)) separator++;
+    if (!*separator) {
+        char *name = strdup(expression);
+        if (!name) return NULL;
+        char *clean = trim(name);
+        make_var_t *var = make_var_find(&eval->vars, clean);
+        if (!var || !var->value) {
+            *complete = false;
+            free(name);
+            return NULL;
+        }
+        char *result = var->recursive
+                           ? make_expand_text(eval, var->value, depth + 1, complete)
+                           : strdup(var->value);
+        free(name);
+        return result;
+    }
+    char *function = cbm_strndup(expression, (size_t)(separator - expression));
+    if (!function) return NULL;
+    while (*separator && isspace((unsigned char)*separator)) separator++;
+    str_vec_t args = {0};
+    if (!make_split_args(separator, &args)) {
+        free(function);
+        str_vec_free(&args);
+        return NULL;
+    }
+    char *result = NULL;
+    if (strcmp(function, "call") == 0) {
+        eval->coverage->macro_count++;
+        result = make_expand_call(eval, &args, depth, complete);
+    } else if (strcmp(function, "strip") == 0 && args.count == 1) {
+        char *expanded = make_expand_text(eval, args.items[0], depth + 1, complete);
+        result = expanded ? make_normalize_words(expanded) : NULL;
+        free(expanded);
+    } else if ((strcmp(function, "addprefix") == 0 ||
+                strcmp(function, "addsuffix") == 0) && args.count == 2) {
+        bool left_complete = true;
+        bool right_complete = true;
+        char *affix = make_expand_text(eval, args.items[0], depth + 1, &left_complete);
+        char *words = make_expand_text(eval, args.items[1], depth + 1, &right_complete);
+        char *copy = words ? strdup(words) : NULL;
+        size_t length = 0;
+        size_t capacity = 0;
+        char *save = NULL;
+        for (char *word = copy ? strtok_r(copy, " \t\r\n", &save) : NULL; word;
+             word = strtok_r(NULL, " \t\r\n", &save)) {
+            if (length) (void)make_append(&result, &length, &capacity, " ", 1);
+            if (strcmp(function, "addprefix") == 0) {
+                (void)make_append(&result, &length, &capacity, affix, strlen(affix));
+            }
+            (void)make_append(&result, &length, &capacity, word, strlen(word));
+            if (strcmp(function, "addsuffix") == 0) {
+                (void)make_append(&result, &length, &capacity, affix, strlen(affix));
+            }
+        }
+        if (!result) result = strdup("");
+        *complete = left_complete && right_complete;
+        free(copy);
+        free(words);
+        free(affix);
+    } else if (strcmp(function, "subst") == 0 && args.count == 3) {
+        bool from_complete = true;
+        bool to_complete = true;
+        bool text_complete = true;
+        char *from = make_expand_text(eval, args.items[0], depth + 1, &from_complete);
+        char *to = make_expand_text(eval, args.items[1], depth + 1, &to_complete);
+        char *text_value = make_expand_text(eval, args.items[2], depth + 1, &text_complete);
+        result = from && to && text_value ? make_replace_all(text_value, from, to) : NULL;
+        *complete = from_complete && to_complete && text_complete;
+        free(from);
+        free(to);
+        free(text_value);
+    } else if (strcmp(function, "if") == 0 && args.count >= 2) {
+        bool condition_complete = true;
+        char *condition = make_expand_text(eval, args.items[0], depth + 1,
+                                           &condition_complete);
+        int selected = condition && trim(condition)[0] ? 1 : 2;
+        if (selected < args.count) {
+            result = make_expand_text(eval, args.items[selected], depth + 1, complete);
+        } else {
+            result = strdup("");
+            *complete = true;
+        }
+        *complete = *complete && condition_complete;
+        free(condition);
+    } else {
+        *complete = false;
+    }
+    if (!result && !*complete) {
+        size_t size = strlen(expression) + 4;
+        result = malloc(size);
+        if (result) (void)snprintf(result, size, "$(%s)", expression);
+    }
+    free(function);
+    str_vec_free(&args);
+    return result;
+}
+
+static char *make_expand_text(make_eval_t *eval, const char *input, int depth,
+                              bool *complete) {
+    if (complete) *complete = true;
+    if (!input) return strdup("");
+    if (depth > 32) {
+        if (complete) *complete = false;
+        return strdup(input);
+    }
+    char *result = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    bool all_complete = true;
+    for (size_t i = 0; input[i];) {
+        if (input[i] != '$' || (input[i + 1] != '(' && input[i + 1] != '{')) {
+            if (!make_append(&result, &length, &capacity, input + i, 1)) goto fail;
+            i++;
+            continue;
+        }
+        char open = input[i + 1];
+        char close = open == '(' ? ')' : '}';
+        int nesting = 1;
+        size_t end = i + 2;
+        while (input[end] && nesting > 0) {
+            if (input[end] == open) nesting++;
+            if (input[end] == close) nesting--;
+            if (nesting > 0) end++;
+        }
+        if (nesting != 0) {
+            all_complete = false;
+            if (!make_append(&result, &length, &capacity, input + i, strlen(input + i)))
+                goto fail;
+            break;
+        }
+        char *expression = cbm_strndup(input + i + 2, end - (i + 2));
+        if (!expression) goto fail;
+        bool expression_complete = true;
+        char *expanded = make_expand_function(eval, expression, depth,
+                                              &expression_complete);
+        if (!expanded) {
+            size_t raw_length = end - i + 1;
+            expanded = cbm_strndup(input + i, raw_length);
+            expression_complete = false;
+        }
+        if (!expanded || !make_append(&result, &length, &capacity, expanded,
+                                      strlen(expanded))) {
+            free(expression);
+            free(expanded);
+            goto fail;
+        }
+        if (!expression_complete) all_complete = false;
+        free(expression);
+        free(expanded);
+        i = end + 1;
+    }
+    if (!result) result = strdup("");
+    if (complete) *complete = all_complete;
+    return result;
+fail:
+    free(result);
+    return NULL;
+}
+
+static bool make_add_words(module_decl_t *module, const char *value,
+                           const char *kind) {
+    char *copy = strdup(value ? value : "");
+    if (!copy) return false;
+    bool ok = true;
+    char *save = NULL;
+    for (char *word = strtok_r(copy, " \t\r\n", &save); word && ok;
+         word = strtok_r(NULL, " \t\r\n", &save)) {
+        ok = module_add_dep(module, word, kind);
+    }
+    free(copy);
+    return ok;
 }
 
 static const char *make_dependency_kind(const char *key) {
@@ -1199,17 +1663,425 @@ static const char *make_dependency_kind(const char *key) {
     if (strcmp(key, "LOCAL_STATIC_LIBRARIES") == 0 || strcmp(key, "LOCAL_WHOLE_STATIC_LIBRARIES") == 0) return "STATIC_LIB";
     if (strcmp(key, "LOCAL_HEADER_LIBRARIES") == 0) return "HEADER_LIB";
     if (strcmp(key, "LOCAL_JAVA_LIBRARIES") == 0 || strcmp(key, "LOCAL_STATIC_JAVA_LIBRARIES") == 0) return "LIB";
-    if (strcmp(key, "LOCAL_REQUIRED_MODULES") == 0) return "REQUIRED";
+    if (strcmp(key, "LOCAL_JNI_SHARED_LIBRARIES") == 0) return "JNI_LIB";
+    if (strcmp(key, "LOCAL_RUNTIME_LIBRARIES") == 0) return "RUNTIME_LIB";
+    if (strcmp(key, "LOCAL_USES_LIBRARIES") == 0) return "USES_LIB";
+    if (strcmp(key, "LOCAL_OPTIONAL_USES_LIBRARIES") == 0) return "OPTIONAL_USES_LIB";
+    if (strcmp(key, "LOCAL_REQUIRED_MODULES") == 0 ||
+        strcmp(key, "LOCAL_HOST_REQUIRED_MODULES") == 0 ||
+        strcmp(key, "LOCAL_TARGET_REQUIRED_MODULES") == 0) return "REQUIRED";
     return NULL;
 }
 
-static bool parse_android_mk(char *source, const char *file_path, module_vec_t *modules) {
-    module_decl_t current = {.file_path = strdup(file_path), .type = strdup("android_make")};
-    if (!current.file_path || !current.type) {
-        module_free(&current);
+static const char *make_semantic_type(const char *rule, const char *module_class) {
+    if (strcmp(rule, "BUILD_SHARED_LIBRARY") == 0) return "cc_library_shared";
+    if (strcmp(rule, "BUILD_STATIC_LIBRARY") == 0) return "cc_library_static";
+    if (strcmp(rule, "BUILD_EXECUTABLE") == 0) return "cc_binary";
+    if (strcmp(rule, "BUILD_HOST_EXECUTABLE") == 0) return "cc_binary_host";
+    if (strcmp(rule, "BUILD_NATIVE_TEST") == 0) return "cc_test";
+    if (strcmp(rule, "BUILD_JAVA_LIBRARY") == 0) return "java_library";
+    if (strcmp(rule, "BUILD_STATIC_JAVA_LIBRARY") == 0) return "java_library_static";
+    if (strcmp(rule, "BUILD_HOST_JAVA_LIBRARY") == 0) return "java_library_host";
+    if (strcmp(rule, "BUILD_PACKAGE") == 0) return "android_app";
+    if (strcmp(rule, "BUILD_RRO_PACKAGE") == 0) return "runtime_resource_overlay";
+    if (strcmp(rule, "BUILD_PREBUILT") == 0) {
+        if (module_class && strcmp(module_class, "APPS") == 0) return "android_app_import";
+        if (module_class && strcmp(module_class, "JAVA_LIBRARIES") == 0) return "java_import";
+        if (module_class && strcmp(module_class, "SHARED_LIBRARIES") == 0)
+            return "cc_prebuilt_library_shared";
+        if (module_class && strcmp(module_class, "STATIC_LIBRARIES") == 0)
+            return "cc_prebuilt_library_static";
+        if (module_class && strcmp(module_class, "EXECUTABLES") == 0)
+            return "cc_prebuilt_binary";
+        if (module_class && strcmp(module_class, "ETC") == 0) return "prebuilt_etc";
+        return "prebuilt";
+    }
+    return "android_make";
+}
+
+static const char *make_default_class(const char *rule) {
+    if (strcmp(rule, "BUILD_SHARED_LIBRARY") == 0) return "SHARED_LIBRARIES";
+    if (strcmp(rule, "BUILD_STATIC_LIBRARY") == 0) return "STATIC_LIBRARIES";
+    if (strcmp(rule, "BUILD_EXECUTABLE") == 0 ||
+        strcmp(rule, "BUILD_HOST_EXECUTABLE") == 0) return "EXECUTABLES";
+    if (strcmp(rule, "BUILD_NATIVE_TEST") == 0) return "NATIVE_TESTS";
+    if (strstr(rule, "JAVA_LIBRARY")) return "JAVA_LIBRARIES";
+    if (strcmp(rule, "BUILD_PACKAGE") == 0 || strcmp(rule, "BUILD_RRO_PACKAGE") == 0)
+        return "APPS";
+    return NULL;
+}
+
+static char *make_value(make_eval_t *eval, const char *name, bool *complete) {
+    make_var_t *var = make_var_find(&eval->vars, name);
+    if (!var || !var->value) {
+        *complete = false;
+        return strdup("");
+    }
+    if (!var->recursive) {
+        *complete = true;
+        return strdup(var->value);
+    }
+    return make_expand_text(eval, var->value, 0, complete);
+}
+
+static bool make_commit_module(make_eval_t *eval, const char *rule) {
+    bool name_complete = true;
+    char *name = make_value(eval, "LOCAL_MODULE", &name_complete);
+    if (!name) return false;
+    char *clean_name = trim(name);
+    if (!name_complete || !clean_name[0]) {
+        bool ok = make_record_unsupported(eval, rule);
+        free(name);
+        return ok;
+    }
+    bool class_complete = true;
+    char *module_class = make_value(eval, "LOCAL_MODULE_CLASS", &class_complete);
+    if (!module_class) {
+        free(name);
         return false;
     }
-    str_vec_t logical = {0};
+    char *clean_class = trim(module_class);
+    const char *effective_class = clean_class[0] ? clean_class : make_default_class(rule);
+    module_decl_t module = {
+        .name = strdup(clean_name),
+        .type = strdup(make_semantic_type(rule, effective_class)),
+        .file_path = strdup(eval->current_file),
+        .make_build_rule = strdup(rule),
+        .make_module_class = effective_class ? strdup(effective_class) : NULL,
+    };
+    free(name);
+    free(module_class);
+    if (!module.name || !module.type || !module.file_path || !module.make_build_rule ||
+        (effective_class && !module.make_module_class)) {
+        module_free(&module);
+        return false;
+    }
+    static const char *dependency_vars[] = {
+        "LOCAL_SHARED_LIBRARIES", "LOCAL_STATIC_LIBRARIES",
+        "LOCAL_WHOLE_STATIC_LIBRARIES", "LOCAL_HEADER_LIBRARIES",
+        "LOCAL_JAVA_LIBRARIES", "LOCAL_STATIC_JAVA_LIBRARIES",
+        "LOCAL_JNI_SHARED_LIBRARIES", "LOCAL_RUNTIME_LIBRARIES",
+        "LOCAL_USES_LIBRARIES", "LOCAL_OPTIONAL_USES_LIBRARIES",
+        "LOCAL_REQUIRED_MODULES", "LOCAL_HOST_REQUIRED_MODULES",
+        "LOCAL_TARGET_REQUIRED_MODULES",
+    };
+    bool ok = true;
+    for (size_t i = 0; ok && i < sizeof(dependency_vars) / sizeof(dependency_vars[0]); i++) {
+        make_var_t *var = make_var_find(&eval->vars, dependency_vars[i]);
+        if (!var) continue;
+        bool value_complete = true;
+        char *value = make_value(eval, dependency_vars[i], &value_complete);
+        const char *kind = make_dependency_kind(dependency_vars[i]);
+        ok = value && make_add_words(&module, value, kind);
+        if (!value_complete) ok = ok && make_record_unsupported(eval, var->value);
+        free(value);
+    }
+    static const char *file_vars[] = {
+        "LOCAL_SRC_FILES", "LOCAL_GENERATED_SOURCES", "LOCAL_PREBUILT_MODULE_FILE",
+    };
+    for (size_t i = 0; ok && i < sizeof(file_vars) / sizeof(file_vars[0]); i++) {
+        make_var_t *var = make_var_find(&eval->vars, file_vars[i]);
+        if (!var) continue;
+        bool value_complete = true;
+        char *value = make_value(eval, file_vars[i], &value_complete);
+        char *save = NULL;
+        for (char *word = value ? strtok_r(value, " \t\r\n", &save) : NULL;
+             word && ok; word = strtok_r(NULL, " \t\r\n", &save)) {
+            if (!strstr(word, "$(") && !strstr(word, "${")) {
+                ok = module_add_file_variant(&module, word, "SOURCE", NULL);
+            }
+        }
+        if (!value_complete) ok = ok && make_record_unsupported(eval, var->value);
+        free(value);
+    }
+    if (ok) ok = module_vec_add(&eval->ctx->modules, &module);
+    module_free(&module);
+    return ok;
+}
+
+static bool make_is_active(const make_eval_t *eval) {
+    return eval->condition_depth == 0 ||
+           eval->conditions[eval->condition_depth - 1].active;
+}
+
+static bool make_parse_condition_args(const char *text, char **left, char **right) {
+    *left = NULL;
+    *right = NULL;
+    char *copy = strdup(text);
+    if (!copy) return false;
+    char *value = trim(copy);
+    size_t length = strlen(value);
+    if (length >= 2 && value[0] == '(' && value[length - 1] == ')') {
+        value[length - 1] = '\0';
+        str_vec_t args = {0};
+        bool ok = make_split_args(value + 1, &args) && args.count == 2;
+        if (ok) {
+            *left = strdup(args.items[0]);
+            *right = strdup(args.items[1]);
+            ok = *left && *right;
+        }
+        str_vec_free(&args);
+        free(copy);
+        return ok;
+    }
+    if (value[0] == '\'' || value[0] == '"') {
+        char quote = value[0];
+        char *left_end = strchr(value + 1, quote);
+        char *right_start = left_end ? trim(left_end + 1) : NULL;
+        if (left_end && right_start && right_start[0] == quote) {
+            char *right_end = strchr(right_start + 1, quote);
+            if (right_end) {
+                *left = cbm_strndup(value + 1, (size_t)(left_end - (value + 1)));
+                *right = cbm_strndup(right_start + 1,
+                                     (size_t)(right_end - (right_start + 1)));
+            }
+        }
+    }
+    free(copy);
+    return *left && *right;
+}
+
+static bool make_begin_condition(make_eval_t *eval, const char *line,
+                                 const char *directive) {
+    if (eval->condition_depth >= (int)(sizeof(eval->conditions) /
+                                       sizeof(eval->conditions[0]))) {
+        return make_record_unsupported(eval, line);
+    }
+    bool parent_active = make_is_active(eval);
+    bool known = true;
+    bool matched = false;
+    const char *arguments = trim((char *)line + strlen(directive));
+    if (strcmp(directive, "ifdef") == 0 || strcmp(directive, "ifndef") == 0) {
+        make_var_t *var = make_var_find(&eval->vars, arguments);
+        if (!var) {
+            known = false;
+        } else {
+            matched = var->value && var->value[0];
+            if (strcmp(directive, "ifndef") == 0) matched = !matched;
+        }
+    } else {
+        char *left = NULL;
+        char *right = NULL;
+        if (!make_parse_condition_args(arguments, &left, &right)) {
+            known = false;
+        } else {
+            bool left_complete = true;
+            bool right_complete = true;
+            char *expanded_left = make_expand_text(eval, left, 0, &left_complete);
+            char *expanded_right = make_expand_text(eval, right, 0, &right_complete);
+            known = expanded_left && expanded_right && left_complete && right_complete;
+            if (known) {
+                matched = strcmp(trim(expanded_left), trim(expanded_right)) == 0;
+                if (strcmp(directive, "ifneq") == 0) matched = !matched;
+            }
+            free(expanded_left);
+            free(expanded_right);
+        }
+        free(left);
+        free(right);
+    }
+    eval->coverage->condition_count++;
+    if (!known && !make_record_unsupported(eval, line)) return false;
+    make_condition_t *condition = &eval->conditions[eval->condition_depth++];
+    *condition = (make_condition_t){
+        .parent_active = parent_active,
+        .active = parent_active && known && matched,
+        .matched = matched,
+        .known = known,
+    };
+    return true;
+}
+
+static bool make_handle_condition(make_eval_t *eval, char *line, bool *handled) {
+    *handled = true;
+    if (strncmp(line, "ifeq", 4) == 0 && isspace((unsigned char)line[4]))
+        return make_begin_condition(eval, line, "ifeq");
+    if (strncmp(line, "ifneq", 5) == 0 && isspace((unsigned char)line[5]))
+        return make_begin_condition(eval, line, "ifneq");
+    if (strncmp(line, "ifdef", 5) == 0 && isspace((unsigned char)line[5]))
+        return make_begin_condition(eval, line, "ifdef");
+    if (strncmp(line, "ifndef", 6) == 0 && isspace((unsigned char)line[6]))
+        return make_begin_condition(eval, line, "ifndef");
+    if (strcmp(line, "else") == 0) {
+        if (eval->condition_depth == 0) return make_record_unsupported(eval, line);
+        make_condition_t *condition = &eval->conditions[eval->condition_depth - 1];
+        if (condition->else_seen) return make_record_unsupported(eval, line);
+        condition->else_seen = true;
+        condition->active = condition->parent_active && condition->known &&
+                            !condition->matched;
+        return true;
+    }
+    if (strncmp(line, "else ", 5) == 0) {
+        if (eval->condition_depth > 0) {
+            make_condition_t *condition =
+                &eval->conditions[eval->condition_depth - 1];
+            condition->active = false;
+            condition->else_seen = true;
+        }
+        return make_record_unsupported(eval, line);
+    }
+    if (strcmp(line, "endif") == 0) {
+        if (eval->condition_depth == 0) return make_record_unsupported(eval, line);
+        eval->condition_depth--;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static bool make_normalize_include(const char *path, char **normalized) {
+    *normalized = NULL;
+    if (!path || !path[0] || path[0] == '/' || path[0] == '\\' ||
+        (isalpha((unsigned char)path[0]) && path[1] == ':') || strstr(path, "..")) {
+        return false;
+    }
+    char *copy = strdup(path);
+    if (!copy) return false;
+    for (char *p = copy; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    while (strncmp(copy, "./", 2) == 0) memmove(copy, copy + 2, strlen(copy + 2) + 1);
+    *normalized = copy;
+    return true;
+}
+
+static bool make_parse_source(make_eval_t *eval, char *source, const char *file_path);
+
+static bool make_include_file(make_eval_t *eval, const char *file_path, bool optional) {
+    char *normalized = NULL;
+    if (!make_normalize_include(file_path, &normalized))
+        return make_record_unsupported(eval, file_path);
+    for (int i = 0; i < eval->include_stack.count; i++) {
+        if (strcmp(eval->include_stack.items[i], normalized) == 0) {
+            bool ok = make_record_unsupported(eval, normalized);
+            free(normalized);
+            return ok;
+        }
+    }
+    char absolute[BG_PATH_MAX];
+    (void)snprintf(absolute, sizeof(absolute), "%s/%s", eval->ctx->repo->abs_path,
+                   normalized);
+    size_t length = 0;
+    char *source = bg_read_file(absolute, &length);
+    if (!source) {
+        bool ok = optional || make_record_unsupported(eval, normalized);
+        free(normalized);
+        return ok;
+    }
+    bool ok = str_vec_add_unique(&eval->coverage->includes, normalized) &&
+              str_vec_add(&eval->include_stack, normalized);
+    const char *previous_file = eval->current_file;
+    if (ok) {
+        eval->current_file = normalized;
+        ok = make_parse_source(eval, source, normalized);
+        eval->current_file = previous_file;
+    }
+    if (eval->include_stack.count > 0) {
+        free(eval->include_stack.items[--eval->include_stack.count]);
+    }
+    free(source);
+    free(normalized);
+    return ok;
+}
+
+static bool make_handle_include(make_eval_t *eval, char *line) {
+    bool optional = false;
+    char *argument = NULL;
+    if (strncmp(line, "include ", 8) == 0) {
+        argument = trim(line + 8);
+    } else if (strncmp(line, "-include ", 9) == 0) {
+        optional = true;
+        argument = trim(line + 9);
+    } else if (strncmp(line, "sinclude ", 9) == 0) {
+        optional = true;
+        argument = trim(line + 9);
+    } else {
+        return false;
+    }
+    if (strcmp(argument, "$(CLEAR_VARS)") == 0 ||
+        strcmp(argument, "${CLEAR_VARS}") == 0) {
+        make_vars_clear_local(&eval->vars);
+        return true;
+    }
+    size_t length = strlen(argument);
+    if (length > 4 && argument[0] == '$' &&
+        (argument[1] == '(' || argument[1] == '{')) {
+        char close = argument[1] == '(' ? ')' : '}';
+        if (argument[length - 1] == close) {
+            char *rule = cbm_strndup(argument + 2, length - 3);
+            if (!rule) return true;
+            if (strncmp(rule, "BUILD_", 6) == 0) {
+                bool ok = make_commit_module(eval, rule);
+                free(rule);
+                return ok;
+            }
+            free(rule);
+        }
+    }
+    bool complete = true;
+    char *expanded = make_expand_text(eval, argument, 0, &complete);
+    if (!expanded) return true;
+    if (!complete) {
+        bool ok = make_record_unsupported(eval, argument);
+        free(expanded);
+        return ok;
+    }
+    bool ok = true;
+    char *save = NULL;
+    for (char *path = strtok_r(expanded, " \t\r\n", &save); path && ok;
+         path = strtok_r(NULL, " \t\r\n", &save)) {
+        ok = make_include_file(eval, path, optional);
+    }
+    free(expanded);
+    return ok;
+}
+
+static bool make_handle_assignment(make_eval_t *eval, char *line) {
+    char *assign = strstr(line, ":=");
+    const char *op = ":=";
+    if (!assign) {
+        assign = strstr(line, "+=");
+        op = "+=";
+    }
+    if (!assign) {
+        assign = strstr(line, "?=");
+        op = "?=";
+    }
+    if (!assign) {
+        assign = strchr(line, '=');
+        op = "=";
+    }
+    if (!assign) return make_record_unsupported(eval, line);
+    *assign = '\0';
+    char *name = trim(line);
+    while (strncmp(name, "override ", 9) == 0 || strncmp(name, "export ", 7) == 0 ||
+           strncmp(name, "private ", 8) == 0) {
+        char *space = strchr(name, ' ');
+        name = trim(space + 1);
+    }
+    char *value = trim(assign + 2 - (strcmp(op, "=") == 0));
+    bool append = strcmp(op, "+=") == 0;
+    bool only_if_missing = strcmp(op, "?=") == 0;
+    make_var_t *existing = make_var_find(&eval->vars, name);
+    if (only_if_missing && existing) return true;
+    bool recursive = strcmp(op, "=") == 0 || only_if_missing ||
+                     (append && (!existing || existing->recursive));
+    char *stored = NULL;
+    bool complete = true;
+    if (recursive) {
+        stored = strdup(value);
+    } else {
+        stored = make_expand_text(eval, value, 0, &complete);
+    }
+    if (!stored) return false;
+    bool ok = make_var_set(&eval->vars, name, stored, recursive, append,
+                           only_if_missing);
+    if (!complete) ok = ok && make_record_unsupported(eval, value);
+    free(stored);
+    return ok;
+}
+
+static bool make_logical_lines(char *source, str_vec_t *logical) {
     char *save = NULL;
     char *pending = NULL;
     size_t pending_len = 0;
@@ -1223,8 +2095,7 @@ static bool parse_android_mk(char *source, const char *file_path, module_vec_t *
         char *grown = realloc(pending, pending_len + len + 2);
         if (!grown) {
             free(pending);
-            str_vec_free(&logical);
-            module_free(&current);
+            str_vec_free(logical);
             return false;
         }
         pending = grown;
@@ -1232,10 +2103,9 @@ static bool parse_android_mk(char *source, const char *file_path, module_vec_t *
         memcpy(pending + pending_len, part, len + 1);
         pending_len += len;
         if (continued) continue;
-        if (!str_vec_add(&logical, pending)) {
+        if (!str_vec_add(logical, pending)) {
             free(pending);
-            str_vec_free(&logical);
-            module_free(&current);
+            str_vec_free(logical);
             return false;
         }
         free(pending);
@@ -1243,54 +2113,74 @@ static bool parse_android_mk(char *source, const char *file_path, module_vec_t *
         pending_len = 0;
     }
     free(pending);
-
-    for (int i = 0; i < logical.count; i++) {
-        char *line = logical.items[i];
-        if (strstr(line, "CLEAR_VARS")) {
-            module_free(&current);
-            current.file_path = strdup(file_path);
-            current.type = strdup("android_make");
-            continue;
-        }
-        if (strncmp(line, "include", 7) == 0 && strstr(line, "BUILD_")) {
-            const char *build = strstr(line, "BUILD_");
-            free(current.type);
-            size_t build_len = 0;
-            while (build && (isupper((unsigned char)build[build_len]) || build[build_len] == '_')) {
-                build_len++;
-            }
-            current.type = build_len ? cbm_strndup(build, build_len) : strdup("android_make");
-            if (!current.type || !module_vec_add(modules, &current)) {
-                module_free(&current);
-                str_vec_free(&logical);
-                return false;
-            }
-            current.file_path = strdup(file_path);
-            current.type = strdup("android_make");
-            continue;
-        }
-        char *assign = strstr(line, ":=");
-        size_t op_len = 2;
-        if (!assign) assign = strstr(line, "+=");
-        if (!assign) {
-            assign = strchr(line, '=');
-            op_len = 1;
-        }
-        if (!assign) continue;
-        *assign = '\0';
-        char *key = trim(line);
-        char *value = trim(assign + op_len);
-        if (strcmp(key, "LOCAL_MODULE") == 0) {
-            free(current.name);
-            current.name = strdup(value);
-        } else {
-            const char *kind = make_dependency_kind(key);
-            if (kind) make_add_words(&current, value, kind);
-        }
-    }
-    module_free(&current);
-    str_vec_free(&logical);
     return true;
+}
+
+static bool make_parse_source(make_eval_t *eval, char *source, const char *file_path) {
+    str_vec_t logical = {0};
+    if (!make_logical_lines(source, &logical)) return false;
+    bool ok = true;
+    for (int i = 0; i < logical.count && ok; i++) {
+        char *line = trim(logical.items[i]);
+        if (!line[0]) continue;
+        bool handled = false;
+        ok = make_handle_condition(eval, line, &handled);
+        if (!ok || handled) continue;
+        if (!make_is_active(eval)) continue;
+        if (strncmp(line, "define ", 7) == 0) {
+            char *name = trim(line + 7);
+            char *body = NULL;
+            size_t body_length = 0;
+            size_t body_capacity = 0;
+            while (++i < logical.count && strcmp(trim(logical.items[i]), "endef") != 0) {
+                const char *part = logical.items[i];
+                if (body_length && !make_append(&body, &body_length, &body_capacity, "\n", 1)) {
+                    ok = false;
+                    break;
+                }
+                if (!make_append(&body, &body_length, &body_capacity, part, strlen(part))) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (i >= logical.count) ok = make_record_unsupported(eval, line);
+            if (ok) ok = make_var_set(&eval->vars, name, body ? body : "", true, false, false);
+            free(body);
+            continue;
+        }
+        if (strcmp(line, "endef") == 0) {
+            ok = make_record_unsupported(eval, line);
+            continue;
+        }
+        if (strncmp(line, "include ", 8) == 0 ||
+            strncmp(line, "-include ", 9) == 0 ||
+            strncmp(line, "sinclude ", 9) == 0) {
+            ok = make_handle_include(eval, line);
+            continue;
+        }
+        if (strchr(line, '=')) {
+            ok = make_handle_assignment(eval, line);
+            continue;
+        }
+        ok = make_record_unsupported(eval, line);
+    }
+    str_vec_free(&logical);
+    (void)file_path;
+    return ok;
+}
+
+static bool parse_android_mk(scan_ctx_t *ctx, char *source, const char *file_path) {
+    make_file_decl_t *coverage = make_file_vec_add(&ctx->make_files, file_path);
+    if (!coverage) return false;
+    make_eval_t eval = {.ctx = ctx, .coverage = coverage, .current_file = file_path};
+    if (!str_vec_add(&eval.include_stack, file_path)) return false;
+    bool ok = make_parse_source(&eval, source, file_path);
+    if (eval.condition_depth != 0) {
+        ok = make_record_unsupported(&eval, "unterminated conditional") && ok;
+    }
+    make_var_vec_free(&eval.vars);
+    str_vec_free(&eval.include_stack);
+    return ok;
 }
 
 static bool parse_aidl(const char *source, size_t length, const char *file_path,
@@ -1862,7 +2752,7 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
             ok = parse_blueprint(ctx, source, length, rel_path);
         } else if (is_mk) {
             ctx->stats.make_files++;
-            ok = parse_android_mk(source, rel_path, &ctx->modules);
+            ok = parse_android_mk(ctx, source, rel_path);
         } else {
             ctx->stats.aidl_files++;
             ok = parse_aidl(source, length, rel_path, &ctx->modules);
@@ -1913,6 +2803,12 @@ static char *module_properties_json(const module_decl_t *module) {
     }
     if (module->generator_command) {
         yyjson_mut_obj_add_strcpy(doc, root, "generator_command", module->generator_command);
+    }
+    if (module->make_build_rule) {
+        yyjson_mut_obj_add_strcpy(doc, root, "make_build_rule", module->make_build_rule);
+    }
+    if (module->make_module_class) {
+        yyjson_mut_obj_add_strcpy(doc, root, "make_module_class", module->make_module_class);
     }
     yyjson_mut_obj_add_strcpy(doc, root, "package", module->package_path ? module->package_path : "");
     yyjson_mut_obj_add_strcpy(doc, root, "namespace",
@@ -2044,6 +2940,7 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_stmt *insert_file = NULL;
     sqlite3_stmt *insert_namespace = NULL;
     sqlite3_stmt *insert_package = NULL;
+    sqlite3_stmt *insert_make = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
     const char *reset_sql =
         "DELETE FROM module_edges WHERE source_id IN "
@@ -2070,6 +2967,13 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_finalize(stmt);
     stmt = NULL;
     if (sqlite3_prepare_v2(db, "DELETE FROM modules WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_make_files WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK)
+        goto fail;
     sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
     sqlite3_finalize(stmt);
@@ -2106,7 +3010,35 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             "INSERT OR REPLACE INTO build_packages(workspace_id,package_path,repo_id,file_path,default_visibility) "
             "VALUES(?1,?2,?3,?4,?5);", -1, &insert_package, NULL) != SQLITE_OK)
         goto fail_insert;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_make_files("
+            "workspace_id,repo_id,file_path,includes,condition_count,macro_count,unsupported_expressions) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_make, NULL) != SQLITE_OK)
+        goto fail_insert;
     for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].make_files.count; i++) {
+            make_file_decl_t *decl = &contexts[c].make_files.items[i];
+            char *includes = string_array_json(&decl->includes);
+            char *unsupported = string_array_json(&decl->unsupported);
+            if (!includes || !unsupported) {
+                free(includes);
+                free(unsupported);
+                goto fail_insert;
+            }
+            sqlite3_reset(insert_make);
+            sqlite3_clear_bindings(insert_make);
+            sqlite3_bind_text(insert_make, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_make, 2, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_make, 3, decl->file_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_make, 4, includes, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(insert_make, 5, decl->condition_count);
+            sqlite3_bind_int(insert_make, 6, decl->macro_count);
+            sqlite3_bind_text(insert_make, 7, unsupported, -1, SQLITE_TRANSIENT);
+            int make_step = sqlite3_step(insert_make);
+            free(includes);
+            free(unsupported);
+            if (make_step != SQLITE_DONE) goto fail_insert;
+        }
         for (int i = 0; i < contexts[c].namespaces.count; i++) {
             scope_decl_t *decl = &contexts[c].namespaces.items[i];
             char *imports = string_array_json(&decl->values);
@@ -2198,11 +3130,13 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_finalize(insert_file);
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
+    sqlite3_finalize(insert_make);
     insert_module = NULL;
     insert_dep = NULL;
     insert_file = NULL;
     insert_namespace = NULL;
     insert_package = NULL;
+    insert_make = NULL;
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
@@ -2223,6 +3157,7 @@ fail_insert:
     sqlite3_finalize(insert_file);
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
+    sqlite3_finalize(insert_make);
 fail:
     sqlite3_finalize(reset);
     sqlite3_finalize(stmt);
@@ -2284,7 +3219,13 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "(SELECT count(*) FROM module_files f JOIN modules m ON m.module_id=f.source_id "
         "WHERE m.workspace_id=?1 AND f.role='OUTPUT'),"
         "(SELECT count(*) FROM module_files f JOIN modules m ON m.module_id=f.source_id "
-        "WHERE m.workspace_id=?1 AND f.role='TOOL_FILE');";
+        "WHERE m.workspace_id=?1 AND f.role='TOOL_FILE'),"
+        "(SELECT coalesce(sum(json_array_length(includes)),0) FROM build_make_files "
+        "WHERE workspace_id=?1),"
+        "(SELECT coalesce(sum(condition_count),0) FROM build_make_files WHERE workspace_id=?1),"
+        "(SELECT coalesce(sum(macro_count),0) FROM build_make_files WHERE workspace_id=?1),"
+        "(SELECT coalesce(sum(json_array_length(unsupported_expressions)),0) "
+        "FROM build_make_files WHERE workspace_id=?1);";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -2314,6 +3255,10 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->source_file_count = sqlite3_column_int(stmt, 19);
             stats->generated_output_count = sqlite3_column_int(stmt, 20);
             stats->tool_file_count = sqlite3_column_int(stmt, 21);
+            stats->make_include_count = sqlite3_column_int(stmt, 22);
+            stats->make_condition_count = sqlite3_column_int(stmt, 23);
+            stats->make_macro_count = sqlite3_column_int(stmt, 24);
+            stats->make_unsupported_count = sqlite3_column_int(stmt, 25);
             rc = 0;
         }
     }
@@ -2371,6 +3316,7 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         module_vec_free(&contexts[i].modules);
         scope_vec_free(&contexts[i].namespaces);
         scope_vec_free(&contexts[i].packages);
+        make_file_vec_free(&contexts[i].make_files);
     }
     free(module_index.items);
     free(contexts);

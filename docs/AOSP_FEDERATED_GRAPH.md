@@ -329,6 +329,31 @@ Master schema v9 adds `module_files`, keyed by module, declared path, and role.
 This table records build declarations only; linking those declarations to indexed
 source and generated `File` nodes remains a later build-graph task.
 
+## Android Make Evaluation
+
+Android.mk extraction evaluates a bounded, deterministic Make subset rather than
+claiming Kati compatibility. Recursive and simple variables support `=`, `:=`,
+`+=`, and `?=`. Expansion covers local variable references, `define` macros,
+`$(call ...)`, `my-dir`, `strip`, `subst`, `addprefix`, `addsuffix`, and `if`.
+Line continuation and relative `include`, `-include`, and `sinclude` fragments are
+processed with include-cycle detection.
+
+`ifeq`, `ifneq`, `ifdef`, `ifndef`, `else`, and `endif` are evaluated when their
+inputs are locally known. Conditions that depend on external product or target
+variables are not guessed: both branches remain unmodeled and the expression is
+reported as a coverage gap. Unsupported functions, statements, missing required
+includes, and malformed or cyclic constructs are retained the same way.
+
+Common `LOCAL_*_LIBRARIES`, runtime/uses-library, JNI, and required-module
+properties become typed module dependencies. Source and prebuilt file declarations
+remain `module_files` rows. `BUILD_*` rules and `LOCAL_MODULE_CLASS` map common
+native, Java, app, test, and prebuilt declarations to semantic module types while
+retaining the original rule and effective class in module properties.
+
+Master schema v10 adds `build_make_files`. Each root Android.mk row stores included
+fragments, condition and macro-expansion counts, and the exact unsupported
+expressions used by CLI and MCP coverage reporting.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

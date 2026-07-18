@@ -8488,6 +8488,11 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "declared_output_files",
                            stats.generated_output_count);
     yyjson_mut_obj_add_int(doc, root, "declared_tool_files", stats.tool_file_count);
+    yyjson_mut_obj_add_int(doc, root, "make_includes", stats.make_include_count);
+    yyjson_mut_obj_add_int(doc, root, "make_conditions", stats.make_condition_count);
+    yyjson_mut_obj_add_int(doc, root, "make_macro_expansions", stats.make_macro_count);
+    yyjson_mut_obj_add_int(doc, root, "make_unsupported_expressions",
+                           stats.make_unsupported_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

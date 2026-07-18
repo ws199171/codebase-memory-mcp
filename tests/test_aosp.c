@@ -355,6 +355,73 @@ static int create_generated_build_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_make_semantics_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_make_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "project") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/make\" path=\"project\"/></manifest>") != 0 ||
+        write_relative(root, "project/Android.bp",
+            "cc_library { name: \"libbase\" }\n"
+            "cc_library { name: \"libutils\" }\n"
+            "cc_library_static { name: \"libcodec_vendor\" }\n") != 0 ||
+        write_relative(root, "project/common.mk",
+            "feature_enabled := true\n"
+            "define vendor-lib\n"
+            "lib$(1)_vendor\n"
+            "endef\n") != 0 ||
+        write_relative(root, "project/Android.mk",
+            "LOCAL_PATH := $(call my-dir)\n"
+            "default_lib ?= $(default_target)\n"
+            "default_lib ?= $(UNSUPPORTED_DEFAULT)\n"
+            "default_target := libbase\n"
+            "late_libs += $(late_target)\n"
+            "late_target := libutils\n"
+            "base_libs = $(default_lib) $(late_libs)\n"
+            "include $(LOCAL_PATH)/common.mk\n"
+            "ifeq ($(feature_enabled),true)\n"
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := libmake_audio\n"
+            "LOCAL_MODULE_CLASS := SHARED_LIBRARIES\n"
+            "LOCAL_SHARED_LIBRARIES := $(base_libs)\n"
+            "LOCAL_STATIC_LIBRARIES += $(call vendor-lib,codec)\n"
+            "LOCAL_SRC_FILES := audio.cpp \\\n"
+            "  generated.cpp\n"
+            "include $(BUILD_SHARED_LIBRARY)\n"
+            "else\n"
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := ignored_else\n"
+            "include $(BUILD_SHARED_LIBRARY)\n"
+            "endif\n"
+            "ifneq ($(feature_enabled),true)\n"
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := ignored_ifneq\n"
+            "include $(BUILD_EXECUTABLE)\n"
+            "endif\n"
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := make_app\n"
+            "LOCAL_MODULE_CLASS := APPS\n"
+            "LOCAL_REQUIRED_MODULES := libmake_audio\n"
+            "LOCAL_PREBUILT_MODULE_FILE := app.apk\n"
+            "include $(BUILD_PREBUILT)\n"
+            "ifeq ($(TARGET_ARCH),arm64)\n"
+            "include $(CLEAR_VARS)\n"
+            "LOCAL_MODULE := unknown_arch_module\n"
+            "include $(BUILD_EXECUTABLE)\n"
+            "endif\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2312,6 +2379,131 @@ TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags) {
     PASS();
 }
 
+TEST(aosp_build_graph_evaluates_common_android_make_semantics) {
+    char *root = NULL;
+    ASSERT_EQ(create_make_semantics_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.blueprint_files, 1);
+    ASSERT_EQ(stats.make_files, 1);
+    ASSERT_EQ(stats.module_count, 5);
+    ASSERT_EQ(stats.dependency_count, 4);
+    ASSERT_EQ(stats.resolved_count, 4);
+    ASSERT_EQ(stats.unresolved_count, 0);
+    ASSERT_EQ(stats.source_file_count, 3);
+    ASSERT_EQ(stats.make_include_count, 1);
+    ASSERT_EQ(stats.make_condition_count, 3);
+    ASSERT_EQ(stats.make_macro_count, 2);
+    ASSERT_EQ(stats.make_unsupported_count, 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT module_type,json_extract(properties,'$.make_build_rule'),"
+                  "json_extract(properties,'$.make_module_class') FROM modules "
+                  "WHERE workspace_id=?1 AND name='libmake_audio';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "cc_library_shared");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "BUILD_SHARED_LIBRARY");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "SHARED_LIBRARIES");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT module_type,json_extract(properties,'$.make_module_class') "
+                  "FROM modules WHERE workspace_id=?1 AND name='make_app';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "android_app_import");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "APPS");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(target_name||':'||type,',') FROM ("
+                  "SELECT d.target_name,d.type FROM module_dependencies d "
+                  "JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libmake_audio' "
+                  "ORDER BY d.target_name,d.type);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "libbase:SHARED_LIB,libcodec_vendor:STATIC_LIB,libutils:SHARED_LIB");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(path,',') FROM ("
+                  "SELECT f.path FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libmake_audio' ORDER BY f.path);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "audio.cpp,generated.cpp");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(includes,'$[0]'),condition_count,macro_count,"
+                  "json_array_length(unsupported_expressions),"
+                  "json_extract(unsupported_expressions,'$[0]') "
+                  "FROM build_make_files WHERE workspace_id=?1 AND file_path='Android.mk';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "common.mk");
+    ASSERT_EQ(sqlite3_column_int(stmt, 1), 3);
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), 2);
+    ASSERT_EQ(sqlite3_column_int(stmt, 3), 1);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4),
+                  "ifeq ($(TARGET_ARCH),arm64)");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT count(*) FROM modules WHERE workspace_id=?1 "
+                  "AND name IN('ignored_else','ignored_ifneq','unknown_arch_module');",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"make\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"make_includes\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"make_conditions\":3"));
+    ASSERT_NOT_NULL(strstr(response, "\"make_macro_expansions\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"make_unsupported_expressions\":1"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3438,6 +3630,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_models_conditional_variants);
     RUN_TEST(aosp_build_graph_models_namespaces_packages_and_visibility);
     RUN_TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags);
+    RUN_TEST(aosp_build_graph_evaluates_common_android_make_semantics);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

@@ -693,6 +693,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(3,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(8,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(9,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(10,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -718,6 +719,11 @@ static const char *AOSP_SCHEMA =
     " source_id TEXT NOT NULL,path TEXT NOT NULL,role TEXT NOT NULL,properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_id,path,role));"
     "CREATE INDEX IF NOT EXISTS idx_aosp_module_files_role ON module_files(role);"
+    "CREATE TABLE IF NOT EXISTS build_make_files("
+    " workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,file_path TEXT NOT NULL,"
+    " includes TEXT NOT NULL DEFAULT '[]',condition_count INTEGER NOT NULL DEFAULT 0,"
+    " macro_count INTEGER NOT NULL DEFAULT 0,unsupported_expressions TEXT NOT NULL DEFAULT '[]',"
+    " PRIMARY KEY(workspace_id,repo_id,file_path));"
     "CREATE TABLE IF NOT EXISTS build_namespaces("
     " workspace_id TEXT NOT NULL,namespace_path TEXT NOT NULL,repo_id TEXT NOT NULL,"
     " file_path TEXT NOT NULL,imports TEXT NOT NULL DEFAULT '[]',"
@@ -3509,6 +3515,10 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    "%d tagged dependencies\n",
                    stats.source_file_count, stats.generated_output_count,
                    stats.tool_file_count, stats.tagged_dependency_count);
+            printf("  Android.mk: %d includes, %d conditions, %d macro expansions, "
+                   "%d unsupported expressions\n",
+                   stats.make_include_count, stats.make_condition_count,
+                   stats.make_macro_count, stats.make_unsupported_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `B6` - expand common Android.mk variables, conditions, includes,
-  macros, and module-class semantics.
-- Next task: `B7` - parse product makefiles, product packages, inheritance,
+- Current task: `B7` - parse product makefiles, product packages, inheritance,
   BoardConfig, device/vendor, and partition ownership.
+- Next task: `B8` - import supported Bazel mixed-build module and dependency
+  metadata.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -78,7 +78,13 @@ complete:
     defaults file provenance, and schema v9 `module_files`; 23 AOSP tests,
     159 MCP tests, production `-Werror` build, and production CLI/MCP smoke pass;
     Linux ASan/UBSan execution remains required before verification completion.
-- Worktree baseline: B4 namespace and visibility checkpoint `c0c6e51` on
+  - `B6` common recursively and simply expanded Make variables, append/default
+    assignment, deterministic conditions, relative includes, user macros and
+    common functions, semantic module classes, schema v10 Make coverage gaps;
+    24 AOSP tests, 159 MCP tests, production `-Werror` build, and production
+    CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
+    verification completion.
+- Worktree baseline: B5 generated build dependency checkpoint `b83a195` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -278,3 +284,4 @@ unaccepted critical coverage gap.
 | `B2` | `371b786` | Transitive defaults expansion, direct precedence, stable resolution, provenance, canonical cycle diagnostics, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B3` | `16b31ea` | Target/arch/multilib/product/Soong-config/select dependency variants, conditional defaults composition, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B4` | `c0c6e51` | Namespace/import/global/explicit resolution, package/default visibility, ambiguity and visibility evidence, schema v8 boundaries, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B5` | `b83a195` | Filegroup/genrule declarations, literal file separation, generated/tool edges, tagged references, defaults file provenance, schema v9 `module_files`, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
