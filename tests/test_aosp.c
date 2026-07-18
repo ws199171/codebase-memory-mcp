@@ -59,11 +59,14 @@ static int create_workspace_fixture(char **root_out) {
             "<project name=\"acme/widgets\" path=\"vendor/acme/widgets\"/>"
             "</manifest>") != 0 ||
         write_relative(root, "frameworks/base/Android.bp",
+            "framework_module = \"libframework_audio\"\n"
+            "framework_shared = [\"libvendor_audio\"]\n"
+            "framework_shared = framework_shared + [\"libmissing\"]\n"
+            "framework_shared += [\"libandroid_extra\"]\n"
             "cc_library_shared {\n"
-            "  name: \"libframework_audio\",\n"
-            "  shared_libs: [\"libvendor_audio\", \"libmissing\"],\n"
+            "  name: framework_module,\n"
+            "  shared_libs: framework_shared,\n"
             "  static_libs: [\"libbase_defaults\"],\n"
-            "  target: { android: { shared_libs: [\"libandroid_extra\"] } },\n"
             "}\n"
             "cc_defaults { name: \"libbase_defaults\" }\n"
             "cc_library { name: \"libandroid_extra\" }\n"
@@ -1498,6 +1501,28 @@ TEST(aosp_build_graph_resolves_cross_repo_modules) {
     ASSERT_EQ(stats.dependency_count, 6);
     ASSERT_EQ(stats.resolved_count, 5);
     ASSERT_EQ(stats.unresolved_count, 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(dependency,',') FROM ("
+                  "SELECT d.target_name||':'||d.type AS dependency "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libframework_audio' "
+                  "ORDER BY d.target_name,d.type);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "libandroid_extra:SHARED_LIB,libbase_defaults:STATIC_LIB,"
+                  "libmissing:SHARED_LIB,libvendor_audio:SHARED_LIB");
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
 
     cbm_aosp_module_t *modules = NULL;
     int count = 0;

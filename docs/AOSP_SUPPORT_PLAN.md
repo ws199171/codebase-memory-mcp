@@ -40,8 +40,8 @@ complete:
 
 ## Current Queue
 
-- Current task: `B1` - evaluate Blueprint literal variables, list concatenation, and references.
-- Next task: `B2` - expand `defaults` inheritance with provenance and cycle detection.
+- Current task: `B2` - expand `defaults` inheritance with provenance and cycle detection.
+- Next task: `B3` - model target, arch, multilib, product-variable, and configurable variants.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -52,7 +52,11 @@ complete:
     propagation, 19 AOSP tests, production `-Werror` build, and production MCP
     smoke pass; Linux ASan/UBSan execution remains required before verification
     completion.
-- Worktree baseline: Q5/Q6 implementation checkpoint `ab0913f` on
+  - `B1` Blueprint string/list variables, `+` concatenation, reassignment, `+=`,
+    and module-property references; 19 AOSP tests, exact dependency golden check,
+    production `-Werror` build, and production CLI smoke pass; Linux ASan/UBSan
+    execution remains required before verification completion.
+- Worktree baseline: Q7 query-plane fault coverage checkpoint `e0c3c03` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -246,3 +250,5 @@ unaccepted critical coverage gap.
 | `Q2` | `0eee37b` | Master-to-shard routing by global_id and resolved symbol, read-only shard node/edge reads with outgoing/incoming direction, missing-symbol and unindexed-repo error paths, 180 focused tests, production `-Werror` build |
 | `Q3` | `dc5cdbb` | BFS cross-shard trace_path with depth/direction/cycle/budget/cancel controls, local shard edges and resolved cross-repository edges, incoming/outgoing/both traversal, 181 focused tests, production `-Werror` build |
 | `Q4` | `5d6b4cb` | Multi-hop federated query_graph across code/module/protocol relationships, SYMBOL→SYMBOL/MODULE/PROTOCOL transitions, module dependency and protocol edge traversal, edge-type filter, result budget, 182 focused tests, production `-Werror` build |
+| `Q5-Q6` | `ab0913f` | Exact workspace source routing plus CLI/MCP query contracts; focused Windows tests, production `-Werror` build and smoke pass; Linux sanitizers deferred |
+| `Q7` | `e0c3c03` | Three-repository mixed path, public fault coverage, query evidence propagation, focused Windows tests, production `-Werror` build and smoke pass; Linux sanitizers deferred |

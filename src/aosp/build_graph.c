@@ -28,6 +28,17 @@ typedef struct {
 
 typedef struct {
     char *name;
+    str_vec_t values;
+} bp_var_t;
+
+typedef struct {
+    bp_var_t *items;
+    int count;
+    int cap;
+} bp_var_vec_t;
+
+typedef struct {
+    char *name;
     char *kind;
 } dep_decl_t;
 
@@ -63,6 +74,7 @@ typedef enum {
     TOK_COLON,
     TOK_COMMA,
     TOK_PLUS,
+    TOK_EQUAL,
     TOK_OTHER,
 } token_kind_t;
 
@@ -142,6 +154,54 @@ static void str_vec_free(str_vec_t *vec) {
     for (int i = 0; i < vec->count; i++) free(vec->items[i]);
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
+}
+
+static bool str_vec_extend(str_vec_t *vec, const str_vec_t *values) {
+    if (!vec || !values) return false;
+    for (int i = 0; i < values->count; i++) {
+        if (!str_vec_add(vec, values->items[i])) return false;
+    }
+    return true;
+}
+
+static bp_var_t *bp_var_find(const bp_var_vec_t *vars, const char *name) {
+    if (!vars || !name) return NULL;
+    for (int i = 0; i < vars->count; i++) {
+        if (strcmp(vars->items[i].name, name) == 0) return &vars->items[i];
+    }
+    return NULL;
+}
+
+static bool bp_var_assign(bp_var_vec_t *vars, const char *name, const str_vec_t *values,
+                          bool append) {
+    if (!vars || !name || !values) return false;
+    bp_var_t *var = bp_var_find(vars, name);
+    if (!var) {
+        if (vars->count == vars->cap) {
+            int new_cap = vars->cap ? vars->cap * 2 : 16;
+            bp_var_t *items = realloc(vars->items, (size_t)new_cap * sizeof(*items));
+            if (!items) return false;
+            vars->items = items;
+            vars->cap = new_cap;
+        }
+        var = &vars->items[vars->count++];
+        memset(var, 0, sizeof(*var));
+        var->name = strdup(name);
+        if (!var->name) return false;
+    } else if (!append) {
+        str_vec_free(&var->values);
+    }
+    return str_vec_extend(&var->values, values);
+}
+
+static void bp_var_vec_free(bp_var_vec_t *vars) {
+    if (!vars) return;
+    for (int i = 0; i < vars->count; i++) {
+        free(vars->items[i].name);
+        str_vec_free(&vars->items[i].values);
+    }
+    free(vars->items);
+    memset(vars, 0, sizeof(*vars));
 }
 
 static bool module_add_dep(module_decl_t *module, const char *name, const char *kind) {
@@ -256,6 +316,7 @@ static token_t lexer_next(lexer_t *lexer) {
         case ':': token.kind = TOK_COLON; return token;
         case ',': token.kind = TOK_COMMA; return token;
         case '+': token.kind = TOK_PLUS; return token;
+        case '=': token.kind = TOK_EQUAL; return token;
         case '"': {
             token.kind = TOK_STRING;
             size_t cap = 32;
@@ -325,9 +386,11 @@ static const char *dependency_kind(const char *key) {
     return NULL;
 }
 
-static bool parse_bp_value(parser_t *parser, module_decl_t *module, const char *key, int depth);
+static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
+                           const char *key, int depth);
 
-static bool parse_bp_object(parser_t *parser, module_decl_t *module, int depth) {
+static bool parse_bp_object(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
+                            int depth) {
     while (parser->current.kind != TOK_EOF && parser->current.kind != TOK_RBRACE) {
         if (parser->current.kind != TOK_IDENT) {
             parser_advance(parser);
@@ -340,7 +403,7 @@ static bool parse_bp_object(parser_t *parser, module_decl_t *module, int depth) 
             continue;
         }
         parser_advance(parser);
-        bool ok = parse_bp_value(parser, module, key, depth);
+        bool ok = parse_bp_value(parser, module, vars, key, depth);
         free(key);
         if (!ok) return false;
         if (parser->current.kind == TOK_COMMA) parser_advance(parser);
@@ -362,37 +425,70 @@ static bool record_bp_string(module_decl_t *module, const char *key, int depth, 
     return !kind || module_add_dep(module, value, kind);
 }
 
-static bool parse_bp_value(parser_t *parser, module_decl_t *module, const char *key, int depth) {
-    int bracket_depth = 0;
-    while (parser->current.kind != TOK_EOF) {
-        if (parser->current.kind == TOK_STRING) {
-            if (!record_bp_string(module, key, depth, parser->current.text ? parser->current.text : "")) {
-                return false;
-            }
+static bool parse_bp_term(parser_t *parser, const bp_var_vec_t *vars, str_vec_t *values) {
+    if (parser->current.kind == TOK_STRING) {
+        bool ok = str_vec_add(values, parser->current.text ? parser->current.text : "");
+        parser_advance(parser);
+        return ok;
+    }
+    if (parser->current.kind == TOK_IDENT) {
+        bp_var_t *var = bp_var_find(vars, parser->current.text);
+        bool ok = !var || str_vec_extend(values, &var->values);
+        parser_advance(parser);
+        return ok;
+    }
+    if (parser->current.kind != TOK_LBRACKET) return true;
+    parser_advance(parser);
+    while (parser->current.kind != TOK_EOF && parser->current.kind != TOK_RBRACKET) {
+        if (parser->current.kind == TOK_COMMA || parser->current.kind == TOK_PLUS) {
             parser_advance(parser);
-        } else if (parser->current.kind == TOK_LBRACKET) {
-            bracket_depth++;
-            parser_advance(parser);
-        } else if (parser->current.kind == TOK_RBRACKET) {
-            parser_advance(parser);
-            if (--bracket_depth <= 0) return true;
-        } else if (parser->current.kind == TOK_LBRACE) {
-            parser_advance(parser);
-            if (!parse_bp_object(parser, module, depth + 1)) return false;
-            if (bracket_depth == 0) return true;
-        } else if ((parser->current.kind == TOK_COMMA || parser->current.kind == TOK_RBRACE) &&
-                   bracket_depth == 0) {
-            return true;
+            continue;
+        }
+        if (parser->current.kind == TOK_STRING || parser->current.kind == TOK_IDENT ||
+            parser->current.kind == TOK_LBRACKET) {
+            if (!parse_bp_term(parser, vars, values)) return false;
         } else {
             parser_advance(parser);
         }
     }
+    if (parser->current.kind == TOK_RBRACKET) parser_advance(parser);
+    return true;
+}
+
+static bool parse_bp_expression(parser_t *parser, const bp_var_vec_t *vars, str_vec_t *values) {
+    if (!parse_bp_term(parser, vars, values)) return false;
+    while (parser->current.kind == TOK_PLUS) {
+        parser_advance(parser);
+        if (!parse_bp_term(parser, vars, values)) return false;
+    }
+    return true;
+}
+
+static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
+                           const char *key, int depth) {
+    if (parser->current.kind == TOK_LBRACE) {
+        parser_advance(parser);
+        return parse_bp_object(parser, module, vars, depth + 1);
+    }
+    str_vec_t values = {0};
+    if (!parse_bp_expression(parser, vars, &values)) {
+        str_vec_free(&values);
+        return false;
+    }
+    for (int i = 0; i < values.count; i++) {
+        if (!record_bp_string(module, key, depth, values.items[i])) {
+            str_vec_free(&values);
+            return false;
+        }
+    }
+    str_vec_free(&values);
     return true;
 }
 
 static bool parse_blueprint(const char *source, size_t length, const char *file_path,
                             module_vec_t *modules) {
     parser_t parser = {.lexer = {.source = source, .length = length}};
+    bp_var_vec_t vars = {0};
     parser.current = lexer_next(&parser.lexer);
     while (parser.current.kind != TOK_EOF) {
         if (parser.current.kind != TOK_IDENT) {
@@ -401,20 +497,41 @@ static bool parse_blueprint(const char *source, size_t length, const char *file_
         }
         char *type = parser.current.text ? strdup(parser.current.text) : NULL;
         parser_advance(&parser);
+        bool append = false;
+        if (parser.current.kind == TOK_PLUS) {
+            append = true;
+            parser_advance(&parser);
+        }
+        if (parser.current.kind == TOK_EQUAL) {
+            parser_advance(&parser);
+            str_vec_t values = {0};
+            bool ok = parse_bp_expression(&parser, &vars, &values) &&
+                      bp_var_assign(&vars, type, &values, append);
+            str_vec_free(&values);
+            free(type);
+            if (!ok) {
+                token_free(&parser.current);
+                bp_var_vec_free(&vars);
+                return false;
+            }
+            continue;
+        }
         if (parser.current.kind != TOK_LBRACE) {
             free(type);
             continue;
         }
         parser_advance(&parser);
         module_decl_t module = {.type = type, .file_path = strdup(file_path)};
-        if (!module.type || !module.file_path || !parse_bp_object(&parser, &module, 1) ||
+        if (!module.type || !module.file_path || !parse_bp_object(&parser, &module, &vars, 1) ||
             !module_vec_add(modules, &module)) {
             module_free(&module);
             token_free(&parser.current);
+            bp_var_vec_free(&vars);
             return false;
         }
     }
     token_free(&parser.current);
+    bp_var_vec_free(&vars);
     return true;
 }
 
