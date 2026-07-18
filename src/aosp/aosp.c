@@ -692,6 +692,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(3,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(8,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(9,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -713,6 +714,10 @@ static const char *AOSP_SCHEMA =
     " target_id TEXT, resolved INTEGER NOT NULL DEFAULT 0, properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_id,target_name,type));"
     "CREATE INDEX IF NOT EXISTS idx_aosp_module_deps_target ON module_dependencies(target_name);"
+    "CREATE TABLE IF NOT EXISTS module_files("
+    " source_id TEXT NOT NULL,path TEXT NOT NULL,role TEXT NOT NULL,properties TEXT DEFAULT '{}',"
+    " PRIMARY KEY(source_id,path,role));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_module_files_role ON module_files(role);"
     "CREATE TABLE IF NOT EXISTS build_namespaces("
     " workspace_id TEXT NOT NULL,namespace_path TEXT NOT NULL,repo_id TEXT NOT NULL,"
     " file_path TEXT NOT NULL,imports TEXT NOT NULL DEFAULT '[]',"
@@ -3496,6 +3501,14 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    "%d unsupported visibility\n",
                    stats.ambiguous_dependency_count, stats.visibility_blocked_count,
                    stats.unsupported_visibility_count);
+            printf("  generators: %d filegroups, %d genrules, %d generated dependencies, "
+                   "%d tool dependencies\n",
+                   stats.filegroup_count, stats.genrule_count,
+                   stats.generated_dependency_count, stats.tool_dependency_count);
+            printf("  declared files: %d sources, %d outputs, %d tool files, "
+                   "%d tagged dependencies\n",
+                   stats.source_file_count, stats.generated_output_count,
+                   stats.tool_file_count, stats.tagged_dependency_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

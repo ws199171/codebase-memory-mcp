@@ -20,6 +20,14 @@ typedef struct {
     int ambiguous_dependency_count;
     int visibility_blocked_count;
     int unsupported_visibility_count;
+    int filegroup_count;
+    int genrule_count;
+    int generated_dependency_count;
+    int tool_dependency_count;
+    int tagged_dependency_count;
+    int source_file_count;
+    int generated_output_count;
+    int tool_file_count;
     int blueprint_files;
     int make_files;
     int aidl_files;

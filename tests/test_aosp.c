@@ -305,6 +305,56 @@ static int create_build_boundaries_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_generated_build_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_generated_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "project") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/generated\" path=\"project\"/></manifest>") != 0 ||
+        write_relative(root, "project/Android.bp",
+            "filegroup { name: \"input_files\", srcs: [\"input.txt\"] }\n"
+            "filegroup {\n"
+            "  name: \"common_srcs\",\n"
+            "  path: \"src\",\n"
+            "  srcs: [\"a.cpp\", \":generated{.cpp}\"],\n"
+            "}\n"
+            "genrule {\n"
+            "  name: \"generated\",\n"
+            "  tools: [\"host_tool\"],\n"
+            "  tool_files: [\"script.py\"],\n"
+            "  srcs: [\":input_files\", \"schema.json\"],\n"
+            "  out: [\"generated.cpp\", \"generated.h\"],\n"
+            "  cmd: \"$(location host_tool) $(in) $(out)\",\n"
+            "}\n"
+            "cc_defaults {\n"
+            "  name: \"b5_defaults\",\n"
+            "  srcs: [\"inherited.cpp\"],\n"
+            "  generated_sources: [\":generated{.cpp}\"],\n"
+            "}\n"
+            "cc_binary {\n"
+            "  name: \"consumer\",\n"
+            "  defaults: [\"b5_defaults\"],\n"
+            "  srcs: [\":common_srcs\", \":generated{.cpp}\", \"main.cpp\", "
+            "\":missing_generator{.src}\"],\n"
+            "  generated_sources: [\"generated\"],\n"
+            "  generated_headers: [\"generated\"],\n"
+            "  export_generated_headers: [\"generated\"],\n"
+            "  tools: [\"host_tool\"],\n"
+            "}\n"
+            "sh_binary { name: \"host_tool\" }\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2101,6 +2151,167 @@ TEST(aosp_build_graph_models_namespaces_packages_and_visibility) {
     PASS();
 }
 
+TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags) {
+    char *root = NULL;
+    ASSERT_EQ(create_generated_build_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.blueprint_files, 1);
+    ASSERT_EQ(stats.module_count, 6);
+    ASSERT_EQ(stats.dependency_count, 12);
+    ASSERT_EQ(stats.resolved_count, 11);
+    ASSERT_EQ(stats.unresolved_count, 1);
+    ASSERT_EQ(stats.filegroup_count, 2);
+    ASSERT_EQ(stats.genrule_count, 1);
+    ASSERT_EQ(stats.generated_dependency_count, 4);
+    ASSERT_EQ(stats.tool_dependency_count, 2);
+    ASSERT_EQ(stats.tagged_dependency_count, 5);
+    ASSERT_EQ(stats.source_file_count, 6);
+    ASSERT_EQ(stats.generated_output_count, 2);
+    ASSERT_EQ(stats.tool_file_count, 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.filegroup_path') FROM modules "
+                  "WHERE workspace_id=?1 AND name='common_srcs';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "src");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.generator_command') FROM modules "
+                  "WHERE workspace_id=?1 AND name='generated';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "$(location host_tool) $(in) $(out)");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(role||':'||path,',') FROM ("
+                  "SELECT f.role,f.path FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='generated' ORDER BY f.role,f.path);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "OUTPUT:generated.cpp,OUTPUT:generated.h,SOURCE:schema.json,TOOL_FILE:script.py");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(f.properties,'$.origin'),"
+                  "json_extract(f.properties,'$.inherited_from') "
+                  "FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='consumer' "
+                  "AND f.path='inherited.cpp' AND f.role='SOURCE';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "defaults");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "b5_defaults");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT d.target_name,d.type,d.resolved,"
+                  "json_extract(d.properties,'$.output_tags[0]'),"
+                  "json_extract(d.properties,'$.declared_references[0]') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='common_srcs';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "generated");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "FILEGROUP_INPUT");
+    ASSERT_TRUE(sqlite3_column_int(stmt, 2));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), ".cpp");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), ":generated{.cpp}");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT d.target_name,d.resolved,json_extract(d.properties,'$.failure_reason'),"
+                  "json_extract(d.properties,'$.output_tags[0]') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='consumer' "
+                  "AND d.target_name='missing_generator';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "missing_generator");
+    ASSERT_FALSE(sqlite3_column_int(stmt, 1));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "not_found");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), ".src");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_array_length(d.properties,'$.declared_references'),"
+                  "json_extract(d.properties,'$.output_tags[0]') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='consumer' "
+                  "AND d.target_name='generated' AND d.type='GENERATED_SOURCE';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), ".cpp");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND d.target_name='script.py';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"consumer\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"filegroups\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"genrules\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"generated_dependencies\":4"));
+    ASSERT_NOT_NULL(strstr(response, "\"tool_dependencies\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"tagged_dependencies\":5"));
+    ASSERT_NOT_NULL(strstr(response, "\"declared_source_files\":6"));
+    ASSERT_NOT_NULL(strstr(response, "\"declared_output_files\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"declared_tool_files\":1"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3226,6 +3437,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles);
     RUN_TEST(aosp_build_graph_models_conditional_variants);
     RUN_TEST(aosp_build_graph_models_namespaces_packages_and_visibility);
+    RUN_TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

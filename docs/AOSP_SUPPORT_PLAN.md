@@ -40,9 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `B5` - model filegroups, genrules, generated sources, tools, and output tags.
-- Next task: `B6` - expand common Android.mk variables, conditions, includes, macros,
-  and module-class semantics.
+- Current task: `B6` - expand common Android.mk variables, conditions, includes,
+  macros, and module-class semantics.
+- Next task: `B7` - parse product makefiles, product packages, inheritance,
+  BoardConfig, device/vendor, and partition ownership.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -72,7 +73,12 @@ complete:
     unsupported-visibility evidence; schema v8 boundary tables; 22 AOSP tests,
     159 MCP tests, production `-Werror` build, and production CLI/MCP smoke pass;
     Linux ASan/UBSan execution remains required before verification completion.
-- Worktree baseline: B3 dependency variants checkpoint `16b31ea` on
+  - `B5` filegroup/genrule declarations, literal source/tool/output separation,
+    generated-source/header and tool module edges, tagged-output references,
+    defaults file provenance, and schema v9 `module_files`; 23 AOSP tests,
+    159 MCP tests, production `-Werror` build, and production CLI/MCP smoke pass;
+    Linux ASan/UBSan execution remains required before verification completion.
+- Worktree baseline: B4 namespace and visibility checkpoint `c0c6e51` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -271,3 +277,4 @@ unaccepted critical coverage gap.
 | `B1` | `720f6dc` | Blueprint string/list variables, `+`/`+=`, references, exact dependency golden check, production `-Werror` build and CLI smoke; Linux sanitizers deferred |
 | `B2` | `371b786` | Transitive defaults expansion, direct precedence, stable resolution, provenance, canonical cycle diagnostics, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B3` | `16b31ea` | Target/arch/multilib/product/Soong-config/select dependency variants, conditional defaults composition, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B4` | `c0c6e51` | Namespace/import/global/explicit resolution, package/default visibility, ambiguity and visibility evidence, schema v8 boundaries, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |

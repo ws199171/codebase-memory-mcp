@@ -51,8 +51,20 @@ typedef struct {
     char *target_namespace;
     char *failure_reason;
     char *visibility_rule;
+    str_vec_t declared_references;
+    str_vec_t output_tags;
     int candidate_count;
 } dep_decl_t;
+
+typedef struct {
+    char *path;
+    char *role;
+    char *inherited_from;
+    char *inheritance_path;
+    int inheritance_depth;
+    str_vec_t variants;
+    bool unconditional;
+} file_decl_t;
 
 typedef struct {
     char *name;
@@ -68,9 +80,14 @@ typedef struct {
     char *namespace_path;
     char *visibility_origin;
     char *visibility_source_package;
+    char *filegroup_path;
+    char *generator_command;
     str_vec_t declared_visibility;
     str_vec_t effective_visibility;
     str_vec_t namespace_imports;
+    file_decl_t *files;
+    int file_count;
+    int file_cap;
     bool blueprint;
 } module_decl_t;
 
@@ -302,6 +319,81 @@ static void bp_var_vec_free(bp_var_vec_t *vars) {
     memset(vars, 0, sizeof(*vars));
 }
 
+static bool normalize_module_reference(const char *reference, char **name_out,
+                                       char **tag_out) {
+    if (!reference || !name_out || !tag_out) return false;
+    *name_out = NULL;
+    *tag_out = NULL;
+    const char *name = reference[0] == ':' ? reference + 1 : reference;
+    size_t name_length = strlen(name);
+    if (name_length > 2 && name[name_length - 1] == '}') {
+        const char *brace = strrchr(name, '{');
+        if (brace && brace > name && brace[1] != '}') {
+            *tag_out = cbm_strndup(brace + 1,
+                                   (size_t)((name + name_length - 1) - (brace + 1)));
+            if (!*tag_out) return false;
+            name_length = (size_t)(brace - name);
+        }
+    }
+    *name_out = cbm_strndup(name, name_length);
+    if (!*name_out || !(*name_out)[0]) {
+        free(*name_out);
+        free(*tag_out);
+        *name_out = NULL;
+        *tag_out = NULL;
+        return false;
+    }
+    return true;
+}
+
+static file_decl_t *module_find_file(module_decl_t *module, const char *path,
+                                     const char *role) {
+    for (int i = 0; module && i < module->file_count; i++) {
+        if (strcmp(module->files[i].path, path) == 0 &&
+            strcmp(module->files[i].role, role) == 0) {
+            return &module->files[i];
+        }
+    }
+    return NULL;
+}
+
+static file_decl_t *module_ensure_file(module_decl_t *module, const char *path,
+                                       const char *role) {
+    file_decl_t *existing = module_find_file(module, path, role);
+    if (existing) return existing;
+    if (module->file_count == module->file_cap) {
+        int new_cap = module->file_cap ? module->file_cap * 2 : 8;
+        file_decl_t *files = realloc(module->files, (size_t)new_cap * sizeof(*files));
+        if (!files) return NULL;
+        module->files = files;
+        module->file_cap = new_cap;
+    }
+    file_decl_t *file = &module->files[module->file_count];
+    memset(file, 0, sizeof(*file));
+    file->path = strdup(path);
+    file->role = strdup(role);
+    if (!file->path || !file->role) {
+        free(file->path);
+        free(file->role);
+        memset(file, 0, sizeof(*file));
+        return NULL;
+    }
+    module->file_count++;
+    return file;
+}
+
+static bool module_add_file_variant(module_decl_t *module, const char *path,
+                                    const char *role, const char *variant) {
+    if (!module || !path || !path[0] || !role) return true;
+    file_decl_t *file = module_ensure_file(module, path, role);
+    if (!file) return false;
+    if (!variant || !variant[0]) {
+        file->unconditional = true;
+        return true;
+    }
+    return str_vec_add_unique(&file->variants, variant);
+}
+
 static dep_decl_t *module_find_dep(module_decl_t *module, const char *name, const char *kind) {
     if (!module || !name || !kind) return NULL;
     for (int i = 0; i < module->dep_count; i++) {
@@ -348,8 +440,16 @@ static bool module_add_dep_variant(module_decl_t *module, const char *name, cons
                                    const char *variant) {
     if (!module || !name || !name[0] || !kind) return true;
     if (strstr(name, "$(") || strstr(name, "${")) return true;
-    dep_decl_t *dep = module_ensure_dep(module, name, kind);
-    return dep && dep_add_variant(dep, variant);
+    char *normalized = NULL;
+    char *tag = NULL;
+    if (!normalize_module_reference(name, &normalized, &tag)) return false;
+    dep_decl_t *dep = module_ensure_dep(module, normalized, kind);
+    bool ok = dep && str_vec_add_unique(&dep->declared_references, name) &&
+              (!tag || str_vec_add_unique(&dep->output_tags, tag)) &&
+              dep_add_variant(dep, variant);
+    free(normalized);
+    free(tag);
+    return ok;
 }
 
 static bool module_add_dep(module_decl_t *module, const char *name, const char *kind) {
@@ -364,6 +464,27 @@ static bool dep_add_combined_variant(dep_decl_t *dep, const char *left, const ch
     if (!combined) return false;
     (void)snprintf(combined, size, "%s&%s", left, right);
     bool ok = dep_add_variant(dep, combined);
+    free(combined);
+    return ok;
+}
+
+static bool file_add_variant(file_decl_t *file, const char *variant) {
+    if (!variant || !variant[0]) {
+        file->unconditional = true;
+        return true;
+    }
+    return str_vec_add_unique(&file->variants, variant);
+}
+
+static bool file_add_combined_variant(file_decl_t *file, const char *left,
+                                      const char *right) {
+    if (!left || !left[0]) return file_add_variant(file, right);
+    if (!right || !right[0]) return file_add_variant(file, left);
+    size_t size = strlen(left) + strlen(right) + 2;
+    char *combined = malloc(size);
+    if (!combined) return false;
+    (void)snprintf(combined, size, "%s&%s", left, right);
+    bool ok = file_add_variant(file, combined);
     free(combined);
     return ok;
 }
@@ -390,6 +511,31 @@ static bool dep_merge_inherited_variants(dep_decl_t *dep, const dep_decl_t *defa
     return true;
 }
 
+static bool file_merge_inherited_variants(file_decl_t *file,
+                                          const dep_decl_t *defaults_dep,
+                                          const file_decl_t *source) {
+    if (defaults_dep->unconditional && source->unconditional) file->unconditional = true;
+    if (defaults_dep->unconditional) {
+        for (int i = 0; i < source->variants.count; i++) {
+            if (!file_add_variant(file, source->variants.items[i])) return false;
+        }
+    }
+    if (source->unconditional) {
+        for (int i = 0; i < defaults_dep->variants.count; i++) {
+            if (!file_add_variant(file, defaults_dep->variants.items[i])) return false;
+        }
+    }
+    for (int i = 0; i < defaults_dep->variants.count; i++) {
+        for (int j = 0; j < source->variants.count; j++) {
+            if (!file_add_combined_variant(file, defaults_dep->variants.items[i],
+                                           source->variants.items[j])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool module_add_inherited_dep(module_decl_t *module, const dep_decl_t *source,
                                      const dep_decl_t *defaults_dep,
                                      const char *defaults_name) {
@@ -398,6 +544,13 @@ static bool module_add_inherited_dep(module_decl_t *module, const dep_decl_t *so
     bool created = dep == NULL;
     if (!dep) dep = module_ensure_dep(module, source->name, source->kind);
     if (!dep || !dep_merge_inherited_variants(dep, defaults_dep, source)) return false;
+    for (int i = 0; i < source->declared_references.count; i++) {
+        if (!str_vec_add_unique(&dep->declared_references,
+                                source->declared_references.items[i])) return false;
+    }
+    for (int i = 0; i < source->output_tags.count; i++) {
+        if (!str_vec_add_unique(&dep->output_tags, source->output_tags.items[i])) return false;
+    }
     if (!created) return true;
     const char *origin = source->inherited_from ? source->inherited_from : defaults_name;
     dep->inherited_from = strdup(origin);
@@ -416,6 +569,31 @@ static bool module_add_inherited_dep(module_decl_t *module, const dep_decl_t *so
     return dep->inherited_from && dep->inheritance_path;
 }
 
+static bool module_add_inherited_file(module_decl_t *module, const file_decl_t *source,
+                                      const dep_decl_t *defaults_dep,
+                                      const char *defaults_name) {
+    file_decl_t *file = module_find_file(module, source->path, source->role);
+    bool created = file == NULL;
+    if (!file) file = module_ensure_file(module, source->path, source->role);
+    if (!file || !file_merge_inherited_variants(file, defaults_dep, source)) return false;
+    if (!created) return true;
+    const char *origin = source->inherited_from ? source->inherited_from : defaults_name;
+    file->inherited_from = strdup(origin);
+    size_t path_size = strlen(defaults_name) + 1;
+    if (source->inheritance_path) path_size += strlen(source->inheritance_path) + 1;
+    file->inheritance_path = malloc(path_size);
+    if (file->inheritance_path) {
+        if (source->inheritance_path) {
+            (void)snprintf(file->inheritance_path, path_size, "%s>%s", defaults_name,
+                           source->inheritance_path);
+        } else {
+            (void)snprintf(file->inheritance_path, path_size, "%s", defaults_name);
+        }
+    }
+    file->inheritance_depth = source->inheritance_depth + 1;
+    return file->inherited_from && file->inheritance_path;
+}
+
 static void module_free(module_decl_t *module) {
     if (!module) return;
     free(module->name);
@@ -427,6 +605,8 @@ static void module_free(module_decl_t *module) {
     free(module->namespace_path);
     free(module->visibility_origin);
     free(module->visibility_source_package);
+    free(module->filegroup_path);
+    free(module->generator_command);
     str_vec_free(&module->declared_visibility);
     str_vec_free(&module->effective_visibility);
     str_vec_free(&module->namespace_imports);
@@ -440,9 +620,19 @@ static void module_free(module_decl_t *module) {
         free(module->deps[i].target_namespace);
         free(module->deps[i].failure_reason);
         free(module->deps[i].visibility_rule);
+        str_vec_free(&module->deps[i].declared_references);
+        str_vec_free(&module->deps[i].output_tags);
         str_vec_free(&module->deps[i].variants);
     }
     free(module->deps);
+    for (int i = 0; i < module->file_count; i++) {
+        free(module->files[i].path);
+        free(module->files[i].role);
+        free(module->files[i].inherited_from);
+        free(module->files[i].inheritance_path);
+        str_vec_free(&module->files[i].variants);
+    }
+    free(module->files);
     memset(module, 0, sizeof(*module));
 }
 
@@ -584,9 +774,12 @@ static const char *dependency_kind(const char *key) {
     if (strcmp(key, "libs") == 0 || strcmp(key, "java_libs") == 0) return "LIB";
     if (strcmp(key, "required") == 0 || strcmp(key, "host_required") == 0 ||
         strcmp(key, "target_required") == 0) return "REQUIRED";
-    if (strcmp(key, "tools") == 0 || strcmp(key, "tool_files") == 0) return "TOOL";
+    if (strcmp(key, "tools") == 0) return "TOOL";
     if (strcmp(key, "plugins") == 0) return "PLUGIN";
     if (strcmp(key, "aidl_libs") == 0 || strcmp(key, "imports") == 0) return "AIDL_IMPORT";
+    if (strcmp(key, "generated_sources") == 0) return "GENERATED_SOURCE";
+    if (strcmp(key, "generated_headers") == 0) return "GENERATED_HEADER";
+    if (strcmp(key, "export_generated_headers") == 0) return "EXPORTED_GENERATED_HEADER";
     return NULL;
 }
 
@@ -654,6 +847,18 @@ static bool record_bp_string(module_decl_t *module, const char *key, const char 
         module->compile_multilib = strdup(value);
         return module->compile_multilib != NULL;
     }
+    if (depth == 1 && key && strcmp(key, "path") == 0 &&
+        strcmp(module->type, "filegroup") == 0) {
+        free(module->filegroup_path);
+        module->filegroup_path = strdup(value);
+        return module->filegroup_path != NULL;
+    }
+    if (depth == 1 && key && strcmp(key, "cmd") == 0 &&
+        strcmp(module->type, "genrule") == 0) {
+        free(module->generator_command);
+        module->generator_command = strdup(value);
+        return module->generator_command != NULL;
+    }
     if (depth == 1 && key &&
         (strcmp(key, "visibility") == 0 || strcmp(key, "defaults_visibility") == 0)) {
         return str_vec_add_unique(&module->declared_visibility, value);
@@ -666,12 +871,32 @@ static bool record_bp_string(module_decl_t *module, const char *key, const char 
         strcmp(key, "imports") == 0) {
         return str_vec_add_unique(&module->namespace_imports, value);
     }
+    const char *variant = is_variant_scope(scope) ? scope : NULL;
+    if (key && strcmp(key, "srcs") == 0) {
+        if (value[0] == ':' || strncmp(value, "//", 2) == 0) {
+            const char *kind = strcmp(module->type, "genrule") == 0
+                                   ? "GENRULE_INPUT"
+                                   : strcmp(module->type, "filegroup") == 0
+                                         ? "FILEGROUP_INPUT"
+                                         : "SOURCE";
+            return module_add_dep_variant(module, value, kind, variant);
+        }
+        return module_add_file_variant(module, value, "SOURCE", variant);
+    }
+    if (key && strcmp(key, "tool_files") == 0) {
+        if (value[0] == ':' || strncmp(value, "//", 2) == 0) {
+            return module_add_dep_variant(module, value, "TOOL_FILE", variant);
+        }
+        return module_add_file_variant(module, value, "TOOL_FILE", variant);
+    }
+    if (key && (strcmp(key, "out") == 0 || strcmp(key, "outs") == 0)) {
+        return module_add_file_variant(module, value, "OUTPUT", variant);
+    }
     const char *kind = dependency_kind(key);
     if (kind && strcmp(key, "imports") == 0 &&
         (!module->type || strcmp(module->type, "aidl_interface") != 0)) {
         kind = NULL;
     }
-    const char *variant = is_variant_scope(scope) ? scope : NULL;
     return !kind || module_add_dep_variant(module, value, kind, variant);
 }
 
@@ -1524,6 +1749,12 @@ static bool expand_module_defaults(const module_index_t *index, module_decl_t *m
                 return false;
             }
         }
+        for (int f = 0; f < target->file_count; f++) {
+            if (!module_add_inherited_file(module, &target->files[f], defaults_dep,
+                                           target->name)) {
+                return false;
+            }
+        }
     }
     stack->count--;
     module->defaults_state = 2;
@@ -1677,6 +1908,12 @@ static char *module_properties_json(const module_decl_t *module) {
     if (module->compile_multilib) {
         yyjson_mut_obj_add_strcpy(doc, root, "compile_multilib", module->compile_multilib);
     }
+    if (module->filegroup_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "filegroup_path", module->filegroup_path);
+    }
+    if (module->generator_command) {
+        yyjson_mut_obj_add_strcpy(doc, root, "generator_command", module->generator_command);
+    }
     yyjson_mut_obj_add_strcpy(doc, root, "package", module->package_path ? module->package_path : "");
     yyjson_mut_obj_add_strcpy(doc, root, "namespace",
                              module->namespace_path ? module->namespace_path : "");
@@ -1733,6 +1970,41 @@ static char *dependency_properties_json(const dep_decl_t *dep) {
     if (dep->visibility_rule) {
         yyjson_mut_obj_add_strcpy(doc, root, "visibility_rule", dep->visibility_rule);
     }
+    yyjson_mut_val *references = yyjson_mut_arr(doc);
+    for (int i = 0; i < dep->declared_references.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, references, dep->declared_references.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "declared_references", references);
+    yyjson_mut_val *output_tags = yyjson_mut_arr(doc);
+    for (int i = 0; i < dep->output_tags.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, output_tags, dep->output_tags.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "output_tags", output_tags);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *file_properties_json(const file_decl_t *file) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    if (file->inherited_from) {
+        yyjson_mut_obj_add_strcpy(doc, root, "origin", "defaults");
+        yyjson_mut_obj_add_strcpy(doc, root, "inherited_from", file->inherited_from);
+        yyjson_mut_obj_add_strcpy(doc, root, "inheritance_path", file->inheritance_path);
+        yyjson_mut_obj_add_int(doc, root, "inheritance_depth", file->inheritance_depth);
+    } else {
+        yyjson_mut_obj_add_strcpy(doc, root, "origin", "direct");
+    }
+    yyjson_mut_obj_add_bool(doc, root, "unconditional", file->unconditional);
+    yyjson_mut_val *variants = yyjson_mut_arr(doc);
+    for (int i = 0; i < file->variants.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, variants, file->variants.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "variants", variants);
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1769,6 +2041,7 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_stmt *stmt = NULL;
     sqlite3_stmt *insert_module = NULL;
     sqlite3_stmt *insert_dep = NULL;
+    sqlite3_stmt *insert_file = NULL;
     sqlite3_stmt *insert_namespace = NULL;
     sqlite3_stmt *insert_package = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
@@ -1781,6 +2054,14 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_step(reset) != SQLITE_DONE) goto fail;
     sqlite3_finalize(reset);
     reset = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM module_files WHERE source_id IN "
+            "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK)
+        goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "DELETE FROM module_dependencies WHERE source_id IN "
             "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK) goto fail;
@@ -1815,6 +2096,9 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type,target_id,resolved,properties) "
             "VALUES(?1,?2,?3,?4,?5,?6);",
             -1, &insert_dep, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO module_files(source_id,path,role,properties) "
+            "VALUES(?1,?2,?3,?4);", -1, &insert_file, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO build_namespaces(workspace_id,namespace_path,repo_id,file_path,imports) "
             "VALUES(?1,?2,?3,?4,?5);", -1, &insert_namespace, NULL) != SQLITE_OK ||
@@ -1871,6 +2155,21 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             int module_step = sqlite3_step(insert_module);
             free(module_properties);
             if (module_step != SQLITE_DONE) goto fail_insert;
+            for (int f = 0; f < module->file_count; f++) {
+                sqlite3_reset(insert_file);
+                sqlite3_clear_bindings(insert_file);
+                sqlite3_bind_text(insert_file, 1, id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_file, 2, module->files[f].path,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_file, 3, module->files[f].role,
+                                  -1, SQLITE_TRANSIENT);
+                char *file_properties = file_properties_json(&module->files[f]);
+                if (!file_properties) goto fail_insert;
+                sqlite3_bind_text(insert_file, 4, file_properties, -1, SQLITE_TRANSIENT);
+                int file_step = sqlite3_step(insert_file);
+                free(file_properties);
+                if (file_step != SQLITE_DONE) goto fail_insert;
+            }
             for (int d = 0; d < module->dep_count; d++) {
                 sqlite3_reset(insert_dep);
                 sqlite3_clear_bindings(insert_dep);
@@ -1896,10 +2195,12 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     }
     sqlite3_finalize(insert_module);
     sqlite3_finalize(insert_dep);
+    sqlite3_finalize(insert_file);
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
     insert_module = NULL;
     insert_dep = NULL;
+    insert_file = NULL;
     insert_namespace = NULL;
     insert_package = NULL;
 
@@ -1919,6 +2220,7 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
 fail_insert:
     sqlite3_finalize(insert_module);
     sqlite3_finalize(insert_dep);
+    sqlite3_finalize(insert_file);
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
 fail:
@@ -1967,7 +2269,22 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
         "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='visibility_blocked'),"
         "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
-        "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='unsupported_visibility');";
+        "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='unsupported_visibility'),"
+        "(SELECT count(*) FROM modules WHERE workspace_id=?1 AND module_type='filegroup'),"
+        "(SELECT count(*) FROM modules WHERE workspace_id=?1 AND module_type='genrule'),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND d.type IN('GENERATED_SOURCE','GENERATED_HEADER',"
+        "'EXPORTED_GENERATED_HEADER')) ,"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND d.type IN('TOOL','TOOL_FILE')) ,"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND json_array_length(d.properties,'$.output_tags')>0),"
+        "(SELECT count(*) FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+        "WHERE m.workspace_id=?1 AND f.role='SOURCE'),"
+        "(SELECT count(*) FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+        "WHERE m.workspace_id=?1 AND f.role='OUTPUT'),"
+        "(SELECT count(*) FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+        "WHERE m.workspace_id=?1 AND f.role='TOOL_FILE');";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1989,6 +2306,14 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->ambiguous_dependency_count = sqlite3_column_int(stmt, 11);
             stats->visibility_blocked_count = sqlite3_column_int(stmt, 12);
             stats->unsupported_visibility_count = sqlite3_column_int(stmt, 13);
+            stats->filegroup_count = sqlite3_column_int(stmt, 14);
+            stats->genrule_count = sqlite3_column_int(stmt, 15);
+            stats->generated_dependency_count = sqlite3_column_int(stmt, 16);
+            stats->tool_dependency_count = sqlite3_column_int(stmt, 17);
+            stats->tagged_dependency_count = sqlite3_column_int(stmt, 18);
+            stats->source_file_count = sqlite3_column_int(stmt, 19);
+            stats->generated_output_count = sqlite3_column_int(stmt, 20);
+            stats->tool_file_count = sqlite3_column_int(stmt, 21);
             rc = 0;
         }
     }

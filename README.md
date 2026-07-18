@@ -584,7 +584,10 @@ models `soong_namespace` imports, explicit `//namespace:module` references,
 package boundaries, inherited `default_visibility`, and module visibility.
 Ambiguous imports, blocked visibility, unsupported visibility expressions, and
 missing targets remain queryable as unresolved declarations instead of being
-silently linked. The protocol linker maps
+silently linked. Filegroups and genrules retain declared source, tool, and output
+files separately from module references. Generated-source/header and tool edges
+remain traversable, while tagged references such as `:generator{.header}` retain
+their original spelling and output tag. The protocol linker maps
 AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy`
 symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
 registration tables. Each protocol edge records its confidence and evidence;
@@ -621,7 +624,7 @@ implementation, annotation, call, and usage relationships.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
-| `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules, namespace/package boundaries, and dependency coverage. |
+| `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules, generated-file declarations, namespace/package boundaries, and dependency coverage. |
 | `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |

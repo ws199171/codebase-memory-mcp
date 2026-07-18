@@ -8477,6 +8477,17 @@ static char *handle_aosp_get_architecture(const char *args) {
                            stats.visibility_blocked_count);
     yyjson_mut_obj_add_int(doc, root, "dependencies_unsupported_visibility",
                            stats.unsupported_visibility_count);
+    yyjson_mut_obj_add_int(doc, root, "filegroups", stats.filegroup_count);
+    yyjson_mut_obj_add_int(doc, root, "genrules", stats.genrule_count);
+    yyjson_mut_obj_add_int(doc, root, "generated_dependencies",
+                           stats.generated_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "tool_dependencies", stats.tool_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "tagged_dependencies",
+                           stats.tagged_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "declared_source_files", stats.source_file_count);
+    yyjson_mut_obj_add_int(doc, root, "declared_output_files",
+                           stats.generated_output_count);
+    yyjson_mut_obj_add_int(doc, root, "declared_tool_files", stats.tool_file_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

@@ -309,6 +309,26 @@ effective namespace, imports, package, visibility, and visibility origin;
 dependency properties retain the resolution tier, candidate count, target
 namespace, matching visibility rule, or failure reason.
 
+## Generated Build Inputs and Outputs
+
+Filegroup and genrule modules remain ordinary build modules, but their literal
+file declarations are stored separately from module dependencies. `srcs` paths,
+genrule `out` entries, and literal `tool_files` become `SOURCE`, `OUTPUT`, and
+`TOOL_FILE` rows in `module_files`. Module references in those properties become
+`SOURCE`, `FILEGROUP_INPUT`, `GENRULE_INPUT`, or `TOOL_FILE` dependency edges.
+Generated sources, generated headers, exported generated headers, and tools use
+dedicated module-edge types.
+
+References beginning with `:` or an explicit namespace may select a tagged output,
+for example `:generator{.header}`. Resolution uses the normalized module name,
+while dependency properties retain every declared spelling and output tag.
+Literal file declarations and tagged dependencies inherited through defaults keep
+the same variant and inheritance provenance as other build relationships.
+
+Master schema v9 adds `module_files`, keyed by module, declared path, and role.
+This table records build declarations only; linking those declarations to indexed
+source and generated `File` nodes remains a later build-graph task.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
