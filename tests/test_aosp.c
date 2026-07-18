@@ -187,6 +187,68 @@ static int create_defaults_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_variants_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_variants_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "project") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/variants\" path=\"project\"/></manifest>") != 0 ||
+        write_relative(root, "project/Android.bp",
+            "cc_defaults {\n"
+            "  name: \"variant_defaults\",\n"
+            "  arch: { arm64: { shared_libs: [\"libfromdefaults\"] } },\n"
+            "}\n"
+            "cc_library {\n"
+            "  name: \"libvariant_consumer\",\n"
+            "  compile_multilib: \"both\",\n"
+            "  shared_libs: [\"libcommon\"],\n"
+            "  target: {\n"
+            "    android: {\n"
+            "      defaults: [\"variant_defaults\"],\n"
+            "      shared_libs: [\"libtarget\", \"libdup\"],\n"
+            "    },\n"
+            "    host: { shared_libs: [\"libhost\"] },\n"
+            "  },\n"
+            "  arch: { arm64: { static_libs: [\"libarch\"], shared_libs: [\"libdup\"] } },\n"
+            "  multilib: {\n"
+            "    lib32: { shared_libs: [\"lib32\"] },\n"
+            "    lib64: { shared_libs: [\"lib64\"] },\n"
+            "  },\n"
+            "  product_variables: { debuggable: { shared_libs: [\"libdebug\"] } },\n"
+            "  soong_config_variables: { feature: {\n"
+            "    enabled: { shared_libs: [\"libfeature\"] },\n"
+            "    conditions_default: { shared_libs: [\"libdefault\"] },\n"
+            "  } },\n"
+            "  runtime_libs: select(soong_config_variable(\"acme\", \"mode\"), {\n"
+            "    \"enabled\": [\"libselect\"],\n"
+            "    default: [],\n"
+            "  }),\n"
+            "}\n"
+            "cc_library { name: \"libcommon\" }\n"
+            "cc_library { name: \"libtarget\" }\n"
+            "cc_library { name: \"libhost\" }\n"
+            "cc_library { name: \"libarch\" }\n"
+            "cc_library { name: \"lib32\" }\n"
+            "cc_library { name: \"lib64\" }\n"
+            "cc_library { name: \"libdebug\" }\n"
+            "cc_library { name: \"libfeature\" }\n"
+            "cc_library { name: \"libdefault\" }\n"
+            "cc_library { name: \"libdup\" }\n"
+            "cc_library { name: \"libfromdefaults\" }\n"
+            "cc_library { name: \"libselect\" }\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1685,6 +1747,129 @@ TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles) {
     PASS();
 }
 
+TEST(aosp_build_graph_models_conditional_variants) {
+    char *root = NULL;
+    ASSERT_EQ(create_variants_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.module_count, 14);
+    ASSERT_EQ(stats.dependency_count, 14);
+    ASSERT_EQ(stats.resolved_count, 14);
+    ASSERT_EQ(stats.unresolved_count, 0);
+    ASSERT_EQ(stats.inherited_dependency_count, 1);
+    ASSERT_EQ(stats.defaults_cycle_count, 0);
+    ASSERT_EQ(stats.variant_dependency_count, 13);
+    ASSERT_EQ(stats.variant_branch_count, 14);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.compile_multilib') FROM modules "
+                  "WHERE workspace_id=?1 AND name='libvariant_consumer';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "both");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT j.value FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id, "
+                  "json_each(d.properties,'$.variants') j WHERE m.workspace_id=?1 "
+                  "AND m.name='libvariant_consumer' AND d.target_name='libselect';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "select.soong_config_variable.acme.mode.enabled");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(value,',') FROM ("
+                  "SELECT j.value FROM module_dependencies d "
+                  "JOIN modules m ON m.module_id=d.source_id, json_each(d.properties,'$.variants') j "
+                  "WHERE m.workspace_id=?1 AND m.name='libvariant_consumer' "
+                  "AND d.target_name='libdup' ORDER BY j.value);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "arch.arm64,target.android");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(d.properties,'$.origin'),"
+                  "json_extract(d.properties,'$.unconditional'),j.value "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id, "
+                  "json_each(d.properties,'$.variants') j "
+                  "WHERE m.workspace_id=?1 AND m.name='libvariant_consumer' "
+                  "AND d.target_name='libfromdefaults';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "defaults");
+    ASSERT_FALSE(sqlite3_column_int(stmt, 1));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2),
+                  "target.android&arch.arm64");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(d.properties,'$.unconditional'),"
+                  "json_array_length(d.properties,'$.variants') "
+                  "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+                  "WHERE m.workspace_id=?1 AND m.name='libvariant_consumer' "
+                  "AND d.target_name='libcommon';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_TRUE(sqlite3_column_int(stmt, 0));
+    ASSERT_EQ(sqlite3_column_int(stmt, 1), 0);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT j.value FROM module_edges e JOIN modules m ON m.module_id=e.source_id "
+                  "JOIN modules t ON t.module_id=e.target_id, json_each(e.properties,'$.variants') j "
+                  "WHERE m.workspace_id=?1 AND m.name='libvariant_consumer' "
+                  "AND t.name='libfromdefaults';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "target.android&arch.arm64");
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"libvariant_consumer\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"variant_dependencies\":13"));
+    ASSERT_NOT_NULL(strstr(response, "\"variant_branches\":14"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2808,6 +2993,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol);
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles);
+    RUN_TEST(aosp_build_graph_models_conditional_variants);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

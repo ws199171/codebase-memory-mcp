@@ -8464,6 +8464,9 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "dependencies_inherited",
                            stats.inherited_dependency_count);
     yyjson_mut_obj_add_int(doc, root, "defaults_cycles", stats.defaults_cycle_count);
+    yyjson_mut_obj_add_int(doc, root, "variant_dependencies",
+                           stats.variant_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "variant_branches", stats.variant_branch_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

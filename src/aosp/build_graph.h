@@ -12,6 +12,8 @@ typedef struct {
     int unresolved_count;
     int inherited_dependency_count;
     int defaults_cycle_count;
+    int variant_dependency_count;
+    int variant_branch_count;
     int blueprint_files;
     int make_files;
     int aidl_files;

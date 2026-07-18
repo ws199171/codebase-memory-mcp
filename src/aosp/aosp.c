@@ -3478,6 +3478,8 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.unresolved_count);
             printf("  defaults: %d inherited dependencies, %d cycles\n",
                    stats.inherited_dependency_count, stats.defaults_cycle_count);
+            printf("  variants: %d conditional dependencies, %d branches\n",
+                   stats.variant_dependency_count, stats.variant_branch_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

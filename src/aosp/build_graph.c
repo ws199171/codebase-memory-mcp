@@ -44,6 +44,8 @@ typedef struct {
     char *inherited_from;
     char *inheritance_path;
     int inheritance_depth;
+    str_vec_t variants;
+    bool unconditional;
 } dep_decl_t;
 
 typedef struct {
@@ -55,6 +57,7 @@ typedef struct {
     int dep_cap;
     int defaults_state;
     char *defaults_cycle;
+    char *compile_multilib;
 } module_decl_t;
 
 typedef struct {
@@ -81,6 +84,8 @@ typedef enum {
     TOK_COMMA,
     TOK_PLUS,
     TOK_EQUAL,
+    TOK_LPAREN,
+    TOK_RPAREN,
     TOK_OTHER,
 } token_kind_t;
 
@@ -170,6 +175,14 @@ static bool str_vec_extend(str_vec_t *vec, const str_vec_t *values) {
     return true;
 }
 
+static bool str_vec_add_unique(str_vec_t *vec, const char *value) {
+    if (!vec || !value || !value[0]) return true;
+    for (int i = 0; i < vec->count; i++) {
+        if (strcmp(vec->items[i], value) == 0) return true;
+    }
+    return str_vec_add(vec, value);
+}
+
 static bp_var_t *bp_var_find(const bp_var_vec_t *vars, const char *name) {
     if (!vars || !name) return NULL;
     for (int i = 0; i < vars->count; i++) {
@@ -210,18 +223,32 @@ static void bp_var_vec_free(bp_var_vec_t *vars) {
     memset(vars, 0, sizeof(*vars));
 }
 
-static bool module_add_dep(module_decl_t *module, const char *name, const char *kind) {
-    if (!module || !name || !name[0] || !kind) return true;
-    if (strstr(name, "$(") || strstr(name, "${")) return true;
+static dep_decl_t *module_find_dep(module_decl_t *module, const char *name, const char *kind) {
+    if (!module || !name || !kind) return NULL;
     for (int i = 0; i < module->dep_count; i++) {
         if (strcmp(module->deps[i].name, name) == 0 && strcmp(module->deps[i].kind, kind) == 0) {
-            return true;
+            return &module->deps[i];
         }
     }
+    return NULL;
+}
+
+static bool dep_add_variant(dep_decl_t *dep, const char *variant) {
+    if (!dep) return false;
+    if (!variant || !variant[0]) {
+        dep->unconditional = true;
+        return true;
+    }
+    return str_vec_add_unique(&dep->variants, variant);
+}
+
+static dep_decl_t *module_ensure_dep(module_decl_t *module, const char *name, const char *kind) {
+    dep_decl_t *existing = module_find_dep(module, name, kind);
+    if (existing) return existing;
     if (module->dep_count == module->dep_cap) {
         int new_cap = module->dep_cap ? module->dep_cap * 2 : 8;
         dep_decl_t *deps = realloc(module->deps, (size_t)new_cap * sizeof(*deps));
-        if (!deps) return false;
+        if (!deps) return NULL;
         module->deps = deps;
         module->dep_cap = new_cap;
     }
@@ -232,23 +259,67 @@ static bool module_add_dep(module_decl_t *module, const char *name, const char *
     if (!dep->name || !dep->kind) {
         free(dep->name);
         free(dep->kind);
-        return false;
+        return NULL;
     }
     module->dep_count++;
+    return dep;
+}
+
+static bool module_add_dep_variant(module_decl_t *module, const char *name, const char *kind,
+                                   const char *variant) {
+    if (!module || !name || !name[0] || !kind) return true;
+    if (strstr(name, "$(") || strstr(name, "${")) return true;
+    dep_decl_t *dep = module_ensure_dep(module, name, kind);
+    return dep && dep_add_variant(dep, variant);
+}
+
+static bool module_add_dep(module_decl_t *module, const char *name, const char *kind) {
+    return module_add_dep_variant(module, name, kind, NULL);
+}
+
+static bool dep_add_combined_variant(dep_decl_t *dep, const char *left, const char *right) {
+    if (!left || !left[0]) return dep_add_variant(dep, right);
+    if (!right || !right[0]) return dep_add_variant(dep, left);
+    size_t size = strlen(left) + strlen(right) + 2;
+    char *combined = malloc(size);
+    if (!combined) return false;
+    (void)snprintf(combined, size, "%s&%s", left, right);
+    bool ok = dep_add_variant(dep, combined);
+    free(combined);
+    return ok;
+}
+
+static bool dep_merge_inherited_variants(dep_decl_t *dep, const dep_decl_t *defaults_dep,
+                                         const dep_decl_t *source) {
+    if (defaults_dep->unconditional && source->unconditional) dep->unconditional = true;
+    if (defaults_dep->unconditional) {
+        for (int i = 0; i < source->variants.count; i++) {
+            if (!dep_add_variant(dep, source->variants.items[i])) return false;
+        }
+    }
+    if (source->unconditional) {
+        for (int i = 0; i < defaults_dep->variants.count; i++) {
+            if (!dep_add_variant(dep, defaults_dep->variants.items[i])) return false;
+        }
+    }
+    for (int i = 0; i < defaults_dep->variants.count; i++) {
+        for (int j = 0; j < source->variants.count; j++) {
+            if (!dep_add_combined_variant(dep, defaults_dep->variants.items[i],
+                                          source->variants.items[j])) return false;
+        }
+    }
     return true;
 }
 
 static bool module_add_inherited_dep(module_decl_t *module, const dep_decl_t *source,
+                                     const dep_decl_t *defaults_dep,
                                      const char *defaults_name) {
-    if (!module || !source || !defaults_name) return false;
-    for (int i = 0; i < module->dep_count; i++) {
-        if (strcmp(module->deps[i].name, source->name) == 0 &&
-            strcmp(module->deps[i].kind, source->kind) == 0) {
-            return true;
-        }
-    }
-    if (!module_add_dep(module, source->name, source->kind)) return false;
-    dep_decl_t *dep = &module->deps[module->dep_count - 1];
+    if (!module || !source || !defaults_dep || !defaults_name) return false;
+    dep_decl_t *dep = module_find_dep(module, source->name, source->kind);
+    bool created = dep == NULL;
+    if (!dep) dep = module_ensure_dep(module, source->name, source->kind);
+    if (!dep || !dep_merge_inherited_variants(dep, defaults_dep, source)) return false;
+    if (!created) return true;
     const char *origin = source->inherited_from ? source->inherited_from : defaults_name;
     dep->inherited_from = strdup(origin);
     size_t path_size = strlen(defaults_name) + 1;
@@ -272,11 +343,13 @@ static void module_free(module_decl_t *module) {
     free(module->type);
     free(module->file_path);
     free(module->defaults_cycle);
+    free(module->compile_multilib);
     for (int i = 0; i < module->dep_count; i++) {
         free(module->deps[i].name);
         free(module->deps[i].kind);
         free(module->deps[i].inherited_from);
         free(module->deps[i].inheritance_path);
+        str_vec_free(&module->deps[i].variants);
     }
     free(module->deps);
     memset(module, 0, sizeof(*module));
@@ -355,6 +428,8 @@ static token_t lexer_next(lexer_t *lexer) {
         case ',': token.kind = TOK_COMMA; return token;
         case '+': token.kind = TOK_PLUS; return token;
         case '=': token.kind = TOK_EQUAL; return token;
+        case '(': token.kind = TOK_LPAREN; return token;
+        case ')': token.kind = TOK_RPAREN; return token;
         case '"': {
             token.kind = TOK_STRING;
             size_t cap = 32;
@@ -424,11 +499,38 @@ static const char *dependency_kind(const char *key) {
     return NULL;
 }
 
+static bool is_variant_scope(const char *scope) {
+    static const char *prefixes[] = {
+        "target", "arch", "multilib", "product_variables", "soong_config_variables", "select",
+    };
+    if (!scope || !scope[0]) return false;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t length = strlen(prefixes[i]);
+        if (strncmp(scope, prefixes[i], length) == 0 &&
+            (scope[length] == '\0' || scope[length] == '.')) return true;
+    }
+    return false;
+}
+
+static char *bp_scope_child(const char *scope, const char *key) {
+    size_t scope_length = scope ? strlen(scope) : 0;
+    size_t key_length = key ? strlen(key) : 0;
+    size_t size = scope_length + key_length + (scope_length ? 2 : 1);
+    char *child = malloc(size);
+    if (!child) return NULL;
+    if (scope_length) {
+        (void)snprintf(child, size, "%s.%s", scope, key ? key : "");
+    } else {
+        (void)snprintf(child, size, "%s", key ? key : "");
+    }
+    return child;
+}
+
 static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
-                           const char *key, int depth);
+                           const char *key, const char *scope, int depth);
 
 static bool parse_bp_object(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
-                            int depth) {
+                            const char *scope, int depth) {
     while (parser->current.kind != TOK_EOF && parser->current.kind != TOK_RBRACE) {
         if (parser->current.kind != TOK_IDENT) {
             parser_advance(parser);
@@ -441,7 +543,7 @@ static bool parse_bp_object(parser_t *parser, module_decl_t *module, const bp_va
             continue;
         }
         parser_advance(parser);
-        bool ok = parse_bp_value(parser, module, vars, key, depth);
+        bool ok = parse_bp_value(parser, module, vars, key, scope, depth);
         free(key);
         if (!ok) return false;
         if (parser->current.kind == TOK_COMMA) parser_advance(parser);
@@ -450,17 +552,24 @@ static bool parse_bp_object(parser_t *parser, module_decl_t *module, const bp_va
     return true;
 }
 
-static bool record_bp_string(module_decl_t *module, const char *key, int depth, const char *value) {
+static bool record_bp_string(module_decl_t *module, const char *key, const char *scope,
+                             int depth, const char *value) {
     if (depth == 1 && key && strcmp(key, "name") == 0 && !module->name) {
         module->name = strdup(value);
         return module->name != NULL;
+    }
+    if (depth == 1 && key && strcmp(key, "compile_multilib") == 0) {
+        free(module->compile_multilib);
+        module->compile_multilib = strdup(value);
+        return module->compile_multilib != NULL;
     }
     const char *kind = dependency_kind(key);
     if (kind && strcmp(key, "imports") == 0 &&
         (!module->type || strcmp(module->type, "aidl_interface") != 0)) {
         kind = NULL;
     }
-    return !kind || module_add_dep(module, value, kind);
+    const char *variant = is_variant_scope(scope) ? scope : NULL;
+    return !kind || module_add_dep_variant(module, value, kind, variant);
 }
 
 static bool parse_bp_term(parser_t *parser, const bp_var_vec_t *vars, str_vec_t *values) {
@@ -502,11 +611,125 @@ static bool parse_bp_expression(parser_t *parser, const bp_var_vec_t *vars, str_
     return true;
 }
 
-static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
-                           const char *key, int depth) {
-    if (parser->current.kind == TOK_LBRACE) {
+static char *bp_join_path(const str_vec_t *parts) {
+    size_t size = 1;
+    for (int i = 0; parts && i < parts->count; i++) size += strlen(parts->items[i]) + 1;
+    char *path = malloc(size);
+    if (!path) return NULL;
+    path[0] = '\0';
+    for (int i = 0; parts && i < parts->count; i++) {
+        if (path[0]) (void)strcat(path, ".");
+        (void)strcat(path, parts->items[i]);
+    }
+    return path;
+}
+
+static bool parse_bp_select(parser_t *parser, module_decl_t *module,
+                            const bp_var_vec_t *vars, const char *key,
+                            const char *scope, int depth) {
+    parser_advance(parser);
+    if (parser->current.kind != TOK_LPAREN) return true;
+    parser_advance(parser);
+    str_vec_t condition_parts = {0};
+    int nested_parens = 0;
+    while (parser->current.kind != TOK_EOF) {
+        if (parser->current.kind == TOK_COMMA && nested_parens == 0) break;
+        if (parser->current.kind == TOK_LPAREN) {
+            nested_parens++;
+        } else if (parser->current.kind == TOK_RPAREN) {
+            if (nested_parens == 0) break;
+            nested_parens--;
+        } else if ((parser->current.kind == TOK_IDENT || parser->current.kind == TOK_STRING) &&
+                   parser->current.text &&
+                   !str_vec_add(&condition_parts, parser->current.text)) {
+            str_vec_free(&condition_parts);
+            return false;
+        }
         parser_advance(parser);
-        return parse_bp_object(parser, module, vars, depth + 1);
+    }
+    char *condition = bp_join_path(&condition_parts);
+    str_vec_free(&condition_parts);
+    if (!condition) return false;
+    if (parser->current.kind == TOK_COMMA) parser_advance(parser);
+    if (parser->current.kind != TOK_LBRACE) {
+        free(condition);
+        return true;
+    }
+    parser_advance(parser);
+    while (parser->current.kind != TOK_EOF && parser->current.kind != TOK_RBRACE) {
+        if (parser->current.kind != TOK_IDENT && parser->current.kind != TOK_STRING) {
+            parser_advance(parser);
+            continue;
+        }
+        char *branch = parser->current.text ? strdup(parser->current.text) : NULL;
+        parser_advance(parser);
+        if (!branch) {
+            free(condition);
+            return false;
+        }
+        if (parser->current.kind != TOK_COLON) {
+            free(branch);
+            continue;
+        }
+        parser_advance(parser);
+        str_vec_t values = {0};
+        if (!parse_bp_expression(parser, vars, &values)) {
+            free(branch);
+            free(condition);
+            str_vec_free(&values);
+            return false;
+        }
+        const char *condition_name = condition[0] ? condition : "condition";
+        size_t select_size = strlen(condition_name) + strlen(branch) + 9;
+        char *select_scope = malloc(select_size);
+        if (!select_scope) {
+            free(branch);
+            free(condition);
+            str_vec_free(&values);
+            return false;
+        }
+        (void)snprintf(select_scope, select_size, "select.%s.%s", condition_name, branch);
+        char *effective_scope = select_scope;
+        if (is_variant_scope(scope)) {
+            size_t effective_size = strlen(scope) + strlen(select_scope) + 2;
+            effective_scope = malloc(effective_size);
+            if (effective_scope) {
+                (void)snprintf(effective_scope, effective_size, "%s&%s", scope, select_scope);
+            }
+        }
+        bool ok = effective_scope != NULL;
+        for (int i = 0; ok && i < values.count; i++) {
+            ok = record_bp_string(module, key, effective_scope, depth, values.items[i]);
+        }
+        if (effective_scope != select_scope) free(effective_scope);
+        free(select_scope);
+        free(branch);
+        str_vec_free(&values);
+        if (!ok) {
+            free(condition);
+            return false;
+        }
+        if (parser->current.kind == TOK_COMMA) parser_advance(parser);
+    }
+    free(condition);
+    if (parser->current.kind == TOK_RBRACE) parser_advance(parser);
+    if (parser->current.kind == TOK_RPAREN) parser_advance(parser);
+    return true;
+}
+
+static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var_vec_t *vars,
+                           const char *key, const char *scope, int depth) {
+    if (parser->current.kind == TOK_IDENT && parser->current.text &&
+        strcmp(parser->current.text, "select") == 0) {
+        return parse_bp_select(parser, module, vars, key, scope, depth);
+    }
+    if (parser->current.kind == TOK_LBRACE) {
+        char *child_scope = bp_scope_child(scope, key);
+        if (!child_scope) return false;
+        parser_advance(parser);
+        bool ok = parse_bp_object(parser, module, vars, child_scope, depth + 1);
+        free(child_scope);
+        return ok;
     }
     str_vec_t values = {0};
     if (!parse_bp_expression(parser, vars, &values)) {
@@ -514,7 +737,7 @@ static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var
         return false;
     }
     for (int i = 0; i < values.count; i++) {
-        if (!record_bp_string(module, key, depth, values.items[i])) {
+        if (!record_bp_string(module, key, scope, depth, values.items[i])) {
             str_vec_free(&values);
             return false;
         }
@@ -560,7 +783,8 @@ static bool parse_blueprint(const char *source, size_t length, const char *file_
         }
         parser_advance(&parser);
         module_decl_t module = {.type = type, .file_path = strdup(file_path)};
-        if (!module.type || !module.file_path || !parse_bp_object(&parser, &module, &vars, 1) ||
+        if (!module.type || !module.file_path ||
+            !parse_bp_object(&parser, &module, &vars, "", 1) ||
             !module_vec_add(modules, &module)) {
             module_free(&module);
             token_free(&parser.current);
@@ -876,7 +1100,8 @@ static bool expand_module_defaults(scan_ctx_t *contexts, int context_count,
         }
         for (int d = 0; d < target->dep_count; d++) {
             if (strcmp(target->deps[d].kind, "DEFAULTS") != 0 &&
-                !module_add_inherited_dep(module, &target->deps[d], target->name)) {
+                !module_add_inherited_dep(module, &target->deps[d], defaults_dep,
+                                          target->name)) {
                 return false;
             }
         }
@@ -975,12 +1200,17 @@ static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, 
 }
 
 static char *module_properties_json(const module_decl_t *module) {
-    if (!module->defaults_cycle) return strdup("{}");
+    if (!module->defaults_cycle && !module->compile_multilib) return strdup("{}");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) return NULL;
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_strcpy(doc, root, "defaults_cycle", module->defaults_cycle);
+    if (module->defaults_cycle) {
+        yyjson_mut_obj_add_strcpy(doc, root, "defaults_cycle", module->defaults_cycle);
+    }
+    if (module->compile_multilib) {
+        yyjson_mut_obj_add_strcpy(doc, root, "compile_multilib", module->compile_multilib);
+    }
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1000,6 +1230,12 @@ static char *dependency_properties_json(const dep_decl_t *dep) {
     } else {
         yyjson_mut_obj_add_strcpy(doc, root, "origin", "direct");
     }
+    yyjson_mut_obj_add_bool(doc, root, "unconditional", dep->unconditional);
+    yyjson_mut_val *variants = yyjson_mut_arr(doc);
+    for (int i = 0; i < dep->variants.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, variants, dep->variants.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "variants", variants);
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1157,7 +1393,12 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
         "WHERE m.workspace_id=?1 AND d.properties LIKE '%\"origin\":\"defaults\"%'),"
         "(SELECT count(*) FROM modules WHERE workspace_id=?1 "
-        "AND properties LIKE '%\"defaults_cycle\":%');";
+        "AND properties LIKE '%\"defaults_cycle\":%'),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND json_array_length(d.properties,'$.variants')>0),"
+        "(SELECT coalesce(sum(json_array_length(d.properties,'$.variants')),0) "
+        "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1);";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1171,6 +1412,8 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->unresolved_count = sqlite3_column_int(stmt, 3);
             stats->inherited_dependency_count = sqlite3_column_int(stmt, 4);
             stats->defaults_cycle_count = sqlite3_column_int(stmt, 5);
+            stats->variant_dependency_count = sqlite3_column_int(stmt, 6);
+            stats->variant_branch_count = sqlite3_column_int(stmt, 7);
             rc = 0;
         }
     }
