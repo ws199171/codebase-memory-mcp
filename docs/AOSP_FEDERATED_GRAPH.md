@@ -212,9 +212,11 @@ Supported hop kinds and transitions:
 
 Each result node carries its node ID (global_id, module_id, or protocol_id),
 kind, repository ID, name, qualified name, file path, the edge type and
-confidence that led to it, the hop index in the pattern, and a `cross_repo`
-flag. The start node has a NULL edge type, 0.0 confidence, hop index 0, and
-`cross_repo` false.
+evidence and confidence that led to it, the hop index in the pattern, and a
+`cross_repo` flag. Local code edges use `local` evidence; cross-repository and
+protocol edges retain stored evidence; module and symbol-to-protocol transitions
+return their Master-table provenance. The start node has NULL edge type/evidence,
+0.0 confidence, hop index 0, and `cross_repo` false.
 
 Cycle detection uses a visited set keyed by `"K:node_id"` where K is the node
 kind prefix (S/M/P), preventing revisits across different relationship types.
@@ -264,7 +266,7 @@ MCP tools:
 | `aosp_resolve_symbol` | Returns deterministic resolution status, match tier, truncation, and all best-tier candidates. |
 | `aosp_get_source_snippet` | Accepts an exact search/resolution `global_id` and returns the verified source range. |
 | `aosp_trace_path` | Accepts a global ID or unambiguous reference and returns bounded code traversal with evidence. |
-| `aosp_query_graph` | Accepts a global ID or unambiguous reference plus ordered symbol/module/protocol hops. |
+| `aosp_query_graph` | Accepts a global ID or unambiguous reference plus ordered symbol/module/protocol hops and returns evidence at each boundary. |
 
 `aosp_search_symbols` now includes `global_id` and `repo_id` in every result, so a
 caller can pass a search hit directly to `aosp_get_source_snippet`. Trace and query
@@ -272,6 +274,17 @@ starts may also use qualified references, but ambiguous references fail with an
 explicit instruction to call `aosp_resolve_symbol`; no candidate is selected by
 repository order. The AOSP-specific tools are read-only and do not alter the
 behavior or schemas of single-project callers.
+
+## Query-Plane Fault Coverage
+
+Q7 uses a four-entry manifest fixture with three indexed repositories and one
+missing repository. Its golden path starts in alpha, follows a local edge, crosses
+to beta, follows a beta-local edge, and crosses again to gamma. Both `trace_path`
+and `query_graph` must return the repository, file, line, edge type, confidence,
+and evidence for all four boundaries. The same fixture verifies that ambiguous
+public starts fail without candidate selection, a missing shard rejects exact
+source reads, a Master/shard identity mismatch reports a stale catalog, and status
+retains the partial workspace's present/indexed/missing counts.
 
 ## Schema Compatibility
 

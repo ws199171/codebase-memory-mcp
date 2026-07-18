@@ -2310,6 +2310,7 @@ typedef struct {
     cbm_aosp_query_kind_t kind;
     int hop_index;
     char *edge_type;
+    char *edge_evidence;
     double confidence;
     bool cross_repo;
 } qg_queue_item_t;
@@ -2333,6 +2334,7 @@ static void qg_queue_free(qg_queue_t *q) {
         free(q->items[idx].node_id);
         free(q->items[idx].repo_id);
         free(q->items[idx].edge_type);
+        free(q->items[idx].edge_evidence);
     }
     free(q->items);
     q->items = NULL; q->capacity = 0; q->head = 0; q->count = 0;
@@ -2340,7 +2342,8 @@ static void qg_queue_free(qg_queue_t *q) {
 
 static int qg_queue_push(qg_queue_t *q, const char *node_id, const char *repo_id,
                          cbm_aosp_query_kind_t kind, int hop_index,
-                         const char *edge_type, double confidence, bool cross_repo) {
+                         const char *edge_type, const char *edge_evidence,
+                         double confidence, bool cross_repo) {
     if (q->count >= q->capacity) {
         int new_cap = q->capacity == 0 ? 64 : q->capacity * 2;
         qg_queue_item_t *ni = calloc((size_t)new_cap, sizeof(*ni));
@@ -2360,13 +2363,16 @@ static int qg_queue_push(qg_queue_t *q, const char *node_id, const char *repo_id
     q->items[tail].kind = kind;
     q->items[tail].hop_index = hop_index;
     q->items[tail].edge_type = edge_type ? strdup(edge_type) : NULL;
+    q->items[tail].edge_evidence = edge_evidence ? strdup(edge_evidence) : NULL;
     q->items[tail].confidence = confidence;
     q->items[tail].cross_repo = cross_repo;
     if (!q->items[tail].node_id || !q->items[tail].repo_id ||
-        (edge_type && !q->items[tail].edge_type)) {
+        (edge_type && !q->items[tail].edge_type) ||
+        (edge_evidence && !q->items[tail].edge_evidence)) {
         free(q->items[tail].node_id);
         free(q->items[tail].repo_id);
         free(q->items[tail].edge_type);
+        free(q->items[tail].edge_evidence);
         return -1;
     }
     q->count++;
@@ -2390,6 +2396,7 @@ void cbm_aosp_query_graph_result_free(cbm_aosp_query_graph_result_t *result) {
         free(result->nodes[i].qualified_name);
         free(result->nodes[i].file_path);
         free(result->nodes[i].edge_type);
+        free(result->nodes[i].edge_evidence);
     }
     free(result->nodes);
     memset(result, 0, sizeof(*result));
@@ -2730,7 +2737,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
 
     /* Enqueue start node */
     if (qg_queue_push(&queue, start_global_id, start_repo, CBM_AOSP_QUERY_KIND_SYMBOL,
-                      0, NULL, 0.0, false) != 0 ||
+                      0, NULL, NULL, 0.0, false) != 0 ||
         trace_visited_add(&visited, start_global_id) != 0) {
         set_error(err, err_size, "out of memory", NULL);
         free(results);
@@ -2759,6 +2766,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                 free(item.node_id);
                 free(item.repo_id);
                 free(item.edge_type);
+                free(item.edge_evidence);
                 break;
             }
             int nc = result_cap * 2;
@@ -2768,6 +2776,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                 free(item.node_id);
                 free(item.repo_id);
                 free(item.edge_type);
+                free(item.edge_evidence);
                 free(results);
                 results = NULL;
                 goto cleanup_q;
@@ -2784,6 +2793,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
         qn->kind = item.kind;
         qn->hop_index = item.hop_index;
         qn->edge_type = item.edge_type;
+        qn->edge_evidence = item.edge_evidence;
         qn->confidence = item.confidence;
         qn->cross_repo = item.cross_repo;
         qn->name = strdup("");
@@ -2798,9 +2808,11 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
             sqlite3_bind_text(sym_lookup, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(sym_lookup, 2, item.node_id, -1, SQLITE_TRANSIENT);
             if (sqlite3_step(sym_lookup) == SQLITE_ROW) {
+                free(qn->repo_id);
                 free(qn->name);
                 free(qn->qualified_name);
                 free(qn->file_path);
+                qn->repo_id = dup_column(sym_lookup, 0);
                 qn->name = dup_column(sym_lookup, 2);
                 qn->qualified_name = dup_column(sym_lookup, 3);
                 qn->file_path = dup_column(sym_lookup, 5);
@@ -2871,8 +2883,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                                         trace_visited_add(&visited, vid) == 0)
                                         (void)qg_queue_push(&queue, nid, cur_repo,
                                                             CBM_AOSP_QUERY_KIND_SYMBOL,
-                                                            hop_idx + 1, edges[i].type, 1.0,
-                                                            false);
+                                                            hop_idx + 1, edges[i].type,
+                                                            "local", 1.0, false);
                                 }
                             }
                         }
@@ -2903,8 +2915,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                                         trace_visited_add(&visited, vid) == 0)
                                         (void)qg_queue_push(&queue, nid, cur_repo,
                                                             CBM_AOSP_QUERY_KIND_SYMBOL,
-                                                            hop_idx + 1, edges[i].type, 1.0,
-                                                            false);
+                                                            hop_idx + 1, edges[i].type,
+                                                            "local", 1.0, false);
                                 }
                             }
                         }
@@ -2924,6 +2936,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                     const char *tid = (const char *)sqlite3_column_text(cross_out, 0);
                     const char *et = (const char *)sqlite3_column_text(cross_out, 1);
                     double conf = sqlite3_column_double(cross_out, 2);
+                    const char *evidence = (const char *)sqlite3_column_text(cross_out, 3);
                     if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
                     if (tid) {
                         char vid[128];
@@ -2931,7 +2944,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_SYMBOL,
-                                                hop_idx + 1, et, conf, true);
+                                                hop_idx + 1, et,
+                                                evidence ? evidence : "cross_repo", conf, true);
                     }
                 }
             }
@@ -2945,6 +2959,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                     const char *sid = (const char *)sqlite3_column_text(cross_in, 0);
                     const char *et = (const char *)sqlite3_column_text(cross_in, 1);
                     double conf = sqlite3_column_double(cross_in, 2);
+                    const char *evidence = (const char *)sqlite3_column_text(cross_in, 3);
                     if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
                     if (sid) {
                         char vid[128];
@@ -2952,7 +2967,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_SYMBOL,
-                                                hop_idx + 1, et, conf, true);
+                                                hop_idx + 1, et,
+                                                evidence ? evidence : "cross_repo", conf, true);
                     }
                 }
             }
@@ -2981,7 +2997,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                                 trace_visited_add(&visited, vid) == 0)
                                 (void)qg_queue_push(&queue, mid, cur_repo,
                                                     CBM_AOSP_QUERY_KIND_MODULE,
-                                                    hop_idx + 1, "defined_in", 1.0, false);
+                                                    hop_idx + 1, "defined_in",
+                                                    "module.file_path", 1.0, false);
                         }
                     }
                 }
@@ -3002,7 +3019,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_MODULE,
-                                                hop_idx + 1, "depends_on", 1.0, false);
+                                                hop_idx + 1, "depends_on",
+                                                "module_dependencies", 1.0, false);
                     }
                 }
             }
@@ -3019,7 +3037,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_MODULE,
-                                                hop_idx + 1, "depended_by", 1.0, false);
+                                                hop_idx + 1, "depended_by",
+                                                "module_dependencies", 1.0, false);
                     }
                 }
             }
@@ -3039,7 +3058,8 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         trace_visited_add(&visited, vid) == 0)
                         (void)qg_queue_push(&queue, pid, cur_repo,
                                             CBM_AOSP_QUERY_KIND_PROTOCOL,
-                                            hop_idx + 1, "protocol_link", 1.0, false);
+                                            hop_idx + 1, "protocol_link",
+                                            "protocol_nodes.symbol_global_id", 1.0, false);
                 }
             }
         } else if (hop->kind == CBM_AOSP_QUERY_KIND_PROTOCOL &&
@@ -3054,6 +3074,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                     const char *tid = (const char *)sqlite3_column_text(proto_edge_out, 0);
                     const char *et = (const char *)sqlite3_column_text(proto_edge_out, 1);
                     double conf = sqlite3_column_double(proto_edge_out, 2);
+                    const char *evidence = (const char *)sqlite3_column_text(proto_edge_out, 3);
                     if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
                     if (tid) {
                         char vid[128];
@@ -3061,7 +3082,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, tid, "", CBM_AOSP_QUERY_KIND_PROTOCOL,
-                                                hop_idx + 1, et, conf, false);
+                                                hop_idx + 1, et, evidence, conf, false);
                     }
                 }
             }
@@ -3074,6 +3095,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                     const char *sid = (const char *)sqlite3_column_text(proto_edge_in, 0);
                     const char *et = (const char *)sqlite3_column_text(proto_edge_in, 1);
                     double conf = sqlite3_column_double(proto_edge_in, 2);
+                    const char *evidence = (const char *)sqlite3_column_text(proto_edge_in, 3);
                     if (hop->edge_type && et && strcmp(hop->edge_type, et) != 0) continue;
                     if (sid) {
                         char vid[128];
@@ -3081,7 +3103,7 @@ int cbm_aosp_query_graph(const cbm_aosp_workspace_t *workspace,
                         if (!trace_visited_contains(&visited, vid) &&
                             trace_visited_add(&visited, vid) == 0)
                             (void)qg_queue_push(&queue, sid, "", CBM_AOSP_QUERY_KIND_PROTOCOL,
-                                                hop_idx + 1, et, conf, false);
+                                                hop_idx + 1, et, evidence, conf, false);
                     }
                 }
             }
@@ -3653,13 +3675,14 @@ int cbm_cmd_aosp(int argc, char **argv) {
                        result.truncated ? "\ttruncated" : "");
                 for (int i = 0; i < result.node_count; i++) {
                     const cbm_aosp_query_node_t *node = &result.nodes[i];
-                    printf("%d\t%s\t%s\t%s\t%s\t%s:%d\t%s\t%.3f\t%s\n",
+                    printf("%d\t%s\t%s\t%s\t%s\t%s:%d\t%s\t%.3f\t%s\t%s\n",
                            node->hop_index, aosp_query_kind_name(node->kind), node->node_id,
                            node->repo_id ? node->repo_id : "",
                            node->qualified_name ? node->qualified_name : node->name,
                            node->file_path ? node->file_path : "", node->start_line,
                            node->edge_type ? node->edge_type : "start", node->confidence,
-                           node->cross_repo ? "cross-repo" : "local");
+                           node->cross_repo ? "cross-repo" : "local",
+                           node->edge_evidence ? node->edge_evidence : "");
                 }
                 cbm_aosp_query_graph_result_free(&result);
             }

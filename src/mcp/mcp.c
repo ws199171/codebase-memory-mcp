@@ -8367,6 +8367,8 @@ static char *handle_aosp_query_graph(const char *args) {
         yyjson_mut_obj_add_int(doc, item, "start_line", node->start_line);
         yyjson_mut_obj_add_strcpy(doc, item, "edge_type",
                                   node->edge_type ? node->edge_type : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "evidence",
+                                  node->edge_evidence ? node->edge_evidence : "");
         yyjson_mut_obj_add_real(doc, item, "confidence", node->confidence);
         yyjson_mut_obj_add_int(doc, item, "hop_index", node->hop_index);
         yyjson_mut_obj_add_bool(doc, item, "cross_repo", node->cross_repo);

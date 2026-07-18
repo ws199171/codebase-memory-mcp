@@ -263,6 +263,7 @@ typedef struct {
     char *file_path;
     int start_line;
     char *edge_type;            /* edge that led here, NULL for start */
+    char *edge_evidence;        /* edge evidence, NULL for start */
     double confidence;          /* edge confidence (0.0 for start) */
     int hop_index;              /* 0 = start, 1 = after first hop, etc. */
     bool cross_repo;            /* true if this hop crossed a repo boundary */

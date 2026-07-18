@@ -91,6 +91,55 @@ static int create_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_q7_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_q7_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "alpha/src") != 0 ||
+        make_dir(root, "beta/src") != 0 || make_dir(root, "gamma/src") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"platform/q7-alpha\" path=\"alpha\"/>"
+            "<project name=\"platform/q7-beta\" path=\"beta\"/>"
+            "<project name=\"platform/q7-gamma\" path=\"gamma\"/>"
+            "<project name=\"vendor/q7-missing\" path=\"vendor/missing\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "alpha/src/Alpha.c",
+            "int Q7Start(void) {\n"
+            "  return Q7Local();\n"
+            "}\n\n"
+            "int Q7Local(void) {\n"
+            "  return 1;\n"
+            "}\n\n"
+            "int Duplicate(void) {\n"
+            "  return 10;\n"
+            "}\n") != 0 ||
+        write_relative(root, "beta/src/Beta.c",
+            "int Q7Bridge(void) {\n"
+            "  return 2;\n"
+            "}\n\n"
+            "int Duplicate(void) {\n"
+            "  return 20;\n"
+            "}\n\n"
+            "int Q7BetaLocal(void) {\n"
+            "  return 21;\n"
+            "}\n") != 0 ||
+        write_relative(root, "gamma/src/Gamma.c",
+            "int Q7End(void) {\n"
+            "  return 3;\n"
+            "}\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -882,6 +931,35 @@ static int create_trace_shard(const char *path, int repo_index) {
     return rc;
 }
 
+static int create_q7_shard(const char *path, int repo_index) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY,source_id INTEGER,target_id INTEGER,"
+        "type TEXT,properties TEXT);";
+    const char *rows[] = {
+        "INSERT INTO nodes VALUES"
+        "(1,'Q7Start','q7.alpha.Q7Start','Function','src/Alpha.c',1,3,'{}'),"
+        "(2,'Q7Local','q7.alpha.Q7Local','Function','src/Alpha.c',5,7,'{}'),"
+        "(3,'Duplicate','q7.alpha.Duplicate','Function','src/Alpha.c',9,11,'{}');"
+        "INSERT INTO edges VALUES(1,1,2,'CALLS','{}');",
+        "INSERT INTO nodes VALUES"
+        "(1,'Q7Bridge','q7.beta.Q7Bridge','Function','src/Beta.c',1,3,'{}'),"
+        "(2,'Duplicate','q7.beta.Duplicate','Function','src/Beta.c',5,7,'{}'),"
+        "(3,'Q7BetaLocal','q7.beta.Q7BetaLocal','Function','src/Beta.c',9,11,'{}');"
+        "INSERT INTO edges VALUES(1,1,3,'CALLS','{}');",
+        "INSERT INTO nodes VALUES"
+        "(1,'Q7End','q7.gamma.Q7End','Function','src/Gamma.c',1,3,'{}');",
+    };
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+             repo_index >= 0 && repo_index < 3 &&
+             sqlite3_exec(db, rows[repo_index], NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_close(db);
+    return rc;
+}
+
 static int insert_cross_edge(const cbm_aosp_workspace_t *workspace,
                              const char *edge_id, const char *source_repo_id,
                              const char *target_repo_id, const char *source_global_id,
@@ -1264,6 +1342,7 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
     ASSERT_EQ(result.nodes[1].kind, CBM_AOSP_QUERY_KIND_SYMBOL);
     ASSERT_STR_EQ(result.nodes[1].name, "Mid");
     ASSERT_STR_EQ(result.nodes[1].edge_type, "CALLS");
+    ASSERT_STR_EQ(result.nodes[1].edge_evidence, "local");
     cbm_aosp_query_graph_result_free(&result);
 
     /* Test 2: SYMBOL → MODULE pattern (find containing module) */
@@ -1309,6 +1388,7 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
             found_beta = true;
             ASSERT_EQ(result.nodes[i].hop_index, 3);
             ASSERT_STR_EQ(result.nodes[i].edge_type, "depends_on");
+            ASSERT_STR_EQ(result.nodes[i].edge_evidence, "module_dependencies");
         }
     }
     ASSERT(found_beta);
@@ -1355,6 +1435,7 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
             found_proto_target = true;
             ASSERT_EQ(result.nodes[i].hop_index, 2);
             ASSERT_STR_EQ(result.nodes[i].edge_type, "AIDL_PROXY");
+            ASSERT_STR_EQ(result.nodes[i].edge_evidence, "aidl_link");
             ASSERT_EQ(result.nodes[i].confidence, 0.9);
         }
     }
@@ -1374,6 +1455,7 @@ TEST(aosp_query_graph_traverses_multi_hop_code_module_protocol) {
     ASSERT_NOT_NULL(strstr(mcp_response, "\"isError\":false"));
     ASSERT_NOT_NULL(strstr(mcp_response, "mod-beta"));
     ASSERT_NOT_NULL(strstr(mcp_response, "depends_on"));
+    ASSERT_NOT_NULL(strstr(mcp_response, "module_dependencies"));
     free(mcp_response);
 
     /* Test 6: Result budget truncation */
@@ -2358,6 +2440,199 @@ TEST(aosp_federation_refreshes_only_invalidated_repositories) {
     PASS();
 }
 
+TEST(aosp_query_plane_handles_three_repos_and_partial_workspace_failures) {
+    char *root = NULL;
+    ASSERT_EQ(create_q7_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(workspace.repo_count, 4);
+    ASSERT_TRUE(workspace.repos[0].exists);
+    ASSERT_TRUE(workspace.repos[1].exists);
+    ASSERT_TRUE(workspace.repos[2].exists);
+    ASSERT_FALSE(workspace.repos[3].exists);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_paths[3][4096];
+    for (int i = 0; i < 3; i++) {
+        (void)snprintf(shard_paths[i], sizeof(shard_paths[i]), "%s/q7-%d.db", root, i);
+        ASSERT_EQ(create_q7_shard(shard_paths[i], i), 0);
+        ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[i], shard_paths[i],
+                                           err, sizeof(err)), 0);
+        ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[i].repo_id, shard_paths[i]), 0);
+    }
+
+    char *start_id = find_symbol_id(&workspace, "Q7Start");
+    char *local_id = find_symbol_id(&workspace, "Q7Local");
+    char *bridge_id = find_symbol_id(&workspace, "Q7Bridge");
+    char *beta_local_id = find_symbol_id(&workspace, "Q7BetaLocal");
+    char *end_id = find_symbol_id(&workspace, "Q7End");
+    ASSERT_NOT_NULL(start_id);
+    ASSERT_NOT_NULL(local_id);
+    ASSERT_NOT_NULL(bridge_id);
+    ASSERT_NOT_NULL(beta_local_id);
+    ASSERT_NOT_NULL(end_id);
+    ASSERT_EQ(insert_cross_edge(&workspace, "q7-edge-alpha-beta",
+                                workspace.repos[0].repo_id, workspace.repos[1].repo_id,
+                                local_id, bridge_id, "CALLS", 0.91, "q7_alpha_beta"), 0);
+    ASSERT_EQ(insert_cross_edge(&workspace, "q7-edge-beta-gamma",
+                                workspace.repos[1].repo_id, workspace.repos[2].repo_id,
+                                beta_local_id, end_id, "USES_TYPE", 0.82, "q7_beta_gamma"), 0);
+
+    cbm_aosp_trace_options_t trace_options = {
+        .max_depth = 5,
+        .direction = CBM_AOSP_TRACE_OUTGOING,
+        .result_budget = 20,
+        .cancel_flag = NULL,
+    };
+    cbm_aosp_trace_result_t trace;
+    ASSERT_EQ(cbm_aosp_trace_path(&workspace, start_id, &trace_options, &trace,
+                                  err, sizeof(err)), 0);
+    ASSERT_EQ(trace.node_count, 5);
+    ASSERT_EQ(trace.max_depth_reached, 4);
+    ASSERT_STR_EQ(trace.nodes[0].global_id, start_id);
+    ASSERT_STR_EQ(trace.nodes[1].global_id, local_id);
+    ASSERT_STR_EQ(trace.nodes[1].repo_id, workspace.repos[0].repo_id);
+    ASSERT_STR_EQ(trace.nodes[1].file_path, "src/Alpha.c");
+    ASSERT_EQ(trace.nodes[1].start_line, 5);
+    ASSERT_STR_EQ(trace.nodes[1].edge_type, "CALLS");
+    ASSERT_STR_EQ(trace.nodes[1].edge_evidence, "local");
+    ASSERT_EQ(trace.nodes[1].confidence, 1.0);
+    ASSERT_FALSE(trace.nodes[1].cross_repo);
+    ASSERT_STR_EQ(trace.nodes[2].global_id, bridge_id);
+    ASSERT_STR_EQ(trace.nodes[2].repo_id, workspace.repos[1].repo_id);
+    ASSERT_STR_EQ(trace.nodes[2].file_path, "src/Beta.c");
+    ASSERT_EQ(trace.nodes[2].start_line, 1);
+    ASSERT_STR_EQ(trace.nodes[2].edge_type, "CALLS");
+    ASSERT_STR_EQ(trace.nodes[2].edge_evidence, "q7_alpha_beta");
+    ASSERT_EQ(trace.nodes[2].confidence, 0.91);
+    ASSERT_TRUE(trace.nodes[2].cross_repo);
+    ASSERT_STR_EQ(trace.nodes[3].global_id, beta_local_id);
+    ASSERT_STR_EQ(trace.nodes[3].repo_id, workspace.repos[1].repo_id);
+    ASSERT_STR_EQ(trace.nodes[3].file_path, "src/Beta.c");
+    ASSERT_EQ(trace.nodes[3].start_line, 9);
+    ASSERT_STR_EQ(trace.nodes[3].edge_type, "CALLS");
+    ASSERT_STR_EQ(trace.nodes[3].edge_evidence, "local");
+    ASSERT_EQ(trace.nodes[3].confidence, 1.0);
+    ASSERT_FALSE(trace.nodes[3].cross_repo);
+    ASSERT_STR_EQ(trace.nodes[4].global_id, end_id);
+    ASSERT_STR_EQ(trace.nodes[4].repo_id, workspace.repos[2].repo_id);
+    ASSERT_STR_EQ(trace.nodes[4].file_path, "src/Gamma.c");
+    ASSERT_EQ(trace.nodes[4].start_line, 1);
+    ASSERT_STR_EQ(trace.nodes[4].edge_type, "USES_TYPE");
+    ASSERT_STR_EQ(trace.nodes[4].edge_evidence, "q7_beta_gamma");
+    ASSERT_EQ(trace.nodes[4].confidence, 0.82);
+    ASSERT_TRUE(trace.nodes[4].cross_repo);
+    cbm_aosp_trace_result_free(&trace);
+
+    cbm_aosp_query_hop_t hops[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        hops[i].kind = CBM_AOSP_QUERY_KIND_SYMBOL;
+        hops[i].direction = CBM_AOSP_TRACE_OUTGOING;
+    }
+    cbm_aosp_query_graph_options_t query_options = {
+        .hops = hops,
+        .hop_count = 4,
+        .max_results = 20,
+    };
+    cbm_aosp_query_graph_result_t query;
+    ASSERT_EQ(cbm_aosp_query_graph(&workspace, start_id, &query_options, &query,
+                                   err, sizeof(err)), 0);
+    ASSERT_EQ(query.node_count, 5);
+    ASSERT_STR_EQ(query.nodes[1].repo_id, workspace.repos[0].repo_id);
+    ASSERT_STR_EQ(query.nodes[2].repo_id, workspace.repos[1].repo_id);
+    ASSERT_STR_EQ(query.nodes[3].repo_id, workspace.repos[1].repo_id);
+    ASSERT_STR_EQ(query.nodes[4].repo_id, workspace.repos[2].repo_id);
+    ASSERT_STR_EQ(query.nodes[1].edge_evidence, "local");
+    ASSERT_STR_EQ(query.nodes[2].edge_evidence, "q7_alpha_beta");
+    ASSERT_STR_EQ(query.nodes[3].edge_evidence, "local");
+    ASSERT_STR_EQ(query.nodes[4].edge_evidence, "q7_beta_gamma");
+    cbm_aosp_query_graph_result_free(&query);
+
+    cbm_aosp_source_snippet_t snippet;
+    ASSERT_EQ(cbm_aosp_read_source_snippet(&workspace, start_id, &snippet,
+                                           err, sizeof(err)), 0);
+    ASSERT_STR_EQ(snippet.workspace_file_path, "alpha/src/Alpha.c");
+    ASSERT_NOT_NULL(strstr(snippet.source, "Q7Start"));
+    cbm_aosp_source_snippet_free(&snippet);
+
+    cbm_aosp_master_stats_t partial_stats;
+    ASSERT_EQ(cbm_aosp_master_stats(&workspace, &partial_stats, err, sizeof(err)), 0);
+    ASSERT_EQ(partial_stats.repo_count, 4);
+    ASSERT_EQ(partial_stats.existing_count, 3);
+    ASSERT_EQ(partial_stats.missing_count, 1);
+    ASSERT_EQ(partial_stats.indexed_count, 3);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args), "{\"workspace_root\":\"%s\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_status", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(response, "repositories_missing"));
+    ASSERT_NOT_NULL(strstr(response, "repositories_indexed"));
+    free(response);
+
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"start\":\"Duplicate\","
+                   "\"max_depth\":3}", root);
+    response = cbm_mcp_handle_tool(NULL, "aosp_trace_path", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "ambiguous symbol reference"));
+    free(response);
+
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"start\":\"Q7Start\","
+                   "\"hops\":[{\"kind\":\"symbol\"},{\"kind\":\"symbol\"},"
+                   "{\"kind\":\"symbol\"},{\"kind\":\"symbol\"}],"
+                   "\"max_results\":20}", root);
+    response = cbm_mcp_handle_tool(NULL, "aosp_query_graph", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":false"));
+    ASSERT_NOT_NULL(strstr(response, "q7_alpha_beta"));
+    ASSERT_NOT_NULL(strstr(response, "q7_beta_gamma"));
+    ASSERT_NOT_NULL(strstr(response, workspace.repos[2].repo_id));
+    free(response);
+
+    char missing_shard[4096];
+    (void)snprintf(missing_shard, sizeof(missing_shard), "%s/missing-shard.db", root);
+    ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[1].repo_id, missing_shard), 0);
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"global_id\":\"%s\"}",
+                   root, bridge_id);
+    response = cbm_mcp_handle_tool(NULL, "aosp_get_source_snippet", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "cannot open AOSP repository shard"));
+    free(response);
+    ASSERT_EQ(mark_repo_indexed(&workspace, workspace.repos[1].repo_id, shard_paths[1]), 0);
+
+    sqlite3 *stale_shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_paths[2], &stale_shard), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(stale_shard,
+                           "UPDATE nodes SET qualified_name='changed.Q7End' WHERE id=1;",
+                           NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(stale_shard);
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"global_id\":\"%s\"}",
+                   root, end_id);
+    response = cbm_mcp_handle_tool(NULL, "aosp_get_source_snippet", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "catalog is stale"));
+    free(response);
+
+    free(start_id);
+    free(local_id);
+    free(bridge_id);
+    free(beta_local_id);
+    free(end_id);
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(aosp) {
     RUN_TEST(aosp_manifest_include_and_local_override);
     RUN_TEST(aosp_manifest_rejects_parent_path);
@@ -2377,4 +2652,5 @@ SUITE(aosp) {
     RUN_TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges);
     RUN_TEST(aosp_structural_federation_collects_cross_repo_candidates_only);
     RUN_TEST(aosp_federation_refreshes_only_invalidated_repositories);
+    RUN_TEST(aosp_query_plane_handles_three_repos_and_partial_workspace_failures);
 }

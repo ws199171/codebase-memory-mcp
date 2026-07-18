@@ -40,15 +40,20 @@ complete:
 
 ## Current Queue
 
-- Current task: `Q7` - complete federated query-plane fault and mixed-path coverage.
-- Next task: `B1` - evaluate Blueprint literal variables, list concatenation, and references.
+- Current task: `B1` - evaluate Blueprint literal variables, list concatenation, and references.
+- Next task: `B2` - expand `defaults` inheritance with provenance and cycle detection.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
-    smoke pass; Linux ASan/UBSan execution remains required before archival.
+    smoke pass; Linux ASan/UBSan execution remains required before verification completion.
   - `Q6` CLI/MCP implementation, 18 AOSP tests, 159 MCP tests, production `-Werror`
     build, and production CLI/MCP smoke pass; Linux ASan/UBSan execution remains
-    required before archival.
-- Worktree baseline: Q4 query_graph commit on `codex/aosp-federated-graph`.
+    required before verification completion.
+  - `Q7` three-repository mixed-path and partial-workspace coverage, query evidence
+    propagation, 19 AOSP tests, production `-Werror` build, and production MCP
+    smoke pass; Linux ASan/UBSan execution remains required before verification
+    completion.
+- Worktree baseline: Q5/Q6 implementation checkpoint `ab0913f` on
+  `codex/aosp-federated-graph`.
 
 ## Verified Baseline
 
