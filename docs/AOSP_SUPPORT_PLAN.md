@@ -40,8 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `B4` - model `soong_namespace`, imports, visibility, and package boundaries.
-- Next task: `B5` - model filegroups, genrules, generated sources, tools, and output tags.
+- Current task: `B5` - model filegroups, genrules, generated sources, tools, and output tags.
+- Next task: `B6` - expand common Android.mk variables, conditions, includes, macros,
+  and module-class semantics.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -66,7 +67,12 @@ complete:
     defaults composition, `compile_multilib`, 21 AOSP tests, 159 MCP tests,
     production `-Werror` build, and production CLI/MCP smoke pass; Linux ASan/UBSan
     execution remains required before verification completion.
-- Worktree baseline: B2 defaults inheritance checkpoint `371b786` on
+  - `B4` namespace-local, imported, global, and explicit module resolution;
+    package/default visibility inheritance; ambiguity, blocked visibility, and
+    unsupported-visibility evidence; schema v8 boundary tables; 22 AOSP tests,
+    159 MCP tests, production `-Werror` build, and production CLI/MCP smoke pass;
+    Linux ASan/UBSan execution remains required before verification completion.
+- Worktree baseline: B3 dependency variants checkpoint `16b31ea` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -264,3 +270,4 @@ unaccepted critical coverage gap.
 | `Q7` | `e0c3c03` | Three-repository mixed path, public fault coverage, query evidence propagation, focused Windows tests, production `-Werror` build and smoke pass; Linux sanitizers deferred |
 | `B1` | `720f6dc` | Blueprint string/list variables, `+`/`+=`, references, exact dependency golden check, production `-Werror` build and CLI smoke; Linux sanitizers deferred |
 | `B2` | `371b786` | Transitive defaults expansion, direct precedence, stable resolution, provenance, canonical cycle diagnostics, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B3` | `16b31ea` | Target/arch/multilib/product/Soong-config/select dependency variants, conditional defaults composition, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |

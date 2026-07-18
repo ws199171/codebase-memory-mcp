@@ -286,6 +286,29 @@ public starts fail without candidate selection, a missing shard rejects exact
 source reads, a Master/shard identity mismatch reports a stale catalog, and status
 retains the partial workspace's present/indexed/missing counts.
 
+## Build Namespace and Visibility Boundaries
+
+Blueprint modules carry their workspace-relative package and nearest enclosing
+`soong_namespace`. Unqualified dependencies resolve in deterministic tiers: the
+current namespace, imported namespaces, then the global namespace. Explicit
+`//namespace:module` references bypass those tiers. Multiple candidates in the
+selected tier remain unresolved as ambiguous; no repository-order fallback is
+allowed.
+
+Module visibility is taken from the module declaration, or from the closest
+ancestor package with `default_visibility`, with Soong's legacy-public default
+when neither is present. Public, private, `__pkg__`, and `__subpackages__` rules
+are evaluated against workspace-relative package paths. A blocked or unsupported
+visibility expression retains the declared dependency and structured failure
+evidence but does not create a `module_edge`.
+
+Master schema v8 stores explicit namespace declarations and imports in
+`build_namespaces`, and every discovered Blueprint package boundary plus its
+declared default visibility in `build_packages`. Module properties retain the
+effective namespace, imports, package, visibility, and visibility origin;
+dependency properties retain the resolution tier, candidate count, target
+namespace, matching visibility rule, or failure reason.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

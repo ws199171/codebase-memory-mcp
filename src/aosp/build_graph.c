@@ -46,6 +46,12 @@ typedef struct {
     int inheritance_depth;
     str_vec_t variants;
     bool unconditional;
+    char *resolved_target_id;
+    char *resolution;
+    char *target_namespace;
+    char *failure_reason;
+    char *visibility_rule;
+    int candidate_count;
 } dep_decl_t;
 
 typedef struct {
@@ -58,6 +64,14 @@ typedef struct {
     int defaults_state;
     char *defaults_cycle;
     char *compile_multilib;
+    char *package_path;
+    char *namespace_path;
+    char *visibility_origin;
+    char *visibility_source_package;
+    str_vec_t declared_visibility;
+    str_vec_t effective_visibility;
+    str_vec_t namespace_imports;
+    bool blueprint;
 } module_decl_t;
 
 typedef struct {
@@ -65,6 +79,18 @@ typedef struct {
     int count;
     int cap;
 } module_vec_t;
+
+typedef struct {
+    char *path;
+    char *file_path;
+    str_vec_t values;
+} scope_decl_t;
+
+typedef struct {
+    scope_decl_t *items;
+    int count;
+    int cap;
+} scope_vec_t;
 
 typedef struct {
     const char *source;
@@ -103,6 +129,8 @@ typedef struct {
     const cbm_aosp_workspace_t *workspace;
     const cbm_aosp_repo_t *repo;
     module_vec_t modules;
+    scope_vec_t namespaces;
+    scope_vec_t packages;
     cbm_aosp_build_stats_t stats;
     char *err;
     size_t err_size;
@@ -181,6 +209,57 @@ static bool str_vec_add_unique(str_vec_t *vec, const char *value) {
         if (strcmp(vec->items[i], value) == 0) return true;
     }
     return str_vec_add(vec, value);
+}
+
+static bool str_vec_copy(str_vec_t *dest, const str_vec_t *source) {
+    if (!dest || !source) return false;
+    str_vec_free(dest);
+    return str_vec_extend(dest, source);
+}
+
+static scope_decl_t *scope_vec_find(scope_vec_t *vec, const char *path) {
+    if (!vec || !path) return NULL;
+    for (int i = 0; i < vec->count; i++) {
+        if (strcmp(vec->items[i].path, path) == 0) return &vec->items[i];
+    }
+    return NULL;
+}
+
+static scope_decl_t *scope_vec_ensure(scope_vec_t *vec, const char *path,
+                                      const char *file_path) {
+    if (!vec || !path || !file_path) return NULL;
+    scope_decl_t *existing = scope_vec_find(vec, path);
+    if (existing) return existing;
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 16;
+        scope_decl_t *items = realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return NULL;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    scope_decl_t *decl = &vec->items[vec->count];
+    memset(decl, 0, sizeof(*decl));
+    decl->path = strdup(path);
+    decl->file_path = strdup(file_path);
+    if (!decl->path || !decl->file_path) {
+        free(decl->path);
+        free(decl->file_path);
+        memset(decl, 0, sizeof(*decl));
+        return NULL;
+    }
+    vec->count++;
+    return decl;
+}
+
+static void scope_vec_free(scope_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) {
+        free(vec->items[i].path);
+        free(vec->items[i].file_path);
+        str_vec_free(&vec->items[i].values);
+    }
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
 }
 
 static bp_var_t *bp_var_find(const bp_var_vec_t *vars, const char *name) {
@@ -344,11 +423,23 @@ static void module_free(module_decl_t *module) {
     free(module->file_path);
     free(module->defaults_cycle);
     free(module->compile_multilib);
+    free(module->package_path);
+    free(module->namespace_path);
+    free(module->visibility_origin);
+    free(module->visibility_source_package);
+    str_vec_free(&module->declared_visibility);
+    str_vec_free(&module->effective_visibility);
+    str_vec_free(&module->namespace_imports);
     for (int i = 0; i < module->dep_count; i++) {
         free(module->deps[i].name);
         free(module->deps[i].kind);
         free(module->deps[i].inherited_from);
         free(module->deps[i].inheritance_path);
+        free(module->deps[i].resolved_target_id);
+        free(module->deps[i].resolution);
+        free(module->deps[i].target_namespace);
+        free(module->deps[i].failure_reason);
+        free(module->deps[i].visibility_rule);
         str_vec_free(&module->deps[i].variants);
     }
     free(module->deps);
@@ -563,6 +654,18 @@ static bool record_bp_string(module_decl_t *module, const char *key, const char 
         module->compile_multilib = strdup(value);
         return module->compile_multilib != NULL;
     }
+    if (depth == 1 && key &&
+        (strcmp(key, "visibility") == 0 || strcmp(key, "defaults_visibility") == 0)) {
+        return str_vec_add_unique(&module->declared_visibility, value);
+    }
+    if (depth == 1 && key && strcmp(module->type, "package") == 0 &&
+        strcmp(key, "default_visibility") == 0) {
+        return str_vec_add_unique(&module->declared_visibility, value);
+    }
+    if (depth == 1 && key && strcmp(module->type, "soong_namespace") == 0 &&
+        strcmp(key, "imports") == 0) {
+        return str_vec_add_unique(&module->namespace_imports, value);
+    }
     const char *kind = dependency_kind(key);
     if (kind && strcmp(key, "imports") == 0 &&
         (!module->type || strcmp(module->type, "aidl_interface") != 0)) {
@@ -746,8 +849,36 @@ static bool parse_bp_value(parser_t *parser, module_decl_t *module, const bp_var
     return true;
 }
 
-static bool parse_blueprint(const char *source, size_t length, const char *file_path,
-                            module_vec_t *modules) {
+static char *workspace_dir_path(const cbm_aosp_repo_t *repo, const char *file_path) {
+    if (!repo || !repo->path || !file_path) return NULL;
+    const char *slash = strrchr(file_path, '/');
+    size_t dir_length = slash ? (size_t)(slash - file_path) : 0;
+    const char *repo_path = strcmp(repo->path, ".") == 0 ? "" : repo->path;
+    size_t repo_length = strlen(repo_path);
+    size_t size = repo_length + dir_length + (repo_length && dir_length ? 2 : 1);
+    char *path = malloc(size);
+    if (!path) return NULL;
+    if (repo_length && dir_length) {
+        (void)snprintf(path, size, "%s/%.*s", repo_path, (int)dir_length, file_path);
+    } else if (repo_length) {
+        (void)snprintf(path, size, "%s", repo_path);
+    } else if (dir_length) {
+        (void)snprintf(path, size, "%.*s", (int)dir_length, file_path);
+    } else {
+        path[0] = '\0';
+    }
+    return path;
+}
+
+static bool parse_blueprint(scan_ctx_t *ctx, const char *source, size_t length,
+                            const char *file_path) {
+    char *package_path = workspace_dir_path(ctx->repo, file_path);
+    if (!package_path) return false;
+    scope_decl_t *package = scope_vec_ensure(&ctx->packages, package_path, file_path);
+    if (!package) {
+        free(package_path);
+        return false;
+    }
     parser_t parser = {.lexer = {.source = source, .length = length}};
     bp_var_vec_t vars = {0};
     parser.current = lexer_next(&parser.lexer);
@@ -773,6 +904,7 @@ static bool parse_blueprint(const char *source, size_t length, const char *file_
             if (!ok) {
                 token_free(&parser.current);
                 bp_var_vec_free(&vars);
+                free(package_path);
                 return false;
             }
             continue;
@@ -782,18 +914,44 @@ static bool parse_blueprint(const char *source, size_t length, const char *file_
             continue;
         }
         parser_advance(&parser);
-        module_decl_t module = {.type = type, .file_path = strdup(file_path)};
+        module_decl_t module = {
+            .type = type,
+            .file_path = strdup(file_path),
+            .package_path = strdup(package_path),
+            .blueprint = true,
+        };
         if (!module.type || !module.file_path ||
-            !parse_bp_object(&parser, &module, &vars, "", 1) ||
-            !module_vec_add(modules, &module)) {
+            !module.package_path || !parse_bp_object(&parser, &module, &vars, "", 1)) {
             module_free(&module);
             token_free(&parser.current);
             bp_var_vec_free(&vars);
+            free(package_path);
+            return false;
+        }
+        bool ok = true;
+        if (strcmp(module.type, "package") == 0) {
+            ok = str_vec_copy(&package->values, &module.declared_visibility);
+            module_free(&module);
+        } else if (strcmp(module.type, "soong_namespace") == 0) {
+            scope_decl_t *namespace_decl =
+                scope_vec_ensure(&ctx->namespaces, package_path, file_path);
+            ok = namespace_decl &&
+                 str_vec_copy(&namespace_decl->values, &module.namespace_imports);
+            module_free(&module);
+        } else {
+            ok = module_vec_add(&ctx->modules, &module);
+        }
+        if (!ok) {
+            module_free(&module);
+            token_free(&parser.current);
+            bp_var_vec_free(&vars);
+            free(package_path);
             return false;
         }
     }
     token_free(&parser.current);
     bp_var_vec_free(&vars);
+    free(package_path);
     return true;
 }
 
@@ -998,43 +1156,305 @@ static bool module_stack_push(module_stack_t *stack, module_decl_t *module) {
     return true;
 }
 
-static module_decl_t *find_defaults_module(scan_ctx_t *contexts, int context_count,
-                                           scan_ctx_t *source_ctx, const char *name,
-                                           scan_ctx_t **target_ctx) {
-    if (target_ctx) *target_ctx = NULL;
-    module_decl_t *best = NULL;
-    char best_id[65] = {0};
-    for (int i = 0; source_ctx && i < source_ctx->modules.count; i++) {
-        if (strcmp(source_ctx->modules.items[i].name, name) == 0) {
-            char candidate_id[65];
-            module_id(source_ctx->repo, &source_ctx->modules.items[i], candidate_id);
-            if (!best || strcmp(candidate_id, best_id) < 0) {
-                best = &source_ctx->modules.items[i];
-                (void)memcpy(best_id, candidate_id, sizeof(best_id));
+static bool path_in_scope(const char *path, const char *scope) {
+    if (!path || !scope) return false;
+    if (!scope[0]) return true;
+    size_t length = strlen(scope);
+    return strncmp(path, scope, length) == 0 &&
+           (path[length] == '\0' || path[length] == '/');
+}
+
+static char *canonical_scope_path(const char *path) {
+    if (!path) return strdup("");
+    while (*path == '/') path++;
+    char *normalized = strdup(path);
+    if (!normalized) return NULL;
+    for (char *p = normalized; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    size_t length = strlen(normalized);
+    while (length && normalized[length - 1] == '/') normalized[--length] = '\0';
+    return normalized;
+}
+
+static scope_decl_t *find_nearest_scope(scan_ctx_t *contexts, int context_count,
+                                        bool namespaces, const char *path,
+                                        bool require_values) {
+    scope_decl_t *best = NULL;
+    size_t best_length = 0;
+    for (int c = 0; c < context_count; c++) {
+        scope_vec_t *vec = namespaces ? &contexts[c].namespaces : &contexts[c].packages;
+        for (int i = 0; i < vec->count; i++) {
+            scope_decl_t *candidate = &vec->items[i];
+            size_t length = strlen(candidate->path);
+            if ((!require_values || candidate->values.count > 0) &&
+                path_in_scope(path, candidate->path) && (!best || length > best_length)) {
+                best = candidate;
+                best_length = length;
             }
         }
     }
-    if (best) {
-        if (target_ctx) *target_ctx = source_ctx;
-        return best;
+    return best;
+}
+
+static bool copy_effective_visibility(module_decl_t *module, const str_vec_t *source) {
+    for (int i = 0; source && i < source->count; i++) {
+        if (strcmp(source->items[i], "//visibility:override") != 0 &&
+            !str_vec_add_unique(&module->effective_visibility, source->items[i])) {
+            return false;
+        }
     }
-    scan_ctx_t *best_ctx = NULL;
+    return true;
+}
+
+static bool finalize_module_scopes(scan_ctx_t *contexts, int context_count) {
     for (int c = 0; c < context_count; c++) {
-        if (&contexts[c] == source_ctx) continue;
         for (int i = 0; i < contexts[c].modules.count; i++) {
-            if (strcmp(contexts[c].modules.items[i].name, name) == 0) {
-                char candidate_id[65];
-                module_id(contexts[c].repo, &contexts[c].modules.items[i], candidate_id);
-                if (!best || strcmp(candidate_id, best_id) < 0) {
-                    best = &contexts[c].modules.items[i];
-                    best_ctx = &contexts[c];
-                    (void)memcpy(best_id, candidate_id, sizeof(best_id));
+            module_decl_t *module = &contexts[c].modules.items[i];
+            if (!module->package_path) {
+                module->package_path = workspace_dir_path(contexts[c].repo, module->file_path);
+                if (!module->package_path) return false;
+            }
+            scope_decl_t *namespace_decl = NULL;
+            if (module->blueprint) {
+                namespace_decl = find_nearest_scope(contexts, context_count, true,
+                                                    module->package_path, false);
+            }
+            module->namespace_path = strdup(namespace_decl ? namespace_decl->path : "");
+            if (!module->namespace_path ||
+                (namespace_decl && !str_vec_copy(&module->namespace_imports,
+                                                 &namespace_decl->values))) {
+                return false;
+            }
+            if (module->declared_visibility.count > 0) {
+                module->visibility_origin = strdup("module");
+                module->visibility_source_package = strdup(module->package_path);
+                if (!copy_effective_visibility(module, &module->declared_visibility)) return false;
+            } else {
+                scope_decl_t *package_decl =
+                    find_nearest_scope(contexts, context_count, false,
+                                       module->package_path, true);
+                if (package_decl) {
+                    module->visibility_origin = strdup("package_default");
+                    module->visibility_source_package = strdup(package_decl->path);
+                    if (!copy_effective_visibility(module, &package_decl->values)) return false;
+                } else {
+                    module->visibility_origin = strdup("legacy_public");
+                    module->visibility_source_package = strdup("");
+                    if (!str_vec_add(&module->effective_visibility,
+                                     "//visibility:legacy_public")) return false;
                 }
             }
+            if (!module->visibility_origin || !module->visibility_source_package) return false;
+            if (module->effective_visibility.count == 0 &&
+                !str_vec_add(&module->effective_visibility, "//visibility:private")) {
+                return false;
+            }
         }
     }
-    if (target_ctx) *target_ctx = best_ctx;
-    return best;
+    return true;
+}
+
+typedef enum {
+    MODULE_RESOLVED,
+    MODULE_NOT_FOUND,
+    MODULE_AMBIGUOUS,
+    MODULE_VISIBILITY_BLOCKED,
+    MODULE_UNSUPPORTED_VISIBILITY,
+} module_resolution_status_t;
+
+typedef struct {
+    module_resolution_status_t status;
+    scan_ctx_t *ctx;
+    module_decl_t *module;
+    const char *tier;
+    const char *visibility_rule;
+    int candidate_count;
+} module_resolution_t;
+
+typedef struct {
+    const char *namespace_path;
+    const char *name;
+    scan_ctx_t *ctx;
+    module_decl_t *module;
+} module_index_item_t;
+
+typedef struct {
+    module_index_item_t *items;
+    int count;
+} module_index_t;
+
+static int compare_module_index_item(const void *left, const void *right) {
+    const module_index_item_t *a = left;
+    const module_index_item_t *b = right;
+    int cmp = strcmp(a->namespace_path, b->namespace_path);
+    return cmp ? cmp : strcmp(a->name, b->name);
+}
+
+static bool build_module_index(scan_ctx_t *contexts, int context_count,
+                               module_index_t *index) {
+    int count = 0;
+    for (int c = 0; c < context_count; c++) count += contexts[c].modules.count;
+    index->items = calloc((size_t)count, sizeof(*index->items));
+    if (count > 0 && !index->items) return false;
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].modules.count; i++) {
+            module_decl_t *module = &contexts[c].modules.items[i];
+            module_index_item_t *item = &index->items[index->count++];
+            item->namespace_path = module->namespace_path;
+            item->name = module->name;
+            item->ctx = &contexts[c];
+            item->module = module;
+        }
+    }
+    if (index->count > 1) {
+        qsort(index->items, (size_t)index->count, sizeof(*index->items),
+              compare_module_index_item);
+    }
+    return true;
+}
+
+static int compare_module_key(const module_index_item_t *item,
+                              const char *namespace_path, const char *name) {
+    int cmp = strcmp(item->namespace_path, namespace_path);
+    return cmp ? cmp : strcmp(item->name, name);
+}
+
+static int collect_namespace_candidates(const module_index_t *index,
+                                        const char *namespace_path, const char *name,
+                                        scan_ctx_t **first_ctx, module_decl_t **first_module) {
+    int low = 0;
+    int high = index->count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (compare_module_key(&index->items[mid], namespace_path, name) < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    int count = 0;
+    for (int i = low; i < index->count &&
+                      compare_module_key(&index->items[i], namespace_path, name) == 0;
+         i++) {
+        if (count == 0) {
+            *first_ctx = index->items[i].ctx;
+            *first_module = index->items[i].module;
+        }
+        count++;
+    }
+    return count;
+}
+
+static int module_visibility_allows(const module_decl_t *source,
+                                    const module_decl_t *target,
+                                    const char **matching_rule) {
+    bool unsupported = false;
+    if (matching_rule) *matching_rule = NULL;
+    for (int i = 0; i < target->effective_visibility.count; i++) {
+        const char *rule = target->effective_visibility.items[i];
+        if (strcmp(rule, "//visibility:public") == 0 ||
+            strcmp(rule, "//visibility:legacy_public") == 0) {
+            if (matching_rule) *matching_rule = rule;
+            return 1;
+        }
+        if (strcmp(rule, "//visibility:private") == 0 ||
+            strcmp(rule, ":__pkg__") == 0) {
+            if (strcmp(source->package_path, target->package_path) == 0) {
+                if (matching_rule) *matching_rule = rule;
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(rule, ":__subpackages__") == 0) {
+            if (path_in_scope(source->package_path, target->package_path)) {
+                if (matching_rule) *matching_rule = rule;
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(rule, "//", 2) == 0) {
+            const char *colon = strrchr(rule + 2, ':');
+            if (colon &&
+                (strcmp(colon, ":__pkg__") == 0 ||
+                 strcmp(colon, ":__subpackages__") == 0)) {
+                char *scope = cbm_strndup(rule + 2, (size_t)(colon - (rule + 2)));
+                if (!scope) return -1;
+                bool allowed = strcmp(colon, ":__pkg__") == 0
+                                   ? strcmp(source->package_path, scope) == 0
+                                   : path_in_scope(source->package_path, scope);
+                free(scope);
+                if (allowed) {
+                    if (matching_rule) *matching_rule = rule;
+                    return 1;
+                }
+                continue;
+            }
+        }
+        unsupported = true;
+    }
+    return unsupported ? -1 : 0;
+}
+
+static module_resolution_t resolve_module_reference(const module_index_t *index,
+                                                    const module_decl_t *source,
+                                                    const char *reference) {
+    module_resolution_t result = {.status = MODULE_NOT_FOUND, .tier = "not_found"};
+    const char *name = reference;
+    char *explicit_scope = NULL;
+    if (strncmp(reference, "//", 2) == 0) {
+        const char *colon = strrchr(reference + 2, ':');
+        if (!colon || !colon[1]) return result;
+        explicit_scope = cbm_strndup(reference + 2,
+                                     (size_t)(colon - (reference + 2)));
+        if (!explicit_scope) return result;
+        name = colon + 1;
+        result.tier = "explicit_namespace";
+        result.candidate_count = collect_namespace_candidates(
+            index, explicit_scope, name, &result.ctx, &result.module);
+    } else {
+        result.tier = source->namespace_path[0] ? "current_namespace" : "global_namespace";
+        result.candidate_count = collect_namespace_candidates(
+            index, source->namespace_path, name, &result.ctx, &result.module);
+        if (result.candidate_count == 0 && source->namespace_path[0]) {
+            result.tier = "imported_namespace";
+            for (int i = 0; i < source->namespace_imports.count; i++) {
+                char *import_path = canonical_scope_path(source->namespace_imports.items[i]);
+                if (!import_path) continue;
+                scan_ctx_t *candidate_ctx = NULL;
+                module_decl_t *candidate = NULL;
+                int count = collect_namespace_candidates(index, import_path, name,
+                                                          &candidate_ctx, &candidate);
+                if (count > 0 && result.candidate_count == 0) {
+                    result.ctx = candidate_ctx;
+                    result.module = candidate;
+                }
+                result.candidate_count += count;
+                free(import_path);
+            }
+            if (result.candidate_count == 0) {
+                result.tier = "global_namespace";
+                result.candidate_count = collect_namespace_candidates(
+                    index, "", name, &result.ctx, &result.module);
+            }
+        }
+    }
+    free(explicit_scope);
+    if (result.candidate_count == 0) return result;
+    if (result.candidate_count > 1) {
+        result.status = MODULE_AMBIGUOUS;
+        return result;
+    }
+    int visibility = module_visibility_allows(source, result.module,
+                                              &result.visibility_rule);
+    if (visibility < 0) {
+        result.status = MODULE_UNSUPPORTED_VISIBILITY;
+    } else if (visibility == 0) {
+        result.status = MODULE_VISIBILITY_BLOCKED;
+    } else {
+        result.status = MODULE_RESOLVED;
+    }
+    return result;
 }
 
 static bool mark_defaults_cycle(module_stack_t *stack, module_decl_t *target) {
@@ -1074,8 +1494,7 @@ static bool mark_defaults_cycle(module_stack_t *stack, module_decl_t *target) {
     return true;
 }
 
-static bool expand_module_defaults(scan_ctx_t *contexts, int context_count,
-                                   scan_ctx_t *ctx, module_decl_t *module,
+static bool expand_module_defaults(const module_index_t *index, module_decl_t *module,
                                    module_stack_t *stack) {
     if (module->defaults_state == 2) return true;
     if (module->defaults_state == 1) return mark_defaults_cycle(stack, module);
@@ -1085,15 +1504,15 @@ static bool expand_module_defaults(scan_ctx_t *contexts, int context_count,
     for (int i = 0; i < direct_dep_count; i++) {
         dep_decl_t *defaults_dep = &module->deps[i];
         if (strcmp(defaults_dep->kind, "DEFAULTS") != 0) continue;
-        scan_ctx_t *target_ctx = NULL;
-        module_decl_t *target = find_defaults_module(contexts, context_count, ctx,
-                                                     defaults_dep->name, &target_ctx);
+        module_resolution_t resolution =
+            resolve_module_reference(index, module, defaults_dep->name);
+        module_decl_t *target = resolution.status == MODULE_RESOLVED ? resolution.module : NULL;
         if (!target) continue;
         if (target->defaults_state == 1) {
             if (!mark_defaults_cycle(stack, target)) return false;
             continue;
         }
-        if (!expand_module_defaults(contexts, context_count, target_ctx, target, stack)) return false;
+        if (!expand_module_defaults(index, target, stack)) return false;
         if (target->defaults_cycle && !module->defaults_cycle) {
             module->defaults_cycle = strdup(target->defaults_cycle);
             if (!module->defaults_cycle) return false;
@@ -1111,17 +1530,65 @@ static bool expand_module_defaults(scan_ctx_t *contexts, int context_count,
     return true;
 }
 
-static bool expand_all_defaults(scan_ctx_t *contexts, int context_count) {
+static bool expand_all_defaults(scan_ctx_t *contexts, int context_count,
+                                const module_index_t *index) {
     module_stack_t stack = {0};
     bool ok = true;
     for (int c = 0; c < context_count && ok; c++) {
         for (int i = 0; i < contexts[c].modules.count && ok; i++) {
-            ok = expand_module_defaults(contexts, context_count, &contexts[c],
-                                        &contexts[c].modules.items[i], &stack);
+            ok = expand_module_defaults(index, &contexts[c].modules.items[i], &stack);
         }
     }
     free(stack.items);
     return ok;
+}
+
+static const char *resolution_failure(module_resolution_status_t status) {
+    switch (status) {
+        case MODULE_NOT_FOUND: return "not_found";
+        case MODULE_AMBIGUOUS: return "ambiguous";
+        case MODULE_VISIBILITY_BLOCKED: return "visibility_blocked";
+        case MODULE_UNSUPPORTED_VISIBILITY: return "unsupported_visibility";
+        case MODULE_RESOLVED: return NULL;
+    }
+    return "not_found";
+}
+
+static bool resolve_all_dependencies(scan_ctx_t *contexts, int context_count,
+                                     const module_index_t *index) {
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].modules.count; i++) {
+            module_decl_t *module = &contexts[c].modules.items[i];
+            for (int d = 0; d < module->dep_count; d++) {
+                dep_decl_t *dep = &module->deps[d];
+                module_resolution_t result =
+                    resolve_module_reference(index, module, dep->name);
+                dep->candidate_count = result.candidate_count;
+                dep->resolution = strdup(result.tier ? result.tier : "not_found");
+                if (!dep->resolution) return false;
+                if (result.module && result.module->namespace_path) {
+                    dep->target_namespace = strdup(result.module->namespace_path);
+                    if (!dep->target_namespace) return false;
+                }
+                const char *failure = resolution_failure(result.status);
+                if (failure) {
+                    dep->failure_reason = strdup(failure);
+                    if (!dep->failure_reason) return false;
+                }
+                if (result.visibility_rule) {
+                    dep->visibility_rule = strdup(result.visibility_rule);
+                    if (!dep->visibility_rule) return false;
+                }
+                if (result.status == MODULE_RESOLVED) {
+                    char id[65];
+                    module_id(result.ctx->repo, result.module, id);
+                    dep->resolved_target_id = strdup(id);
+                    if (!dep->resolved_target_id) return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, int depth) {
@@ -1161,7 +1628,7 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
         bool ok;
         if (is_bp) {
             ctx->stats.blueprint_files++;
-            ok = parse_blueprint(source, length, rel_path, &ctx->modules);
+            ok = parse_blueprint(ctx, source, length, rel_path);
         } else if (is_mk) {
             ctx->stats.make_files++;
             ok = parse_android_mk(source, rel_path, &ctx->modules);
@@ -1200,7 +1667,6 @@ static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, 
 }
 
 static char *module_properties_json(const module_decl_t *module) {
-    if (!module->defaults_cycle && !module->compile_multilib) return strdup("{}");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) return NULL;
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1211,6 +1677,25 @@ static char *module_properties_json(const module_decl_t *module) {
     if (module->compile_multilib) {
         yyjson_mut_obj_add_strcpy(doc, root, "compile_multilib", module->compile_multilib);
     }
+    yyjson_mut_obj_add_strcpy(doc, root, "package", module->package_path ? module->package_path : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "namespace",
+                             module->namespace_path ? module->namespace_path : "");
+    yyjson_mut_val *imports = yyjson_mut_arr(doc);
+    for (int i = 0; i < module->namespace_imports.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, imports, module->namespace_imports.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "namespace_imports", imports);
+    yyjson_mut_obj_add_strcpy(doc, root, "visibility_origin",
+                             module->visibility_origin ? module->visibility_origin : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "visibility_source_package",
+                             module->visibility_source_package
+                                 ? module->visibility_source_package
+                                 : "");
+    yyjson_mut_val *visibility = yyjson_mut_arr(doc);
+    for (int i = 0; i < module->effective_visibility.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, visibility, module->effective_visibility.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "visibility", visibility);
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1236,6 +1721,32 @@ static char *dependency_properties_json(const dep_decl_t *dep) {
         yyjson_mut_arr_add_strcpy(doc, variants, dep->variants.items[i]);
     }
     yyjson_mut_obj_add_val(doc, root, "variants", variants);
+    yyjson_mut_obj_add_strcpy(doc, root, "resolution",
+                             dep->resolution ? dep->resolution : "not_found");
+    yyjson_mut_obj_add_int(doc, root, "candidate_count", dep->candidate_count);
+    if (dep->target_namespace) {
+        yyjson_mut_obj_add_strcpy(doc, root, "target_namespace", dep->target_namespace);
+    }
+    if (dep->failure_reason) {
+        yyjson_mut_obj_add_strcpy(doc, root, "failure_reason", dep->failure_reason);
+    }
+    if (dep->visibility_rule) {
+        yyjson_mut_obj_add_strcpy(doc, root, "visibility_rule", dep->visibility_rule);
+    }
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *string_array_json(const str_vec_t *values) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *array = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, array);
+    for (int i = 0; values && i < values->count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, array, values->items[i]);
+    }
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1258,6 +1769,8 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_stmt *stmt = NULL;
     sqlite3_stmt *insert_module = NULL;
     sqlite3_stmt *insert_dep = NULL;
+    sqlite3_stmt *insert_namespace = NULL;
+    sqlite3_stmt *insert_package = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
     const char *reset_sql =
         "DELETE FROM module_edges WHERE source_id IN "
@@ -1280,15 +1793,66 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_namespaces WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK)
+        goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_packages WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK)
+        goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR IGNORE INTO modules(module_id,workspace_id,repo_id,name,module_type,file_path,properties)"
             " VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_module, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type,properties) "
-            "VALUES(?1,?2,?3,?4);",
-            -1, &insert_dep, NULL) != SQLITE_OK) goto fail_insert;
+            "INSERT OR IGNORE INTO module_dependencies(source_id,target_name,type,target_id,resolved,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6);",
+            -1, &insert_dep, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_namespaces(workspace_id,namespace_path,repo_id,file_path,imports) "
+            "VALUES(?1,?2,?3,?4,?5);", -1, &insert_namespace, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_packages(workspace_id,package_path,repo_id,file_path,default_visibility) "
+            "VALUES(?1,?2,?3,?4,?5);", -1, &insert_package, NULL) != SQLITE_OK)
+        goto fail_insert;
     for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].namespaces.count; i++) {
+            scope_decl_t *decl = &contexts[c].namespaces.items[i];
+            char *imports = string_array_json(&decl->values);
+            if (!imports) goto fail_insert;
+            sqlite3_reset(insert_namespace);
+            sqlite3_clear_bindings(insert_namespace);
+            sqlite3_bind_text(insert_namespace, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_namespace, 2, decl->path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_namespace, 3, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_namespace, 4, decl->file_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_namespace, 5, imports, -1, SQLITE_TRANSIENT);
+            int namespace_step = sqlite3_step(insert_namespace);
+            free(imports);
+            if (namespace_step != SQLITE_DONE) goto fail_insert;
+        }
+        for (int i = 0; i < contexts[c].packages.count; i++) {
+            scope_decl_t *decl = &contexts[c].packages.items[i];
+            char *visibility = string_array_json(&decl->values);
+            if (!visibility) goto fail_insert;
+            sqlite3_reset(insert_package);
+            sqlite3_clear_bindings(insert_package);
+            sqlite3_bind_text(insert_package, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_package, 2, decl->path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_package, 3, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_package, 4, decl->file_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_package, 5, visibility, -1, SQLITE_TRANSIENT);
+            int package_step = sqlite3_step(insert_package);
+            free(visibility);
+            if (package_step != SQLITE_DONE) goto fail_insert;
+        }
         for (int i = 0; i < contexts[c].modules.count; i++) {
             module_decl_t *module = &contexts[c].modules.items[i];
             char id[65];
@@ -1313,9 +1877,17 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
                 sqlite3_bind_text(insert_dep, 1, id, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(insert_dep, 2, module->deps[d].name, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(insert_dep, 3, module->deps[d].kind, -1, SQLITE_TRANSIENT);
+                if (module->deps[d].resolved_target_id) {
+                    sqlite3_bind_text(insert_dep, 4, module->deps[d].resolved_target_id,
+                                      -1, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_null(insert_dep, 4);
+                }
+                sqlite3_bind_int(insert_dep, 5,
+                                 module->deps[d].resolved_target_id != NULL);
                 char *dep_properties = dependency_properties_json(&module->deps[d]);
                 if (!dep_properties) goto fail_insert;
-                sqlite3_bind_text(insert_dep, 4, dep_properties, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_dep, 6, dep_properties, -1, SQLITE_TRANSIENT);
                 int dep_step = sqlite3_step(insert_dep);
                 free(dep_properties);
                 if (dep_step != SQLITE_DONE) goto fail_insert;
@@ -1324,28 +1896,13 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     }
     sqlite3_finalize(insert_module);
     sqlite3_finalize(insert_dep);
+    sqlite3_finalize(insert_namespace);
+    sqlite3_finalize(insert_package);
     insert_module = NULL;
     insert_dep = NULL;
+    insert_namespace = NULL;
+    insert_package = NULL;
 
-    const char *resolve_sql =
-        "UPDATE module_dependencies SET target_id=(SELECT t.module_id FROM modules t "
-        "JOIN modules s ON s.module_id=module_dependencies.source_id "
-        "WHERE t.workspace_id=?1 AND t.name=module_dependencies.target_name "
-        "ORDER BY (t.repo_id=s.repo_id) DESC,t.module_id LIMIT 1) WHERE source_id IN "
-        "(SELECT module_id FROM modules WHERE workspace_id=?2);";
-    if (sqlite3_prepare_v2(db, resolve_sql, -1, &stmt, NULL) != SQLITE_OK) goto fail;
-    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "UPDATE module_dependencies SET resolved=(target_id IS NOT NULL) WHERE source_id IN "
-            "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK) goto fail;
-    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
-    sqlite3_finalize(stmt);
-    stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
             "SELECT source_id,target_id,type,properties FROM module_dependencies WHERE target_id IS NOT NULL "
@@ -1362,6 +1919,8 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
 fail_insert:
     sqlite3_finalize(insert_module);
     sqlite3_finalize(insert_dep);
+    sqlite3_finalize(insert_namespace);
+    sqlite3_finalize(insert_package);
 fail:
     sqlite3_finalize(reset);
     sqlite3_finalize(stmt);
@@ -1398,7 +1957,17 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "WHERE m.workspace_id=?1 AND json_array_length(d.properties,'$.variants')>0),"
         "(SELECT coalesce(sum(json_array_length(d.properties,'$.variants')),0) "
         "FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
-        "WHERE m.workspace_id=?1);";
+        "WHERE m.workspace_id=?1),"
+        "(SELECT count(*) FROM build_namespaces WHERE workspace_id=?1),"
+        "(SELECT coalesce(sum(json_array_length(imports)),0) FROM build_namespaces "
+        "WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM build_packages WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='ambiguous'),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='visibility_blocked'),"
+        "(SELECT count(*) FROM module_dependencies d JOIN modules m ON m.module_id=d.source_id "
+        "WHERE m.workspace_id=?1 AND json_extract(d.properties,'$.failure_reason')='unsupported_visibility');";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1414,6 +1983,12 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->defaults_cycle_count = sqlite3_column_int(stmt, 5);
             stats->variant_dependency_count = sqlite3_column_int(stmt, 6);
             stats->variant_branch_count = sqlite3_column_int(stmt, 7);
+            stats->namespace_count = sqlite3_column_int(stmt, 8);
+            stats->namespace_import_count = sqlite3_column_int(stmt, 9);
+            stats->package_count = sqlite3_column_int(stmt, 10);
+            stats->ambiguous_dependency_count = sqlite3_column_int(stmt, 11);
+            stats->visibility_blocked_count = sqlite3_column_int(stmt, 12);
+            stats->unsupported_visibility_count = sqlite3_column_int(stmt, 13);
             rc = 0;
         }
     }
@@ -1430,6 +2005,7 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
     if (!contexts) return -1;
     int rc = 0;
     cbm_aosp_build_stats_t file_stats = {0};
+    module_index_t module_index = {0};
     for (int i = 0; i < workspace->repo_count && rc == 0; i++) {
         contexts[i].workspace = workspace;
         contexts[i].repo = &workspace->repos[i];
@@ -1442,8 +2018,21 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
             file_stats.aidl_files += contexts[i].stats.aidl_files;
         }
     }
-    if (rc == 0 && !expand_all_defaults(contexts, workspace->repo_count)) {
+    if (rc == 0 && !finalize_module_scopes(contexts, workspace->repo_count)) {
+        bg_error(err, err_size, "cannot finalize AOSP build scopes", "out of memory");
+        rc = -1;
+    }
+    if (rc == 0 && !build_module_index(contexts, workspace->repo_count, &module_index)) {
+        bg_error(err, err_size, "cannot index AOSP build modules", "out of memory");
+        rc = -1;
+    }
+    if (rc == 0 && !expand_all_defaults(contexts, workspace->repo_count, &module_index)) {
         bg_error(err, err_size, "cannot expand AOSP defaults", "out of memory");
+        rc = -1;
+    }
+    if (rc == 0 &&
+        !resolve_all_dependencies(contexts, workspace->repo_count, &module_index)) {
+        bg_error(err, err_size, "cannot resolve AOSP module dependencies", "out of memory");
         rc = -1;
     }
     if (rc == 0) rc = persist_build_graph(workspace, contexts, workspace->repo_count, err, err_size);
@@ -1453,7 +2042,12 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         stats->make_files = file_stats.make_files;
         stats->aidl_files = file_stats.aidl_files;
     }
-    for (int i = 0; i < workspace->repo_count; i++) module_vec_free(&contexts[i].modules);
+    for (int i = 0; i < workspace->repo_count; i++) {
+        module_vec_free(&contexts[i].modules);
+        scope_vec_free(&contexts[i].namespaces);
+        scope_vec_free(&contexts[i].packages);
+    }
+    free(module_index.items);
     free(contexts);
     return rc;
 }

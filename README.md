@@ -579,7 +579,12 @@ The shard contains the complete graph produced for that repository. The Master
 provides manifest topology, index state, global definition-symbol lookup, and a
 workspace build graph extracted from Soong `Android.bp`, `Android.mk`, and AIDL
 declarations. Declared dependencies are retained even when their target cannot
-be resolved, so architecture coverage remains visible. The protocol linker maps
+be resolved, so architecture coverage remains visible. Blueprint resolution
+models `soong_namespace` imports, explicit `//namespace:module` references,
+package boundaries, inherited `default_visibility`, and module visibility.
+Ambiguous imports, blocked visibility, unsupported visibility expressions, and
+missing targets remain queryable as unresolved declarations instead of being
+silently linked. The protocol linker maps
 AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy`
 symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
 registration tables. Each protocol edge records its confidence and evidence;
@@ -616,7 +621,7 @@ implementation, annotation, call, and usage relationships.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
-| `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules and workspace dependency coverage. |
+| `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules, namespace/package boundaries, and dependency coverage. |
 | `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |

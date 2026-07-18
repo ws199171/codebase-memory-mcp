@@ -14,6 +14,12 @@ typedef struct {
     int defaults_cycle_count;
     int variant_dependency_count;
     int variant_branch_count;
+    int namespace_count;
+    int namespace_import_count;
+    int package_count;
+    int ambiguous_dependency_count;
+    int visibility_blocked_count;
+    int unsupported_visibility_count;
     int blueprint_files;
     int make_files;
     int aidl_files;

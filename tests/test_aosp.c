@@ -249,6 +249,62 @@ static int create_variants_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_build_boundaries_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_boundaries_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "global") != 0 ||
+        make_dir(root, "vendor/one") != 0 || make_dir(root, "vendor/two") != 0 ||
+        make_dir(root, "app/client/sub") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"platform/global\" path=\"global\"/>"
+            "<project name=\"vendor/one\" path=\"vendor/one\"/>"
+            "<project name=\"vendor/two\" path=\"vendor/two\"/>"
+            "<project name=\"platform/client\" path=\"app/client\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "global/Android.bp",
+            "cc_library { name: \"libglobal\", visibility: [\"//visibility:public\"] }\n") != 0 ||
+        write_relative(root, "vendor/one/Android.bp",
+            "soong_namespace {}\n"
+            "cc_library { name: \"libsame\", visibility: [\"//visibility:public\"] }\n"
+            "cc_library { name: \"libduplicate\", visibility: [\"//visibility:public\"] }\n"
+            "cc_library { name: \"libprivate\", visibility: [\"//visibility:private\"] }\n"
+            "cc_library { name: \"libpackage\", visibility: [\"//app/client:__pkg__\"] }\n"
+            "cc_library { name: \"libsub\", visibility: [\"//app/client:__subpackages__\"] }\n"
+            "cc_library { name: \"libunknown\", visibility: [\"//visibility:any_partition\"] }\n") != 0 ||
+        write_relative(root, "vendor/two/Android.bp",
+            "soong_namespace {}\n"
+            "cc_library { name: \"libsame\", visibility: [\"//visibility:public\"] }\n"
+            "cc_library { name: \"libduplicate\", visibility: [\"//visibility:public\"] }\n"
+            "cc_library { name: \"libqualified\", visibility: [\"//visibility:public\"] }\n") != 0 ||
+        write_relative(root, "app/client/Android.bp",
+            "soong_namespace { imports: [\"vendor/one\", \"vendor/two\"] }\n"
+            "package { default_visibility: [\"//visibility:private\"] }\n"
+            "cc_library { name: \"libsame\" }\n"
+            "cc_library {\n"
+            "  name: \"libconsumer\",\n"
+            "  shared_libs: [\n"
+            "    \"libglobal\", \"libsame\", \"libduplicate\", \"libprivate\",\n"
+            "    \"libpackage\", \"libsub\", \"libunknown\",\n"
+            "    \"//vendor/two:libqualified\", \"libmissing\",\n"
+            "  ],\n"
+            "}\n") != 0 ||
+        write_relative(root, "app/client/sub/Android.bp",
+            "cc_library { name: \"libsubconsumer\", "
+            "shared_libs: [\"libpackage\", \"libsub\"] }\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1870,6 +1926,181 @@ TEST(aosp_build_graph_models_conditional_variants) {
     PASS();
 }
 
+TEST(aosp_build_graph_models_namespaces_packages_and_visibility) {
+    char *root = NULL;
+    ASSERT_EQ(create_build_boundaries_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.blueprint_files, 5);
+    ASSERT_EQ(stats.module_count, 13);
+    ASSERT_EQ(stats.dependency_count, 11);
+    ASSERT_EQ(stats.resolved_count, 6);
+    ASSERT_EQ(stats.unresolved_count, 5);
+    ASSERT_EQ(stats.namespace_count, 3);
+    ASSERT_EQ(stats.namespace_import_count, 2);
+    ASSERT_EQ(stats.package_count, 5);
+    ASSERT_EQ(stats.ambiguous_dependency_count, 1);
+    ASSERT_EQ(stats.visibility_blocked_count, 2);
+    ASSERT_EQ(stats.unsupported_visibility_count, 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(namespace_path,',') FROM ("
+                  "SELECT namespace_path FROM build_namespaces WHERE workspace_id=?1 "
+                  "ORDER BY namespace_path);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "app/client,vendor/one,vendor/two");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT imports FROM build_namespaces WHERE workspace_id=?1 "
+                  "AND namespace_path='app/client';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "[\"vendor/one\",\"vendor/two\"]");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.package'),"
+                  "json_extract(properties,'$.namespace'),"
+                  "json_extract(properties,'$.visibility_origin'),"
+                  "json_extract(properties,'$.visibility_source_package'),"
+                  "json_extract(properties,'$.visibility[0]') FROM modules "
+                  "WHERE workspace_id=?1 AND name='libsubconsumer';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "app/client/sub");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "app/client");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "package_default");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "app/client");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), "//visibility:private");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT d.resolved,json_extract(t.properties,'$.namespace'),"
+                  "json_extract(d.properties,'$.resolution') "
+                  "FROM module_dependencies d JOIN modules s ON s.module_id=d.source_id "
+                  "LEFT JOIN modules t ON t.module_id=d.target_id "
+                  "WHERE s.workspace_id=?1 AND s.name='libconsumer' "
+                  "AND d.target_name='libsame';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_TRUE(sqlite3_column_int(stmt, 0));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "app/client");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "current_namespace");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT resolved,json_extract(properties,'$.failure_reason'),"
+                  "json_extract(properties,'$.candidate_count'),"
+                  "json_extract(properties,'$.resolution') FROM module_dependencies "
+                  "WHERE source_id=(SELECT module_id FROM modules WHERE workspace_id=?1 "
+                  "AND name='libconsumer') AND target_name='libduplicate';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_FALSE(sqlite3_column_int(stmt, 0));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "ambiguous");
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), 2);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "imported_namespace");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.failure_reason'),"
+                  "json_extract(properties,'$.target_namespace') FROM module_dependencies "
+                  "WHERE source_id=(SELECT module_id FROM modules WHERE workspace_id=?1 "
+                  "AND name='libconsumer') AND target_name='libprivate';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "visibility_blocked");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "vendor/one");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.failure_reason') FROM module_dependencies "
+                  "WHERE source_id=(SELECT module_id FROM modules WHERE workspace_id=?1 "
+                  "AND name='libconsumer') AND target_name='libunknown';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "unsupported_visibility");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.resolution'),"
+                  "json_extract(properties,'$.visibility_rule') FROM module_dependencies "
+                  "WHERE source_id=(SELECT module_id FROM modules WHERE workspace_id=?1 "
+                  "AND name='libconsumer') AND target_name='//vendor/two:libqualified';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "explicit_namespace");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "//visibility:public");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(properties,'$.failure_reason') FROM module_dependencies "
+                  "WHERE source_id=(SELECT module_id FROM modules WHERE workspace_id=?1 "
+                  "AND name='libsubconsumer') AND target_name='libpackage';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "visibility_blocked");
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"libconsumer\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"namespaces\":3"));
+    ASSERT_NOT_NULL(strstr(response, "\"namespace_imports\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"packages\":5"));
+    ASSERT_NOT_NULL(strstr(response, "\"dependencies_ambiguous\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"dependencies_visibility_blocked\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"dependencies_unsupported_visibility\":1"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2994,6 +3225,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_resolves_cross_repo_modules);
     RUN_TEST(aosp_build_graph_expands_defaults_with_provenance_and_cycles);
     RUN_TEST(aosp_build_graph_models_conditional_variants);
+    RUN_TEST(aosp_build_graph_models_namespaces_packages_and_visibility);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

@@ -651,7 +651,8 @@ static const tool_def_t TOOLS[] = {
 
     {"aosp_get_architecture", "Get AOSP architecture",
      "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
-     "counts and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
+     "counts, Soong namespaces, package visibility boundaries, and matching "
+     "Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Optional module name/type filter\"},"
@@ -8467,6 +8468,15 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "variant_dependencies",
                            stats.variant_dependency_count);
     yyjson_mut_obj_add_int(doc, root, "variant_branches", stats.variant_branch_count);
+    yyjson_mut_obj_add_int(doc, root, "namespaces", stats.namespace_count);
+    yyjson_mut_obj_add_int(doc, root, "namespace_imports", stats.namespace_import_count);
+    yyjson_mut_obj_add_int(doc, root, "packages", stats.package_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_ambiguous",
+                           stats.ambiguous_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_visibility_blocked",
+                           stats.visibility_blocked_count);
+    yyjson_mut_obj_add_int(doc, root, "dependencies_unsupported_visibility",
+                           stats.unsupported_visibility_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

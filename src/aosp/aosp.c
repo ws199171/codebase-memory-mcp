@@ -691,6 +691,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(1,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(3,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(8,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -712,6 +713,14 @@ static const char *AOSP_SCHEMA =
     " target_id TEXT, resolved INTEGER NOT NULL DEFAULT 0, properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_id,target_name,type));"
     "CREATE INDEX IF NOT EXISTS idx_aosp_module_deps_target ON module_dependencies(target_name);"
+    "CREATE TABLE IF NOT EXISTS build_namespaces("
+    " workspace_id TEXT NOT NULL,namespace_path TEXT NOT NULL,repo_id TEXT NOT NULL,"
+    " file_path TEXT NOT NULL,imports TEXT NOT NULL DEFAULT '[]',"
+    " PRIMARY KEY(workspace_id,namespace_path));"
+    "CREATE TABLE IF NOT EXISTS build_packages("
+    " workspace_id TEXT NOT NULL,package_path TEXT NOT NULL,repo_id TEXT NOT NULL,"
+    " file_path TEXT NOT NULL,default_visibility TEXT NOT NULL DEFAULT '[]',"
+    " PRIMARY KEY(workspace_id,package_path));"
     "CREATE TABLE IF NOT EXISTS symbols("
     " id INTEGER PRIMARY KEY, global_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " local_node_id INTEGER, name TEXT NOT NULL, qualified_name TEXT NOT NULL, label TEXT NOT NULL,"
@@ -3480,6 +3489,13 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.inherited_dependency_count, stats.defaults_cycle_count);
             printf("  variants: %d conditional dependencies, %d branches\n",
                    stats.variant_dependency_count, stats.variant_branch_count);
+            printf("  boundaries: %d namespaces (%d imports), %d packages\n",
+                   stats.namespace_count, stats.namespace_import_count,
+                   stats.package_count);
+            printf("  rejected: %d ambiguous, %d visibility blocked, "
+                   "%d unsupported visibility\n",
+                   stats.ambiguous_dependency_count, stats.visibility_blocked_count,
+                   stats.unsupported_visibility_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;
