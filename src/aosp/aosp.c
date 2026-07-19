@@ -3728,8 +3728,9 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.binder_services, stats.binder_service_registrations,
                    stats.binder_service_lookups, stats.binder_service_waits,
                    stats.binder_service_server_links, stats.binder_service_interface_links);
-            printf("  JNI: %d static, %d dynamic edges\n",
-                   stats.jni_static_edges, stats.jni_dynamic_edges);
+            printf("  JNI: %d static, %d dynamic, %d overload, %d helper edges\n",
+                   stats.jni_static_edges, stats.jni_dynamic_edges,
+                   stats.jni_overload_edges, stats.jni_registration_helper_edges);
             printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);
         }
     } else if (strcmp(action, "federate") == 0) {

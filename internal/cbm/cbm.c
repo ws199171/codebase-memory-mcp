@@ -1069,6 +1069,84 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
     return buf;
 }
 
+static const char *cbm_jvm_overload_qn(CBMArena *arena, const CBMDefinition *def) {
+    size_t size = strlen(def->qualified_name) + 3;
+    if (def->param_types) {
+        for (int i = 0; def->param_types[i]; i++) {
+            size += strlen(def->param_types[i]) + 1;
+        }
+    } else if (def->signature) {
+        size += strlen(def->signature);
+    }
+    char *qn = cbm_arena_alloc(arena, size);
+    if (!qn) {
+        return def->qualified_name;
+    }
+    size_t pos = (size_t)snprintf(qn, size, "%s(", def->qualified_name);
+    if (def->param_types) {
+        for (int i = 0; def->param_types[i]; i++) {
+            if (i > 0 && pos + 1 < size) {
+                qn[pos++] = ',';
+            }
+            for (const char *p = def->param_types[i]; *p && pos + 1 < size; p++) {
+                if (!isspace((unsigned char)*p)) {
+                    qn[pos++] = *p;
+                }
+            }
+        }
+    } else if (def->signature) {
+        const char *begin = def->signature;
+        const char *end = begin + strlen(begin);
+        if (*begin == '(' && end > begin && end[-1] == ')') {
+            begin++;
+            end--;
+        }
+        for (const char *p = begin; p < end && pos + 1 < size; p++) {
+            if (!isspace((unsigned char)*p)) {
+                qn[pos++] = *p;
+            }
+        }
+    }
+    if (pos + 1 < size) {
+        qn[pos++] = ')';
+    }
+    qn[pos] = '\0';
+    return qn;
+}
+
+static void cbm_disambiguate_jvm_method_qns(CBMFileResult *result, CBMLanguage language) {
+    if (!result || (language != CBM_LANG_JAVA && language != CBM_LANG_KOTLIN)) {
+        return;
+    }
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        if (!def->qualified_name || !def->label || strcmp(def->label, "Method") != 0) {
+            continue;
+        }
+        const char *base_qn = def->qualified_name;
+        bool duplicate = false;
+        for (int j = i + 1; j < result->defs.count; j++) {
+            const CBMDefinition *other = &result->defs.items[j];
+            if (other->qualified_name && other->label && strcmp(other->label, "Method") == 0 &&
+                strcmp(base_qn, other->qualified_name) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            def->qualified_name = cbm_jvm_overload_qn(&result->arena, def);
+            for (int j = i + 1; j < result->defs.count; j++) {
+                CBMDefinition *other = &result->defs.items[j];
+                if (other->qualified_name && other->label &&
+                    strcmp(other->label, "Method") == 0 &&
+                    strcmp(base_qn, other->qualified_name) == 0) {
+                    other->qualified_name = cbm_jvm_overload_qn(&result->arena, other);
+                }
+            }
+        }
+    }
+}
+
 /* Public entry: run the extraction and journal completion. The DONE mark on
  * every ordinary return (including error/timeout results) tells the crash
  * supervisor this file did NOT kill the worker — only a file whose S has no
@@ -1516,6 +1594,12 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
 
     result->imports_count = result->imports.count;
+
+    /* The graph store keys nodes by qualified name. Preserve JVM overloads as
+     * distinct nodes without changing the long-standing QN of non-overloaded
+     * methods. This runs after per-file LSP so its overload registry can keep
+     * using the shared Class.method lookup key. */
+    cbm_disambiguate_jvm_method_qns(result, language);
 
     // Accumulate profiling counters
     atomic_fetch_add(&total_parse_ns, t1 - t0);

@@ -3063,6 +3063,25 @@ static void add_dedup_type(CBMArena *a, const char **types, int *count, char *ty
     types[(*count)++] = cleaned;
 }
 
+// JVM method signatures are positional: primitives and repeated types must be
+// retained so overload identity and descriptor matching remain exact.
+static void add_jvm_param_type(CBMArena *a, const char **types, int *count, char *type_text) {
+    if (!type_text || !type_text[0]) {
+        return;
+    }
+    const char *begin = type_text;
+    while (*begin && isspace((unsigned char)*begin)) {
+        begin++;
+    }
+    const char *end = begin + strlen(begin);
+    while (end > begin && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    if (end > begin) {
+        types[(*count)++] = cbm_arena_strndup(a, begin, (size_t)(end - begin));
+    }
+}
+
 static const char **extract_param_types(CBMArena *a, TSNode params, const char *source,
                                         CBMLanguage lang) {
     if (ts_node_is_null(params)) {
@@ -3078,7 +3097,12 @@ static const char **extract_param_types(CBMArena *a, TSNode params, const char *
         if (ts_node_is_null(param) || !ts_node_is_named(param)) {
             continue;
         }
-        add_dedup_type(a, types, &count, resolve_param_type_text(a, param, source, lang));
+        char *type_text = resolve_param_type_text(a, param, source, lang);
+        if (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN) {
+            add_jvm_param_type(a, types, &count, type_text);
+        } else {
+            add_dedup_type(a, types, &count, type_text);
+        }
     }
 
     if (count == 0) {

@@ -1506,11 +1506,356 @@ static int find_dynamic_class(const char *source, char *out, size_t out_size) {
     return -1;
 }
 
+typedef enum {
+    JNI_SIGNATURE_MISMATCH,
+    JNI_SIGNATURE_UNKNOWN,
+    JNI_SIGNATURE_MATCH,
+} jni_signature_match_t;
+
+static bool jni_class_matches(const char *qualified_name, const char *class_name) {
+    if (!qualified_name || !class_name || !class_name[0]) return true;
+    char normalized[PG_PATH_MAX];
+    (void)snprintf(normalized, sizeof(normalized), "%s", class_name);
+    for (char *p = normalized; *p; p++) if (*p == '/') *p = '.';
+    if (contains_class_token(qualified_name, normalized)) return true;
+    for (char *p = normalized; *p; p++) if (*p == '$') *p = '.';
+    return contains_class_token(qualified_name, normalized);
+}
+
+static bool jni_signature_arguments(const char *signature, const char **begin,
+                                    const char **end) {
+    if (!signature || !signature[0]) return false;
+    if (signature[0] == '(') {
+        const char *close = strchr(signature + 1, ')');
+        if (!close) return false;
+        *begin = signature + 1;
+        *end = close;
+        return true;
+    }
+    *begin = signature;
+    *end = signature + strlen(signature);
+    return true;
+}
+
+static bool jni_signature_is_valid(const char *signature) {
+    const char *cursor = NULL;
+    const char *end = NULL;
+    if (!jni_signature_arguments(signature, &cursor, &end)) return false;
+    while (cursor < end) {
+        while (cursor < end && *cursor == '[') cursor++;
+        if (cursor >= end || *cursor == 'V') return false;
+        if (strchr("ZBCSIJFD", *cursor)) {
+            cursor++;
+        } else if (*cursor == 'L') {
+            const char *object_end = memchr(cursor + 1, ';',
+                                            (size_t)(end - cursor - 1));
+            if (!object_end || object_end == cursor + 1) return false;
+            cursor = object_end + 1;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *jni_type_leaf(const char *begin, const char *end) {
+    const char *leaf = begin;
+    for (const char *p = begin; p < end; p++) {
+        if (*p == '/' || *p == '.' || *p == '$') leaf = p + 1;
+    }
+    return leaf;
+}
+
+static bool jni_java_type_matches(const char *java_type, const char **descriptor,
+                                  const char *descriptor_end) {
+    if (!java_type || !descriptor || !*descriptor || *descriptor >= descriptor_end) return false;
+    char normalized[1024];
+    size_t written = 0;
+    int generic_depth = 0;
+    for (const char *p = java_type; *p && written + 1 < sizeof(normalized); p++) {
+        if (*p == '<') {
+            generic_depth++;
+        } else if (*p == '>' && generic_depth > 0) {
+            generic_depth--;
+        } else if (generic_depth == 0 && !isspace((unsigned char)*p)) {
+            normalized[written++] = *p;
+        }
+    }
+    normalized[written] = '\0';
+    int java_arrays = 0;
+    while (written >= 2 && normalized[written - 2] == '[' &&
+           normalized[written - 1] == ']') {
+        written -= 2;
+        normalized[written] = '\0';
+        java_arrays++;
+    }
+    if (written >= 3 && strcmp(normalized + written - 3, "...") == 0) {
+        written -= 3;
+        normalized[written] = '\0';
+        java_arrays++;
+    }
+    int descriptor_arrays = 0;
+    const char *cursor = *descriptor;
+    while (cursor < descriptor_end && *cursor == '[') {
+        descriptor_arrays++;
+        cursor++;
+    }
+    if (java_arrays != descriptor_arrays || cursor >= descriptor_end) return false;
+
+    struct primitive_type {
+        const char *name;
+        char descriptor;
+    };
+    static const struct primitive_type primitives[] = {
+        {"boolean", 'Z'}, {"byte", 'B'}, {"char", 'C'}, {"short", 'S'},
+        {"int", 'I'}, {"long", 'J'}, {"float", 'F'}, {"double", 'D'},
+        {"void", 'V'},
+    };
+    for (size_t i = 0; i < sizeof(primitives) / sizeof(primitives[0]); i++) {
+        if (strcmp(normalized, primitives[i].name) == 0) {
+            if (*cursor != primitives[i].descriptor) return false;
+            *descriptor = cursor + 1;
+            return true;
+        }
+    }
+    if (*cursor != 'L') return false;
+    const char *object_end = memchr(cursor + 1, ';', (size_t)(descriptor_end - cursor - 1));
+    if (!object_end) return false;
+    const char *descriptor_leaf = jni_type_leaf(cursor + 1, object_end);
+    const char *java_begin = normalized;
+    while (*java_begin == '?' || *java_begin == '@') java_begin++;
+    const char *java_end = normalized + strlen(normalized);
+    const char *java_leaf = jni_type_leaf(java_begin, java_end);
+    size_t descriptor_leaf_length = (size_t)(object_end - descriptor_leaf);
+    size_t java_leaf_length = (size_t)(java_end - java_leaf);
+    if (descriptor_leaf_length != java_leaf_length ||
+        strncmp(descriptor_leaf, java_leaf, java_leaf_length) != 0) return false;
+    *descriptor = object_end + 1;
+    return true;
+}
+
+static void jni_trim_span(const char **begin, const char **end) {
+    while (*begin < *end && isspace((unsigned char)**begin)) (*begin)++;
+    while (*end > *begin && isspace((unsigned char)(*end)[-1])) (*end)--;
+}
+
+static bool jni_java_parameter_type(const char *begin, const char *end,
+                                    char *out, size_t out_size) {
+    jni_trim_span(&begin, &end);
+    if (begin >= end || out_size == 0) return false;
+
+    /* Kotlin writes name:type; Java writes type name. Prefer a top-level colon
+     * when present, then use Java's final top-level whitespace separator. */
+    int angle_depth = 0;
+    int paren_depth = 0;
+    const char *colon = NULL;
+    for (const char *p = begin; p < end; p++) {
+        if (*p == '<') angle_depth++;
+        else if (*p == '>' && angle_depth > 0) angle_depth--;
+        else if (*p == '(') paren_depth++;
+        else if (*p == ')' && paren_depth > 0) paren_depth--;
+        else if (*p == ':' && angle_depth == 0 && paren_depth == 0) colon = p;
+    }
+    if (colon) {
+        begin = colon + 1;
+        jni_trim_span(&begin, &end);
+        angle_depth = 0;
+        for (const char *p = begin; p < end; p++) {
+            if (*p == '<') angle_depth++;
+            else if (*p == '>' && angle_depth > 0) angle_depth--;
+            else if (*p == '=' && angle_depth == 0) {
+                end = p;
+                break;
+            }
+        }
+        jni_trim_span(&begin, &end);
+    } else {
+        /* Remove Java parameter annotations and modifiers before separating
+         * the declared type from the parameter name. */
+        for (;;) {
+            while (begin < end && isspace((unsigned char)*begin)) begin++;
+            if (begin < end && *begin == '@') {
+                begin++;
+                while (begin < end &&
+                       (isalnum((unsigned char)*begin) || *begin == '_' || *begin == '.' ||
+                        *begin == '$')) begin++;
+                while (begin < end && isspace((unsigned char)*begin)) begin++;
+                if (begin < end && *begin == '(') {
+                    int depth = 1;
+                    begin++;
+                    while (begin < end && depth > 0) {
+                        if (*begin == '(') depth++;
+                        else if (*begin == ')') depth--;
+                        begin++;
+                    }
+                }
+                continue;
+            }
+            const char *word_end = begin;
+            while (word_end < end && isalpha((unsigned char)*word_end)) word_end++;
+            size_t word_len = (size_t)(word_end - begin);
+            bool modifier = (word_len == 5 && strncmp(begin, "final", 5) == 0) ||
+                            (word_len == 8 && strncmp(begin, "volatile", 8) == 0) ||
+                            (word_len == 9 && strncmp(begin, "transient", 9) == 0) ||
+                            (word_len == 6 && strncmp(begin, "vararg", 6) == 0);
+            if (!modifier) break;
+            begin = word_end;
+        }
+        jni_trim_span(&begin, &end);
+        const char *last_space = NULL;
+        angle_depth = 0;
+        paren_depth = 0;
+        for (const char *p = begin; p < end; p++) {
+            if (*p == '<') angle_depth++;
+            else if (*p == '>' && angle_depth > 0) angle_depth--;
+            else if (*p == '(') paren_depth++;
+            else if (*p == ')' && paren_depth > 0) paren_depth--;
+            else if (isspace((unsigned char)*p) && angle_depth == 0 && paren_depth == 0) {
+                last_space = p;
+            }
+        }
+        if (last_space) {
+            const char *name = last_space;
+            while (name < end && isspace((unsigned char)*name)) name++;
+            const char *suffix = name;
+            while (suffix < end &&
+                   (isalnum((unsigned char)*suffix) || *suffix == '_' || *suffix == '$')) suffix++;
+            const char *type_end = last_space;
+            jni_trim_span(&begin, &type_end);
+            size_t type_len = (size_t)(type_end - begin);
+            size_t suffix_len = (size_t)(end - suffix);
+            if (type_len + suffix_len + 1 > out_size) return false;
+            memcpy(out, begin, type_len);
+            memcpy(out + type_len, suffix, suffix_len);
+            out[type_len + suffix_len] = '\0';
+            return type_len > 0;
+        }
+    }
+
+    size_t length = (size_t)(end - begin);
+    if (length == 0 || length + 1 > out_size) return false;
+    memcpy(out, begin, length);
+    out[length] = '\0';
+    return true;
+}
+
+static jni_signature_match_t jni_java_signature_text_matches(const char *signature,
+                                                             const char *jni_signature) {
+    if (!signature) return JNI_SIGNATURE_UNKNOWN;
+    const char *begin = signature;
+    const char *end = signature + strlen(signature);
+    jni_trim_span(&begin, &end);
+    if (end - begin < 2 || *begin != '(' || end[-1] != ')') return JNI_SIGNATURE_UNKNOWN;
+    begin++;
+    end--;
+
+    const char *descriptor = NULL;
+    const char *descriptor_end = NULL;
+    if (!jni_signature_arguments(jni_signature, &descriptor, &descriptor_end)) {
+        return JNI_SIGNATURE_MISMATCH;
+    }
+    const char *parameter = begin;
+    int angle_depth = 0;
+    int paren_depth = 0;
+    for (const char *p = begin; p <= end; p++) {
+        bool at_end = p == end;
+        if (!at_end) {
+            if (*p == '<') angle_depth++;
+            else if (*p == '>' && angle_depth > 0) angle_depth--;
+            else if (*p == '(') paren_depth++;
+            else if (*p == ')' && paren_depth > 0) paren_depth--;
+        }
+        if (at_end || (*p == ',' && angle_depth == 0 && paren_depth == 0)) {
+            const char *param_end = p;
+            jni_trim_span(&parameter, &param_end);
+            if (parameter < param_end) {
+                char java_type[1024];
+                if (!jni_java_parameter_type(parameter, param_end, java_type,
+                                              sizeof(java_type)) ||
+                    !jni_java_type_matches(java_type, &descriptor, descriptor_end)) {
+                    return JNI_SIGNATURE_MISMATCH;
+                }
+            } else if (!at_end) {
+                return JNI_SIGNATURE_UNKNOWN;
+            }
+            parameter = p + 1;
+        }
+    }
+    return descriptor == descriptor_end ? JNI_SIGNATURE_MATCH : JNI_SIGNATURE_MISMATCH;
+}
+
+static jni_signature_match_t jni_java_signature_matches(const char *properties,
+                                                        const char *jni_signature) {
+    const char *descriptor = NULL;
+    const char *descriptor_end = NULL;
+    if (!jni_signature_arguments(jni_signature, &descriptor, &descriptor_end)) {
+        return JNI_SIGNATURE_MISMATCH;
+    }
+    yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *param_types = root && yyjson_is_obj(root)
+        ? yyjson_obj_get(root, "param_types") : NULL;
+    if (!param_types || !yyjson_is_arr(param_types)) {
+        yyjson_val *signature = root && yyjson_is_obj(root)
+            ? yyjson_obj_get(root, "signature") : NULL;
+        jni_signature_match_t fallback = yyjson_is_str(signature)
+            ? jni_java_signature_text_matches(yyjson_get_str(signature), jni_signature)
+            : JNI_SIGNATURE_UNKNOWN;
+        yyjson_doc_free(doc);
+        return fallback;
+    }
+    size_t index, max;
+    yyjson_val *value;
+    bool matches = true;
+    yyjson_arr_foreach(param_types, index, max, value) {
+        const char *java_type = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+        if (!jni_java_type_matches(java_type, &descriptor, descriptor_end)) {
+            matches = false;
+            break;
+        }
+    }
+    if (matches && descriptor != descriptor_end) matches = false;
+    yyjson_doc_free(doc);
+    return matches ? JNI_SIGNATURE_MATCH : JNI_SIGNATURE_MISMATCH;
+}
+
+static char *jni_edge_properties(const char *class_name, const char *method_name,
+                                 const char *signature, const char *signature_resolution,
+                                 const char *registration_helper, bool overload) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "class", class_name ? class_name : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "method", method_name ? method_name : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "signature", signature ? signature : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "signature_resolution", signature_resolution);
+    yyjson_mut_obj_add_bool(doc, root, "overload", overload);
+    if (registration_helper && registration_helper[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "registration_helper", registration_helper);
+    }
+    return aidl_write_properties(doc);
+}
+
+static const char *find_dynamic_registration_helper(const char *source) {
+    static const char *helpers[] = {
+        "registerNativeMethodsOrDie", "jniRegisterNativeMethods",
+        "RegisterMethodsOrDie", "registerNativeMethods", "RegisterNatives",
+    };
+    for (size_t i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) {
+        if (strstr(source, helpers[i])) return helpers[i];
+    }
+    return NULL;
+}
+
 static int link_jni_pair(link_ctx_t *ctx, const char *java_method, const char *class_name,
-                         const char *native_function, const char *native_repo_id,
-                         const char *native_file_path, const char *evidence, double confidence) {
+                          const char *native_function, const char *native_repo_id,
+                          const char *native_file_path, const char *jni_signature,
+                          const char *registration_helper, const char *evidence,
+                          double confidence) {
+    if (jni_signature && jni_signature[0] && !jni_signature_is_valid(jni_signature)) return 0;
     const char *sql =
-        "SELECT global_id,repo_id,name,qualified_name,file_path,label FROM symbols "
+        "SELECT global_id,repo_id,name,qualified_name,file_path,label,properties FROM symbols "
         "WHERE workspace_id=?1 AND name=?2;";
     sqlite3_stmt *java_stmt = NULL;
     sqlite3_stmt *native_stmt = NULL;
@@ -1524,16 +1869,54 @@ static int link_jni_pair(link_ctx_t *ctx, const char *java_method, const char *c
     sqlite3_bind_text(java_stmt, 2, java_method, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(native_stmt, 1, ctx->workspace->workspace_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(native_stmt, 2, native_function, -1, SQLITE_TRANSIENT);
+    int java_candidate_count = 0;
+    int exact_signature_count = 0;
+    int unknown_signature_count = 0;
+    while (sqlite3_step(java_stmt) == SQLITE_ROW) {
+        const char *qualified = (const char *)sqlite3_column_text(java_stmt, 3);
+        const char *java_label = (const char *)sqlite3_column_text(java_stmt, 5);
+        if (!java_label || strcmp(java_label, "Method") != 0 ||
+            !jni_class_matches(qualified, class_name)) continue;
+        java_candidate_count++;
+        if (jni_signature && jni_signature[0]) {
+            const char *properties = (const char *)sqlite3_column_text(java_stmt, 6);
+            jni_signature_match_t match = jni_java_signature_matches(properties,
+                                                                     jni_signature);
+            if (match == JNI_SIGNATURE_MATCH) exact_signature_count++;
+            if (match == JNI_SIGNATURE_UNKNOWN) unknown_signature_count++;
+        }
+    }
+    bool use_exact_signature = jni_signature && jni_signature[0] &&
+                               exact_signature_count > 0;
+    bool use_unknown_unique = jni_signature && jni_signature[0] &&
+                              exact_signature_count == 0 && java_candidate_count == 1 &&
+                              unknown_signature_count == 1;
+    bool use_unique_name = (!jni_signature || !jni_signature[0]) &&
+                           java_candidate_count == 1;
+    sqlite3_reset(java_stmt);
+
     int rc = 0;
     while (rc == 0 && sqlite3_step(java_stmt) == SQLITE_ROW) {
         const char *qualified = (const char *)sqlite3_column_text(java_stmt, 3);
         const char *java_label = (const char *)sqlite3_column_text(java_stmt, 5);
-        if (!java_label || strcmp(java_label, "Method") != 0) continue;
-        if (class_name && class_name[0]) {
-            char normalized[PG_PATH_MAX];
-            (void)snprintf(normalized, sizeof(normalized), "%s", class_name);
-            for (char *p = normalized; *p; p++) if (*p == '/') *p = '.';
-            if (!strstr(qualified ? qualified : "", normalized)) continue;
+        if (!java_label || strcmp(java_label, "Method") != 0 ||
+            !jni_class_matches(qualified, class_name)) continue;
+        jni_signature_match_t signature_match = JNI_SIGNATURE_UNKNOWN;
+        if (jni_signature && jni_signature[0]) {
+            const char *properties = (const char *)sqlite3_column_text(java_stmt, 6);
+            signature_match = jni_java_signature_matches(properties, jni_signature);
+        }
+        if ((use_exact_signature && signature_match != JNI_SIGNATURE_MATCH) ||
+            (use_unknown_unique && signature_match != JNI_SIGNATURE_UNKNOWN) ||
+            (!use_exact_signature && !use_unknown_unique && !use_unique_name)) continue;
+        const char *signature_resolution = use_exact_signature ? "exact" :
+            use_unknown_unique ? "metadata_unavailable_unique" : "unique_name";
+        char *properties = jni_edge_properties(class_name, java_method, jni_signature,
+                                               signature_resolution, registration_helper,
+                                               java_candidate_count > 1);
+        if (!properties) {
+            rc = -1;
+            break;
         }
         sqlite3_reset(native_stmt);
         while (sqlite3_step(native_stmt) == SQLITE_ROW) {
@@ -1552,12 +1935,15 @@ static int link_jni_pair(link_ctx_t *ctx, const char *java_method, const char *c
             char native_id[65];
             if (add_symbol_endpoint(ctx, java_stmt, "JNI_JAVA_METHOD", java_id) != 0 ||
                 add_symbol_endpoint(ctx, native_stmt, "JNI_NATIVE_FUNCTION", native_id) != 0 ||
-                insert_protocol_edge(ctx, java_id, native_id, "JNI_NATIVE_IMPLEMENTATION",
-                                     confidence, evidence) != 0) {
+                insert_protocol_edge_properties(ctx, java_id, native_id,
+                    "JNI_NATIVE_IMPLEMENTATION",
+                    use_unknown_unique ? confidence * 0.85 : confidence,
+                    evidence, properties) != 0) {
                 rc = -1;
                 break;
             }
         }
+        free(properties);
     }
     sqlite3_finalize(java_stmt);
     sqlite3_finalize(native_stmt);
@@ -1565,10 +1951,11 @@ static int link_jni_pair(link_ctx_t *ctx, const char *java_method, const char *c
 }
 
 static int parse_dynamic_jni(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
-                             const char *file_path, const char *source) {
+                              const char *file_path, const char *source) {
     if (!strstr(source, "JNINativeMethod")) return 0;
     char class_name[PG_PATH_MAX] = {0};
     (void)find_dynamic_class(source, class_name, sizeof(class_name));
+    const char *registration_helper = find_dynamic_registration_helper(source);
     const char *cursor = strstr(source, "JNINativeMethod");
     while (cursor) {
         const char *table_open = strchr(cursor, '{');
@@ -1605,7 +1992,7 @@ static int parse_dynamic_jni(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
             } else if (token.kind == PG_RBRACE && entry_depth >= 2) {
                 if (java_name && signature && last_ident &&
                     link_jni_pair(ctx, java_name, class_name, last_ident,
-                                  repo->repo_id, file_path,
+                                  repo->repo_id, file_path, signature, registration_helper,
                                   "jni_native_method_table", class_name[0] ? 0.98 : 0.75) != 0) {
                     pg_token_free(&token);
                     free(java_name); free(signature); free(last_ident);
@@ -2004,34 +2391,112 @@ static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
     return rc;
 }
 
+static int jni_hex_value(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static bool jni_append_codepoint(char *out, size_t out_size, size_t *written,
+                                 unsigned codepoint) {
+    unsigned char bytes[3];
+    size_t count = 0;
+    if (codepoint <= 0x7f) {
+        bytes[count++] = (unsigned char)codepoint;
+    } else if (codepoint <= 0x7ff) {
+        bytes[count++] = (unsigned char)(0xc0 | (codepoint >> 6));
+        bytes[count++] = (unsigned char)(0x80 | (codepoint & 0x3f));
+    } else {
+        bytes[count++] = (unsigned char)(0xe0 | (codepoint >> 12));
+        bytes[count++] = (unsigned char)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[count++] = (unsigned char)(0x80 | (codepoint & 0x3f));
+    }
+    if (*written + count >= out_size) return false;
+    for (size_t i = 0; i < count; i++) out[(*written)++] = (char)bytes[i];
+    return true;
+}
+
+static int decode_jni_component(const char *encoded, bool raw_underscore_is_slash,
+                                char *out, size_t out_size) {
+    size_t written = 0;
+    size_t length = strlen(encoded);
+    for (size_t i = 0; i < length;) {
+        if (encoded[i] != '_') {
+            if (written + 1 >= out_size) return -1;
+            out[written++] = encoded[i++];
+            continue;
+        }
+        if (i + 1 < length && encoded[i + 1] == '1') {
+            if (written + 1 >= out_size) return -1;
+            out[written++] = '_';
+            i += 2;
+        } else if (i + 1 < length && encoded[i + 1] == '2') {
+            if (written + 1 >= out_size) return -1;
+            out[written++] = ';';
+            i += 2;
+        } else if (i + 1 < length && encoded[i + 1] == '3') {
+            if (written + 1 >= out_size) return -1;
+            out[written++] = '[';
+            i += 2;
+        } else if (i + 5 < length && encoded[i + 1] == '0') {
+            unsigned codepoint = 0;
+            for (size_t h = i + 2; h <= i + 5; h++) {
+                int value = jni_hex_value(encoded[h]);
+                if (value < 0) return -1;
+                codepoint = (codepoint << 4) | (unsigned)value;
+            }
+            if (!jni_append_codepoint(out, out_size, &written, codepoint)) return -1;
+            i += 6;
+        } else {
+            if (written + 1 >= out_size) return -1;
+            out[written++] = raw_underscore_is_slash ? '/' : '_';
+            i++;
+        }
+    }
+    out[written] = '\0';
+    return 0;
+}
+
 static int decode_static_jni(const char *native_name, char *class_name, size_t class_size,
-                             char *method_name, size_t method_size) {
+                              char *method_name, size_t method_size,
+                              char *signature, size_t signature_size) {
     if (!native_name || strncmp(native_name, "Java_", 5) != 0) return -1;
     char encoded[PG_PATH_MAX];
     (void)snprintf(encoded, sizeof(encoded), "%s", native_name + 5);
-    char *signature = strstr(encoded, "__");
-    if (signature) *signature = '\0';
+    char *encoded_signature = strstr(encoded, "__");
+    if (encoded_signature) *encoded_signature = '\0';
     char *split = NULL;
-    for (char *p = encoded + strlen(encoded); p > encoded;) {
-        p--;
-        if (*p == '_' && p[1] != '0' && p[1] != '1' && p[1] != '2' && p[1] != '3') {
-            split = p;
-            break;
+    for (size_t i = 0; encoded[i];) {
+        if (encoded[i] != '_') {
+            i++;
+        } else if (encoded[i + 1] == '1' || encoded[i + 1] == '2' ||
+                   encoded[i + 1] == '3') {
+            i += 2;
+        } else if (encoded[i + 1] == '0') {
+            if (!encoded[i + 2] || !encoded[i + 3] || !encoded[i + 4] ||
+                !encoded[i + 5]) return -1;
+            i += 6;
+        } else {
+            split = encoded + i;
+            i++;
         }
     }
     if (!split || !split[1]) return -1;
     *split++ = '\0';
-    (void)snprintf(method_name, method_size, "%s", split);
-    size_t written = 0;
-    for (size_t i = 0; encoded[i] && written + 1 < class_size; i++) {
-        if (encoded[i] == '_' && encoded[i + 1] == '1') {
-            class_name[written++] = '_';
-            i++;
-        } else {
-            class_name[written++] = encoded[i] == '_' ? '/' : encoded[i];
-        }
+    if (decode_jni_component(encoded, true, class_name, class_size) != 0 ||
+        decode_jni_component(split, false, method_name, method_size) != 0) return -1;
+    signature[0] = '\0';
+    if (encoded_signature) {
+        char decoded[PG_PATH_MAX];
+        if (decode_jni_component(encoded_signature + 2, true, decoded,
+                                 sizeof(decoded)) != 0) return -1;
+        int written = snprintf(signature, signature_size, "(%s)", decoded);
+        if (written < 0 || (size_t)written >= signature_size) return -1;
+        const char *begin = NULL;
+        const char *end = NULL;
+        if (!jni_signature_arguments(signature, &begin, &end)) return -1;
     }
-    class_name[written] = '\0';
     return 0;
 }
 
@@ -2047,10 +2512,14 @@ static int link_static_jni(link_ctx_t *ctx) {
         const char *native_name = (const char *)sqlite3_column_text(stmt, 0);
         char class_name[PG_PATH_MAX];
         char method_name[1024];
+        char signature[PG_PATH_MAX];
         if (decode_static_jni(native_name, class_name, sizeof(class_name),
-                              method_name, sizeof(method_name)) == 0) {
+                               method_name, sizeof(method_name), signature,
+                               sizeof(signature)) == 0) {
             rc = link_jni_pair(ctx, method_name, class_name, native_name, NULL, NULL,
-                               "jni_exported_name", 1.0);
+                                signature, NULL,
+                                signature[0] ? "jni_exported_overload" : "jni_exported_name",
+                                1.0);
         }
     }
     sqlite3_finalize(stmt);
@@ -2551,8 +3020,10 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_SERVICE_WAIT'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVICE_SERVER'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVICE_INTERFACE'),"
-        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_exported_name'),"
-        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_native_method_table');";
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence IN('jni_exported_name','jni_exported_overload')) ,"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_native_method_table'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='JNI_NATIVE_IMPLEMENTATION' AND json_extract(e.properties,'$.overload')=1),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='JNI_NATIVE_IMPLEMENTATION' AND json_extract(e.properties,'$.registration_helper') IS NOT NULL);";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
@@ -2586,6 +3057,8 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
             stats->binder_service_interface_links = sqlite3_column_int(stmt, 25);
             stats->jni_static_edges = sqlite3_column_int(stmt, 26);
             stats->jni_dynamic_edges = sqlite3_column_int(stmt, 27);
+            stats->jni_overload_edges = sqlite3_column_int(stmt, 28);
+            stats->jni_registration_helper_edges = sqlite3_column_int(stmt, 29);
             rc = 0;
         }
     } else {

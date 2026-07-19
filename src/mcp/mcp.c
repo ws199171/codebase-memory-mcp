@@ -8743,6 +8743,9 @@ static char *handle_aosp_trace_protocol(const char *args) {
                            stats.binder_service_interface_links);
     yyjson_mut_obj_add_int(doc, root, "jni_static_edges", stats.jni_static_edges);
     yyjson_mut_obj_add_int(doc, root, "jni_dynamic_edges", stats.jni_dynamic_edges);
+    yyjson_mut_obj_add_int(doc, root, "jni_overload_edges", stats.jni_overload_edges);
+    yyjson_mut_obj_add_int(doc, root, "jni_registration_helper_edges",
+                           stats.jni_registration_helper_edges);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

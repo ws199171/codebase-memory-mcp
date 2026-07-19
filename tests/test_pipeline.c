@@ -2742,6 +2742,56 @@ TEST(pipeline_docstring_java_method) {
     PASS();
 }
 
+TEST(pipeline_java_overloads_preserve_distinct_nodes) {
+    const char *files[] = {"android/media/NativeCodec.java"};
+    const char *contents[] = {
+        "package android.media;\n"
+        "class NativeCodec {\n"
+        "  native void process(int value);\n"
+        "  native void process(String value);\n"
+        "  native void unique(byte[] value);\n"
+        "}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0) FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), "process", &nodes, &count);
+    ASSERT_EQ(count, 2);
+    bool found_int = false;
+    bool found_string = false;
+    for (int i = 0; i < count; i++) {
+        found_int |= strstr(nodes[i].qualified_name, ".process(int)") != NULL &&
+                     strstr(nodes[i].properties_json, "\"param_types\":[\"int\"]") != NULL;
+        found_string |= strstr(nodes[i].qualified_name, ".process(String)") != NULL &&
+                        strstr(nodes[i].properties_json,
+                               "\"param_types\":[\"String\"]") != NULL;
+    }
+    ASSERT_TRUE(found_int);
+    ASSERT_TRUE(found_string);
+    cbm_store_free_nodes(nodes, count);
+
+    nodes = NULL;
+    count = 0;
+    cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), "unique", &nodes, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(nodes[0].qualified_name, ".unique(") == NULL);
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"param_types\":[\"byte[]\"]"));
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_docstring_kotlin_function) {
     /* Kotlin function with KDoc comment */
     const char *files[] = {"main.kt"};
@@ -6960,6 +7010,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_go_function);
     RUN_TEST(pipeline_docstring_python_function);
     RUN_TEST(pipeline_docstring_java_method);
+    RUN_TEST(pipeline_java_overloads_preserve_distinct_nodes);
     RUN_TEST(pipeline_docstring_kotlin_function);
     RUN_TEST(pipeline_docstring_go_class);
     /* Project name */

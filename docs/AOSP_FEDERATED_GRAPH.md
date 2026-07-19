@@ -589,6 +589,33 @@ and `BINDER_SERVICE_INTERFACE` edges. Calls with computed service names do not
 produce a guessed service identity; only literal names enter the static protocol
 graph. Refresh remains transactional and idempotent.
 
+## JNI Overloads And Registration Helpers
+
+P5 decodes both short and long exported JNI names. Class and method components
+support the JNI `_1`, `_2`, `_3`, and `_0xxxx` escapes, including nested Java
+classes encoded with `_00024`. Long-name suffixes after `__` become canonical
+JVM argument descriptors, so primitive, object, and array overloads retain their
+exact parameter identity.
+
+The index retains repeated Java/Kotlin method names as distinct, signature-qualified
+nodes while leaving non-overloaded method QNs unchanged. The linker compares decoded
+descriptors with structured `param_types`, or parses the raw Java `signature` when
+that older metadata is absent. When multiple methods share a class and name, only an
+exact descriptor match creates `JNI_NATIVE_IMPLEMENTATION`; a short exported name,
+invalid descriptor, or mismatched descriptor creates no speculative edge. A signed
+entry may use a reduced-confidence metadata-unavailable fallback only when neither
+parameter representation is usable and the class and method have exactly one
+candidate.
+
+Dynamic `JNINativeMethod` entries use the signature stored in each table row.
+The surrounding source is also checked for common registration paths:
+`registerNativeMethods`, `jniRegisterNativeMethods`, `RegisterMethodsOrDie`,
+`registerNativeMethodsOrDie`, and `RegisterNatives`. Edge properties include the
+decoded class, method, signature, signature-resolution mode, overload state, and
+registration helper. `aosp link` and `aosp_trace_protocol` report
+`jni_overload_edges` and `jni_registration_helper_edges` alongside the existing
+static and dynamic JNI totals. Refresh remains atomic and idempotent.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

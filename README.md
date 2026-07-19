@@ -619,8 +619,13 @@ statistics report Java, C++/NDK, and Rust generated-node coverage separately. Li
 ServiceManager registration, lookup, and wait calls become shared service nodes
 that connect enclosing client/server callers to direct Binder implementations and
 AIDL interfaces. The linker also resolves exported JNI names and parses
-`JNINativeMethod` dynamic registration tables. Each protocol edge records its
-confidence and evidence; ambiguous name-only candidates are not linked.
+`JNINativeMethod` dynamic registration tables. JNI long names decode escaped
+underscores, arrays, object descriptors, Unicode code units, nested classes, and
+overload parameter signatures. Dynamic table signatures and common Android
+registration helpers are retained as edge evidence; overloads require an exact
+Java parameter-signature match, while ambiguous short names are not linked. Each
+protocol edge records its confidence and evidence; ambiguous name-only candidates
+are not linked.
 
 `aosp modules --details` exposes bounded outgoing dependency records and file
 declarations for matching modules. Each record retains structured variant,

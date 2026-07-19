@@ -753,6 +753,53 @@ static int create_binder_backends_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_jni_overload_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_jni_p5_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "service/jni") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/service\" path=\"service\"/></manifest>") != 0 ||
+        write_relative(root, "service/jni/NativeCodec.java",
+            "package android.media;\n"
+            "class NativeCodec {\n"
+            "  native void process(int value);\n"
+            "  native void process(String value);\n"
+            "  native void name_with_underscore(byte[] data);\n"
+            "  static class Inner { native void ping(); }\n"
+            "  native void configure(int value);\n"
+            "  native void configure(String value);\n"
+            "}\n") != 0 ||
+        write_relative(root, "service/jni/NativeCodec.cpp",
+            "void Java_android_media_NativeCodec_process__I() {}\n"
+            "void Java_android_media_NativeCodec_process__Ljava_lang_String_2() {}\n"
+            "void Java_android_media_NativeCodec_name_1with_1underscore___3B() {}\n"
+            "void Java_android_media_NativeCodec_00024Inner_ping() {}\n"
+            "void Java_android_media_NativeCodec_process() {}\n"
+            "void Java_android_media_NativeCodec_process__J() {}\n"
+            "void nativeConfigureInt() {}\n"
+            "void nativeConfigureString() {}\n"
+            "void nativeConfigureWrong() {}\n"
+            "static const JNINativeMethod gMethods[] = {\n"
+            "  { \"configure\", \"(I)V\", (void*)nativeConfigureInt },\n"
+            "  { \"configure\", \"(Ljava/lang/String;)V\", (void*)nativeConfigureString },\n"
+            "  { \"configure\", \"(J)V\", (void*)nativeConfigureWrong },\n"
+            "};\n"
+            "int registerCodec(JNIEnv* env) {\n"
+            "  return RegisterMethodsOrDie(env, \"android/media/NativeCodec\", gMethods, 3);\n"
+            "}\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 static int create_service_manager_workspace_fixture(char **root_out) {
     static unsigned fixture_sequence = 0;
     char prefix[64];
@@ -4041,6 +4088,118 @@ TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     PASS();
 }
 
+TEST(aosp_protocol_graph_decodes_jni_overloads_and_registration_helpers) {
+    char *root = NULL;
+    ASSERT_EQ(create_jni_overload_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_path[4096];
+    (void)snprintf(shard_path, sizeof(shard_path), "%s/jni-overload-shard.db", root);
+    sqlite3 *shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_path, &shard), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(shard,
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "INSERT INTO nodes VALUES"
+        "(1,'process','android.media.NativeCodec.process(int)','Method','jni/NativeCodec.java',3,3,'{\"param_types\":[\"int\"]}'),"
+        "(2,'process','android.media.NativeCodec.process(java.lang.String)','Method','jni/NativeCodec.java',4,4,'{\"signature\":\"(String value)\"}'),"
+        "(3,'name_with_underscore','android.media.NativeCodec.name_with_underscore','Method','jni/NativeCodec.java',5,5,'{\"param_types\":[\"byte[]\"]}'),"
+        "(4,'ping','android.media.NativeCodec.Inner.ping','Method','jni/NativeCodec.java',6,6,'{\"param_types\":[]}'),"
+        "(5,'configure','android.media.NativeCodec.configure(int)','Method','jni/NativeCodec.java',7,7,'{\"param_types\":[\"int\"]}'),"
+        "(6,'configure','android.media.NativeCodec.configure(java.lang.String)','Method','jni/NativeCodec.java',8,8,'{\"param_types\":[\"String\"]}'),"
+        "(10,'Java_android_media_NativeCodec_process__I','jni.Java_android_media_NativeCodec_process__I','Function','jni/NativeCodec.cpp',1,1,'{}'),"
+        "(11,'Java_android_media_NativeCodec_process__Ljava_lang_String_2','jni.Java_android_media_NativeCodec_process__Ljava_lang_String_2','Function','jni/NativeCodec.cpp',2,2,'{}'),"
+        "(12,'Java_android_media_NativeCodec_name_1with_1underscore___3B','jni.Java_android_media_NativeCodec_name_1with_1underscore___3B','Function','jni/NativeCodec.cpp',3,3,'{}'),"
+        "(13,'Java_android_media_NativeCodec_00024Inner_ping','jni.Java_android_media_NativeCodec_00024Inner_ping','Function','jni/NativeCodec.cpp',4,4,'{}'),"
+        "(14,'Java_android_media_NativeCodec_process','jni.Java_android_media_NativeCodec_process','Function','jni/NativeCodec.cpp',5,5,'{}'),"
+        "(15,'Java_android_media_NativeCodec_process__J','jni.Java_android_media_NativeCodec_process__J','Function','jni/NativeCodec.cpp',6,6,'{}'),"
+        "(16,'nativeConfigureInt','jni.nativeConfigureInt','Function','jni/NativeCodec.cpp',7,7,'{}'),"
+        "(17,'nativeConfigureString','jni.nativeConfigureString','Function','jni/NativeCodec.cpp',8,8,'{}'),"
+        "(18,'nativeConfigureWrong','jni.nativeConfigureWrong','Function','jni/NativeCodec.cpp',9,9,'{}');",
+        NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(shard);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[0], shard_path,
+                                       err, sizeof(err)), 0);
+
+    cbm_aosp_protocol_stats_t stats;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.jni_static_edges, 4);
+    ASSERT_EQ(stats.jni_dynamic_edges, 2);
+    ASSERT_EQ(stats.jni_overload_edges, 4);
+    ASSERT_EQ(stats.jni_registration_helper_edges, 2);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes t "
+        "ON t.protocol_id=e.target_id WHERE e.type='JNI_NATIVE_IMPLEMENTATION' "
+        "AND t.name IN('Java_android_media_NativeCodec_process',"
+        "'Java_android_media_NativeCodec_process__J','nativeConfigureWrong');",
+        -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes s "
+        "ON s.protocol_id=e.source_id WHERE s.workspace_id=?1 "
+        "AND e.evidence='jni_exported_overload' "
+        "AND json_extract(e.properties,'$.signature_resolution')='exact';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 3);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes s "
+        "ON s.protocol_id=e.source_id WHERE s.workspace_id=?1 "
+        "AND json_extract(e.properties,'$.registration_helper')='RegisterMethodsOrDie' "
+        "AND json_extract(e.properties,'$.signature_resolution')='exact';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes t "
+        "ON t.protocol_id=e.target_id WHERE e.type='JNI_NATIVE_IMPLEMENTATION' "
+        "AND t.name='Java_android_media_NativeCodec_00024Inner_ping' "
+        "AND json_extract(e.properties,'$.class')='android/media/NativeCodec$Inner';",
+        -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"NativeCodec\",\"limit\":100}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_trace_protocol", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"jni_static_edges\":4"));
+    ASSERT_NOT_NULL(strstr(response, "\"jni_dynamic_edges\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"jni_overload_edges\":4"));
+    ASSERT_NOT_NULL(strstr(response, "\"jni_registration_helper_edges\":2"));
+    ASSERT_NOT_NULL(strstr(response, "RegisterMethodsOrDie"));
+    free(response);
+
+    int edge_count = stats.edge_count;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.edge_count, edge_count);
+    ASSERT_EQ(stats.jni_static_edges, 4);
+    ASSERT_EQ(stats.jni_dynamic_edges, 2);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 static int catalog_single_symbol(const cbm_aosp_workspace_t *workspace,
                                  const cbm_aosp_repo_t *repo, const char *db_path,
                                  const char *name, const char *qualified_name) {
@@ -5117,6 +5276,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_protocol_graph_models_generated_binder_backends);
     RUN_TEST(aosp_protocol_graph_links_service_manager_paths);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
+    RUN_TEST(aosp_protocol_graph_decodes_jni_overloads_and_registration_helpers);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
     RUN_TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges);

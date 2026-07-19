@@ -34,6 +34,8 @@ typedef struct {
     int binder_service_interface_links;
     int jni_static_edges;
     int jni_dynamic_edges;
+    int jni_overload_edges;
+    int jni_registration_helper_edges;
 } cbm_aosp_protocol_stats_t;
 
 typedef struct {
