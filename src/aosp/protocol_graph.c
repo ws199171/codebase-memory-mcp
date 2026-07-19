@@ -97,6 +97,7 @@ typedef struct {
     sqlite3_stmt *insert_node;
     sqlite3_stmt *insert_edge;
     sqlite3_stmt *find_symbols;
+    sqlite3_stmt *insert_service;
     char *err;
     size_t err_size;
 } link_ctx_t;
@@ -163,15 +164,27 @@ static char *pg_read_file(const char *path, size_t *length_out) {
 static void binder_symbols_free(binder_symbols_t *symbols) {
     if (!symbols) return;
     for (int i = 0; i < symbols->count; i++) {
-        free(symbols->items[i].global_id);
-        free(symbols->items[i].repo_id);
-        free(symbols->items[i].name);
-        free(symbols->items[i].qualified_name);
-        free(symbols->items[i].file_path);
-        free(symbols->items[i].label);
+        binder_symbol_t *item = &symbols->items[i];
+        free(item->global_id);
+        free(item->repo_id);
+        free(item->name);
+        free(item->qualified_name);
+        free(item->file_path);
+        free(item->label);
     }
     free(symbols->items);
     memset(symbols, 0, sizeof(*symbols));
+}
+
+static void binder_symbol_free(binder_symbol_t *symbol) {
+    if (!symbol) return;
+    free(symbol->global_id);
+    free(symbol->repo_id);
+    free(symbol->name);
+    free(symbol->qualified_name);
+    free(symbol->file_path);
+    free(symbol->label);
+    memset(symbol, 0, sizeof(*symbol));
 }
 
 static int binder_symbols_load(link_ctx_t *ctx, const char *name, binder_symbols_t *symbols) {
@@ -478,6 +491,24 @@ static char *binder_symbol_owner(const char *qualified_name, const char *method_
     if (!owner) return NULL;
     memcpy(owner, qualified_name + start, end - start);
     owner[end - start] = '\0';
+    return owner;
+}
+
+static char *binder_symbol_qualified_owner(const char *qualified_name,
+                                           const char *method_name) {
+    if (!qualified_name || !method_name) return NULL;
+    size_t length = strlen(qualified_name);
+    size_t method_length = strlen(method_name);
+    if (length <= method_length || strcmp(qualified_name + length - method_length,
+                                          method_name) != 0) return NULL;
+    size_t end = length - method_length;
+    while (end > 0 && (qualified_name[end - 1] == '.' || qualified_name[end - 1] == ':' ||
+                       qualified_name[end - 1] == '$')) end--;
+    if (end == 0) return NULL;
+    char *owner = malloc(end + 1);
+    if (!owner) return NULL;
+    memcpy(owner, qualified_name, end);
+    owner[end] = '\0';
     return owner;
 }
 
@@ -959,7 +990,8 @@ static int add_binder_symbol_endpoint(link_ctx_t *ctx, const binder_symbol_t *sy
 
 static char *binder_evidence_properties(const char *transaction_name,
                                         const char *method_name,
-                                        const char *owner_name) {
+                                        const char *owner_name,
+                                        const char *qualified_owner) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) return NULL;
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -967,6 +999,9 @@ static char *binder_evidence_properties(const char *transaction_name,
     yyjson_mut_obj_add_strcpy(doc, root, "transaction", transaction_name);
     yyjson_mut_obj_add_strcpy(doc, root, "method", method_name);
     if (owner_name) yyjson_mut_obj_add_strcpy(doc, root, "owner", owner_name);
+    if (qualified_owner) {
+        yyjson_mut_obj_add_strcpy(doc, root, "qualified_owner", qualified_owner);
+    }
     size_t length = 0;
     char *json = yyjson_mut_write(doc, 0, &length);
     yyjson_mut_doc_free(doc);
@@ -1484,6 +1519,332 @@ static int parse_dynamic_jni(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
     return 0;
 }
 
+static const char *service_operation_kind(const char *identifier, const char **api_out) {
+    const char *leaf = identifier ? strrchr(identifier, '.') : NULL;
+    leaf = leaf ? leaf + 1 : identifier;
+    if (!leaf) return NULL;
+    static const char *const registrations[] = {
+        "addService", "AServiceManager_addService", "publishBinderService", "registerService",
+    };
+    static const char *const lookups[] = {
+        "getService", "checkService", "getDeclaredService",
+        "AServiceManager_getService", "AServiceManager_checkService",
+    };
+    static const char *const waits[] = {
+        "waitForService", "waitForDeclaredService", "AServiceManager_waitForService",
+    };
+    for (size_t i = 0; i < sizeof(registrations) / sizeof(registrations[0]); i++) {
+        if (strcmp(leaf, registrations[i]) == 0) {
+            if (api_out) *api_out = registrations[i];
+            return "register";
+        }
+    }
+    for (size_t i = 0; i < sizeof(lookups) / sizeof(lookups[0]); i++) {
+        if (strcmp(leaf, lookups[i]) == 0) {
+            if (api_out) *api_out = lookups[i];
+            return "lookup";
+        }
+    }
+    for (size_t i = 0; i < sizeof(waits) / sizeof(waits[0]); i++) {
+        if (strcmp(leaf, waits[i]) == 0) {
+            if (api_out) *api_out = waits[i];
+            return "wait";
+        }
+    }
+    return NULL;
+}
+
+static bool service_hint_excluded(const char *component) {
+    static const char *const excluded[] = {
+        "String", "String16", "String8", "ServiceManager", "IServiceManager",
+        "AServiceManager_addService", "AServiceManager_getService",
+        "AServiceManager_checkService", "AServiceManager_waitForService", "IBinder",
+        "Parcel", "Status", "Stub", "Proxy",
+    };
+    for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++) {
+        if (strcmp(component, excluded[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void service_consider_hint(const char *identifier, char **implementation_hint,
+                                  char **interface_hint) {
+    if (!identifier) return;
+    char *copy = strdup(identifier);
+    if (!copy) return;
+    char *component = strtok(copy, ".");
+    while (component) {
+        size_t length = strlen(component);
+        if (length > 1 && component[0] == 'I' && isupper((unsigned char)component[1]) &&
+            !service_hint_excluded(component)) {
+            if (interface_hint && !*interface_hint) *interface_hint = strdup(component);
+        } else if (implementation_hint && isupper((unsigned char)component[0]) &&
+                   !service_hint_excluded(component) &&
+                   !(length > 1 && component[0] == 'I' &&
+                     isupper((unsigned char)component[1]))) {
+            char *replacement = strdup(component);
+            if (replacement) {
+                free(*implementation_hint);
+                *implementation_hint = replacement;
+            }
+        }
+        component = strtok(NULL, ".");
+    }
+    free(copy);
+}
+
+static int service_source_line(const char *source, size_t offset) {
+    int line = 1;
+    for (size_t i = 0; source && i < offset; i++) if (source[i] == '\n') line++;
+    return line;
+}
+
+static int service_source_column(const char *source, size_t offset) {
+    size_t line_start = offset;
+    while (line_start > 0 && source[line_start - 1] != '\n') line_start--;
+    return (int)(offset - line_start + 1);
+}
+
+static int service_find_caller(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                               const char *rel_path, int line, binder_symbol_t *caller) {
+    const char *sql =
+        "SELECT global_id,repo_id,name,qualified_name,file_path,label,start_line,end_line "
+        "FROM symbols WHERE workspace_id=?1 AND repo_id=?2 AND file_path=?3 "
+        "AND start_line<=?4 AND end_line>=?4 AND label IN('Function','Method') "
+        "ORDER BY (end_line-start_line),start_line DESC,global_id LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, ctx->workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, rel_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, line);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        const char *values[6];
+        for (int i = 0; i < 6; i++) values[i] = (const char *)sqlite3_column_text(stmt, i);
+        caller->global_id = strdup(values[0] ? values[0] : "");
+        caller->repo_id = strdup(values[1] ? values[1] : "");
+        caller->name = strdup(values[2] ? values[2] : "");
+        caller->qualified_name = strdup(values[3] ? values[3] : "");
+        caller->file_path = strdup(values[4] ? values[4] : "");
+        caller->label = strdup(values[5] ? values[5] : "");
+        caller->start_line = sqlite3_column_int(stmt, 6);
+        caller->end_line = sqlite3_column_int(stmt, 7);
+        if (!caller->global_id || !caller->repo_id || !caller->name ||
+            !caller->qualified_name || !caller->file_path || !caller->label) {
+            binder_symbol_free(caller);
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return step == SQLITE_ROW ? 1 : step == SQLITE_DONE ? 0 : -1;
+}
+
+static char *service_operation_properties(const char *operation, const char *api,
+                                          const char *service_name, int line, int column,
+                                          const char *implementation_hint,
+                                          const char *interface_hint,
+                                          const char *caller_global_id) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "operation", operation);
+    yyjson_mut_obj_add_strcpy(doc, root, "api", api);
+    yyjson_mut_obj_add_strcpy(doc, root, "service_name", service_name);
+    yyjson_mut_obj_add_int(doc, root, "line", line);
+    yyjson_mut_obj_add_int(doc, root, "column", column);
+    if (implementation_hint) {
+        yyjson_mut_obj_add_strcpy(doc, root, "implementation_hint", implementation_hint);
+    }
+    if (interface_hint) yyjson_mut_obj_add_strcpy(doc, root, "interface_hint", interface_hint);
+    if (caller_global_id) {
+        yyjson_mut_obj_add_strcpy(doc, root, "caller_global_id", caller_global_id);
+    }
+    return aidl_write_properties(doc);
+}
+
+static int insert_service_node(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                               const char *service_name, const char *rel_path,
+                               char service_id[65]) {
+    size_t size = strlen(service_name) + 16;
+    char *qualified = malloc(size);
+    char *properties = NULL;
+    if (!qualified) return -1;
+    (void)snprintf(qualified, size, "binder-service:%s", service_name);
+    hash_id(ctx->workspace->workspace_id, "BINDER_SERVICE", qualified, service_id);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (doc) {
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_strcpy(doc, root, "service_name", service_name);
+        properties = aidl_write_properties(doc);
+    }
+    if (!properties) {
+        free(qualified);
+        return -1;
+    }
+    sqlite3_reset(ctx->insert_service);
+    sqlite3_clear_bindings(ctx->insert_service);
+    sqlite3_bind_text(ctx->insert_service, 1, service_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_service, 2, ctx->workspace->workspace_id, -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_service, 3, repo->repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_service, 4, "BINDER_SERVICE", -1, SQLITE_STATIC);
+    sqlite3_bind_text(ctx->insert_service, 5, service_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_service, 6, qualified, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_service, 7, rel_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_null(ctx->insert_service, 8);
+    sqlite3_bind_text(ctx->insert_service, 9, properties, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(ctx->insert_service) == SQLITE_DONE ? 0 : -1;
+    free(qualified);
+    free(properties);
+    return rc;
+}
+
+static int link_service_operation(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                                  const char *rel_path, int line, int column,
+                                  const char *operation,
+                                  const char *api, const char *service_name,
+                                  char *implementation_hint, char *interface_hint) {
+    binder_symbol_t caller = {0};
+    int caller_status = service_find_caller(ctx, repo, rel_path, line, &caller);
+    if (caller_status < 0) {
+        free(interface_hint);
+        return -1;
+    }
+    if (caller_status > 0 && !interface_hint) {
+        char *caller_source = binder_symbol_source(ctx, &caller, true);
+        if (caller_source) {
+            pg_lexer_t lexer = {.source = caller_source, .length = strlen(caller_source)};
+            pg_token_t token;
+            while (!interface_hint && (token = pg_next(&lexer)).kind != PG_EOF) {
+                if (token.kind == PG_IDENT) service_consider_hint(token.text, NULL, &interface_hint);
+                pg_token_free(&token);
+            }
+            pg_token_free(&token);
+            free(caller_source);
+        }
+    }
+
+    char service_id[65];
+    if (insert_service_node(ctx, repo, service_name, rel_path, service_id) != 0) {
+        binder_symbol_free(&caller);
+        free(interface_hint);
+        return -1;
+    }
+    const char *caller_qn = caller_status > 0 ? caller.qualified_name : rel_path;
+    size_t operation_qn_size = strlen(caller_qn) + strlen(operation) +
+                               strlen(service_name) + 48;
+    char *operation_qn = malloc(operation_qn_size);
+    char *properties = service_operation_properties(operation, api, service_name, line, column,
+        implementation_hint, interface_hint, caller_status > 0 ? caller.global_id : NULL);
+    if (!operation_qn || !properties) {
+        free(operation_qn);
+        free(properties);
+        binder_symbol_free(&caller);
+        free(interface_hint);
+        return -1;
+    }
+    (void)snprintf(operation_qn, operation_qn_size, "%s::service:%s:%s:%d:%d", caller_qn,
+                   operation, service_name, line, column);
+    const char *operation_node_kind = strcmp(operation, "register") == 0
+        ? "BINDER_SERVICE_REGISTRATION"
+        : strcmp(operation, "wait") == 0 ? "BINDER_SERVICE_WAIT" : "BINDER_SERVICE_LOOKUP";
+    const char *service_edge = strcmp(operation, "register") == 0
+        ? "REGISTERS_BINDER_SERVICE"
+        : strcmp(operation, "wait") == 0 ? "WAITS_FOR_BINDER_SERVICE"
+                                           : "LOOKS_UP_BINDER_SERVICE";
+    char operation_id[65];
+    hash_id(ctx->workspace->workspace_id, operation_node_kind, operation_qn, operation_id);
+    int rc = insert_protocol_node_properties(ctx, operation_id, repo->repo_id,
+        operation_node_kind, api, operation_qn, rel_path, NULL, properties);
+    if (rc == 0) {
+        rc = insert_protocol_edge_properties(ctx, operation_id, service_id, service_edge,
+                                             1.0, "service_manager_literal", properties);
+    }
+    if (rc == 0 && caller_status > 0) {
+        size_t caller_wrapper_size = strlen(caller.qualified_name) + 24;
+        char *caller_wrapper_qn = malloc(caller_wrapper_size);
+        if (!caller_wrapper_qn) {
+            rc = -1;
+        } else {
+            (void)snprintf(caller_wrapper_qn, caller_wrapper_size, "%s::service-caller",
+                           caller.qualified_name);
+            char caller_id[65];
+            hash_id(ctx->workspace->workspace_id, "BINDER_SERVICE_CALLER", caller_wrapper_qn,
+                    caller_id);
+            if (insert_protocol_node_properties(ctx, caller_id, caller.repo_id,
+                    "BINDER_SERVICE_CALLER",
+                    caller.name, caller_wrapper_qn, caller.file_path, caller.global_id, "{}") != 0 ||
+                insert_protocol_edge_properties(ctx, caller_id, operation_id,
+                    "CALLS_SERVICE_MANAGER", 1.0, "enclosing_symbol", properties) != 0) rc = -1;
+            free(caller_wrapper_qn);
+        }
+    }
+    free(operation_qn);
+    free(properties);
+    binder_symbol_free(&caller);
+    free(interface_hint);
+    return rc;
+}
+
+static int parse_service_manager_calls(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                                       const char *rel_path, const char *source) {
+    pg_lexer_t lexer = {.source = source, .length = strlen(source)};
+    pg_token_t token;
+    int rc = 0;
+    while (rc == 0 && (token = pg_next(&lexer)).kind != PG_EOF) {
+        const char *api = NULL;
+        const char *operation = token.kind == PG_IDENT
+            ? service_operation_kind(token.text, &api) : NULL;
+        size_t call_offset = lexer.last_start;
+        if (!operation) {
+            pg_token_free(&token);
+            continue;
+        }
+        pg_token_free(&token);
+        token = pg_next(&lexer);
+        if (token.kind != PG_LPAREN) {
+            pg_token_free(&token);
+            continue;
+        }
+        pg_token_free(&token);
+        int depth = 1;
+        int argument_index = 0;
+        int service_argument = strcmp(api, "AServiceManager_addService") == 0 ? 1 : 0;
+        char *service_literal = NULL;
+        char *implementation_hint = NULL;
+        char *interface_hint = NULL;
+        while (depth > 0 && (token = pg_next(&lexer)).kind != PG_EOF) {
+            if (token.kind == PG_LPAREN) depth++;
+            if (token.kind == PG_RPAREN) depth--;
+            if (depth == 1 && token.kind == PG_COMMA) argument_index++;
+            if (depth > 0 && token.kind == PG_STRING && token.text &&
+                argument_index == service_argument && !service_literal) {
+                service_literal = strdup(token.text);
+            } else if (depth > 0 && token.kind == PG_IDENT && token.text) {
+                service_consider_hint(token.text, &implementation_hint, &interface_hint);
+            }
+            pg_token_free(&token);
+        }
+        pg_token_free(&token);
+        if (service_literal && service_literal[0]) {
+            int line = service_source_line(source, call_offset);
+            int column = service_source_column(source, call_offset);
+            rc = link_service_operation(ctx, repo, rel_path, line, column, operation, api,
+                                        service_literal, implementation_hint, interface_hint);
+            interface_hint = NULL;
+        }
+        free(service_literal);
+        free(implementation_hint);
+        free(interface_hint);
+    }
+    pg_token_free(&token);
+    return rc;
+}
+
 static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_dir,
                           const char *rel_dir, int depth) {
     if (depth > PG_MAX_DEPTH) return -1;
@@ -1509,14 +1870,25 @@ static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
         bool native = (name_len > 2 && strcmp(entry->name + name_len - 2, ".c") == 0) ||
                       (name_len > 3 && strcmp(entry->name + name_len - 3, ".cc") == 0) ||
                       (name_len > 4 && strcmp(entry->name + name_len - 4, ".cpp") == 0);
+        bool managed = (name_len > 5 && strcmp(entry->name + name_len - 5, ".java") == 0) ||
+                       (name_len > 3 && strcmp(entry->name + name_len - 3, ".kt") == 0);
         if (aidl) {
             rc = link_aidl_file(ctx, repo, abs_path, rel_path);
-        } else if (native) {
+        } else if (native || managed) {
             size_t length = 0;
             char *source = pg_read_file(abs_path, &length);
             if (source) {
-                if (strstr(source, "JNINativeMethod")) {
+                if (native && strstr(source, "JNINativeMethod")) {
                     rc = parse_dynamic_jni(ctx, repo, rel_path, source);
+                }
+                if (rc == 0 && (strstr(source, "ServiceManager") ||
+                                strstr(source, "addService") ||
+                                strstr(source, "registerService") ||
+                                strstr(source, "getService") ||
+                                strstr(source, "checkService") ||
+                                strstr(source, "waitForService") ||
+                                strstr(source, "publishBinderService"))) {
+                    rc = parse_service_manager_calls(ctx, repo, rel_path, source);
                 }
                 free(source);
             }
@@ -1658,6 +2030,105 @@ static int resolve_aidl_references(link_ctx_t *ctx) {
     return 0;
 }
 
+static int resolve_binder_services(link_ctx_t *ctx) {
+    const char *sql_template =
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT service.protocol_id,impl.protocol_id,'BINDER_SERVICE_SERVER',1.0,"
+        "'service_registration_implementation',json_object("
+        "'service_name',json_extract(operation.properties,'$.service_name'),"
+        "'implementation_hint',json_extract(operation.properties,'$.implementation_hint')) "
+        "FROM protocol_edges registration JOIN protocol_nodes operation "
+        "ON operation.protocol_id=registration.source_id "
+        "JOIN protocol_nodes service ON service.protocol_id=registration.target_id "
+        "JOIN protocol_nodes impl ON impl.workspace_id=service.workspace_id "
+        "AND impl.kind='BINDER_IMPLEMENTATION_METHOD' "
+        "AND json_extract(impl.properties,'$.owner')="
+        "json_extract(operation.properties,'$.implementation_hint') "
+        "WHERE registration.type='REGISTERS_BINDER_SERVICE' "
+        "AND operation.workspace_id='%s' "
+        "AND json_extract(operation.properties,'$.implementation_hint') IS NOT NULL "
+        "AND (SELECT count(DISTINCT json_extract(candidate.properties,'$.qualified_owner')) "
+        "FROM protocol_nodes candidate WHERE candidate.workspace_id=service.workspace_id "
+        "AND candidate.kind='BINDER_IMPLEMENTATION_METHOD' "
+        "AND json_extract(candidate.properties,'$.owner')="
+        "json_extract(operation.properties,'$.implementation_hint'))=1;"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT service.protocol_id,iface.protocol_id,'BINDER_SERVICE_INTERFACE',1.0,"
+        "'service_client_interface',json_object("
+        "'service_name',json_extract(operation.properties,'$.service_name'),"
+        "'interface_hint',json_extract(operation.properties,'$.interface_hint')) "
+        "FROM protocol_edges access JOIN protocol_nodes operation "
+        "ON operation.protocol_id=access.source_id "
+        "JOIN protocol_nodes service ON service.protocol_id=access.target_id "
+        "JOIN protocol_nodes iface ON iface.workspace_id=service.workspace_id "
+        "AND iface.kind='AIDL_INTERFACE' "
+        "AND iface.name=json_extract(operation.properties,'$.interface_hint') "
+        "WHERE access.type IN('REGISTERS_BINDER_SERVICE','LOOKS_UP_BINDER_SERVICE',"
+        "'WAITS_FOR_BINDER_SERVICE') AND operation.workspace_id='%s' "
+        "AND json_extract(operation.properties,'$.interface_hint') IS NOT NULL "
+        "AND (SELECT count(*) FROM protocol_nodes candidate "
+        "WHERE candidate.workspace_id=service.workspace_id AND candidate.kind='AIDL_INTERFACE' "
+        "AND candidate.name=json_extract(operation.properties,'$.interface_hint'))=1;"
+        "UPDATE protocol_nodes AS service SET properties=json_set(properties,"
+        "'$.server_candidate_count',(SELECT count(DISTINCT "
+        "json_extract(candidate.properties,'$.qualified_owner')) "
+        "FROM protocol_edges registration JOIN protocol_nodes operation "
+        "ON operation.protocol_id=registration.source_id JOIN protocol_nodes candidate "
+        "ON candidate.workspace_id=service.workspace_id "
+        "AND candidate.kind='BINDER_IMPLEMENTATION_METHOD' "
+        "AND json_extract(candidate.properties,'$.owner')="
+        "json_extract(operation.properties,'$.implementation_hint') "
+        "WHERE registration.target_id=service.protocol_id "
+        "AND registration.type='REGISTERS_BINDER_SERVICE'),"
+        "'$.server_resolution',CASE (SELECT count(DISTINCT "
+        "json_extract(candidate.properties,'$.qualified_owner')) "
+        "FROM protocol_edges registration JOIN protocol_nodes operation "
+        "ON operation.protocol_id=registration.source_id JOIN protocol_nodes candidate "
+        "ON candidate.workspace_id=service.workspace_id "
+        "AND candidate.kind='BINDER_IMPLEMENTATION_METHOD' "
+        "AND json_extract(candidate.properties,'$.owner')="
+        "json_extract(operation.properties,'$.implementation_hint') "
+        "WHERE registration.target_id=service.protocol_id "
+        "AND registration.type='REGISTERS_BINDER_SERVICE') "
+        "WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END,"
+        "'$.interface_candidate_count',(SELECT count(DISTINCT candidate.protocol_id) "
+        "FROM protocol_edges access JOIN protocol_nodes operation "
+        "ON operation.protocol_id=access.source_id JOIN protocol_nodes candidate "
+        "ON candidate.workspace_id=service.workspace_id AND candidate.kind='AIDL_INTERFACE' "
+        "AND candidate.name=json_extract(operation.properties,'$.interface_hint') "
+        "WHERE access.target_id=service.protocol_id AND access.type IN("
+        "'REGISTERS_BINDER_SERVICE','LOOKS_UP_BINDER_SERVICE','WAITS_FOR_BINDER_SERVICE')) ,"
+        "'$.interface_resolution',CASE (SELECT count(DISTINCT candidate.protocol_id) "
+        "FROM protocol_edges access JOIN protocol_nodes operation "
+        "ON operation.protocol_id=access.source_id JOIN protocol_nodes candidate "
+        "ON candidate.workspace_id=service.workspace_id AND candidate.kind='AIDL_INTERFACE' "
+        "AND candidate.name=json_extract(operation.properties,'$.interface_hint') "
+        "WHERE access.target_id=service.protocol_id AND access.type IN("
+        "'REGISTERS_BINDER_SERVICE','LOOKS_UP_BINDER_SERVICE','WAITS_FOR_BINDER_SERVICE')) "
+        "WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) "
+        "WHERE service.workspace_id='%s' AND service.kind='BINDER_SERVICE';"
+        "DELETE FROM protocol_edges WHERE type='BINDER_SERVICE_SERVER' AND source_id IN("
+        "SELECT protocol_id FROM protocol_nodes WHERE workspace_id='%s' "
+        "AND kind='BINDER_SERVICE' AND json_extract(properties,'$.server_resolution')!='resolved');"
+        "DELETE FROM protocol_edges WHERE type='BINDER_SERVICE_INTERFACE' AND source_id IN("
+        "SELECT protocol_id FROM protocol_nodes WHERE workspace_id='%s' "
+        "AND kind='BINDER_SERVICE' "
+        "AND json_extract(properties,'$.interface_resolution')!='resolved');";
+    char sql[32768];
+    (void)snprintf(sql, sizeof(sql), sql_template, ctx->workspace->workspace_id,
+                   ctx->workspace->workspace_id, ctx->workspace->workspace_id,
+                   ctx->workspace->workspace_id, ctx->workspace->workspace_id);
+    char *sql_error = NULL;
+    int sqlite_rc = sqlite3_exec(ctx->db, sql, NULL, NULL, &sql_error);
+    int rc = sqlite_rc == SQLITE_OK ? 0 : -1;
+    if (rc != 0) {
+        pg_error(ctx->err, ctx->err_size, "cannot resolve Binder services",
+                 sql_error ? sql_error : sqlite3_errmsg(ctx->db));
+    }
+    sqlite3_free(sql_error);
+    return rc;
+}
+
 static bool binder_generated_server(const char *qualified_name, const char *bn_name,
                                     const char *interface_name) {
     return contains_class_token(qualified_name, bn_name) ||
@@ -1722,18 +2193,24 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
             binder_generated_server(implementation->qualified_name, bn, interface_name) ||
             binder_generated_proxy(implementation->qualified_name, bp, interface_name)) continue;
         char *owner = binder_symbol_owner(implementation->qualified_name, method);
+        char *qualified_owner = binder_symbol_qualified_owner(
+            implementation->qualified_name, method);
         char *source = binder_symbol_source(ctx, implementation, false);
-        bool direct_implementation = source && owner &&
+        bool direct_implementation = source && owner && qualified_owner &&
             binder_source_declares_implementation(source, owner, bn, interface_name);
         free(source);
         if (!direct_implementation) {
             free(owner);
+            free(qualified_owner);
             continue;
         }
-        char *properties = binder_evidence_properties(transaction, method, owner);
+        char *properties = binder_evidence_properties(transaction, method, owner,
+                                                       qualified_owner);
         if (!properties ||
-            add_binder_symbol_endpoint(ctx, implementation,
-                                       "BINDER_IMPLEMENTATION_METHOD") != 0) {
+            insert_protocol_node_properties(ctx, implementation->global_id,
+                implementation->repo_id, "BINDER_IMPLEMENTATION_METHOD",
+                implementation->name, implementation->qualified_name,
+                implementation->file_path, implementation->global_id, properties) != 0) {
             rc = -1;
         }
         for (int s = 0; s < methods.count && rc == 0; s++) {
@@ -1750,6 +2227,7 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
                 properties) != 0) rc = -1;
         free(properties);
         free(owner);
+        free(qualified_owner);
     }
 
     if (constants.count == 0) {
@@ -1768,7 +2246,7 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
         binder_symbol_t *constant = &constants.items[c];
         if (strcmp(constant->label, "Method") == 0 ||
             !binder_generated_server(constant->qualified_name, bn, interface_name)) continue;
-        char *properties = binder_evidence_properties(transaction, method, NULL);
+        char *properties = binder_evidence_properties(transaction, method, NULL, NULL);
         if (!properties) {
             rc = -1;
             break;
@@ -1866,6 +2344,12 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_ON_TRANSACT_HANDLER'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_TRANSACT_CALL'),"
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_IMPLEMENTATION_METHOD'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_SERVICE'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_SERVICE_REGISTRATION'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_SERVICE_LOOKUP'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_SERVICE_WAIT'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVICE_SERVER'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVICE_INTERFACE'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_exported_name'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_native_method_table');";
     sqlite3_stmt *stmt = NULL;
@@ -1890,8 +2374,14 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
             stats->binder_on_transact_handlers = sqlite3_column_int(stmt, 14);
             stats->binder_transact_calls = sqlite3_column_int(stmt, 15);
             stats->binder_implementation_methods = sqlite3_column_int(stmt, 16);
-            stats->jni_static_edges = sqlite3_column_int(stmt, 17);
-            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 18);
+            stats->binder_services = sqlite3_column_int(stmt, 17);
+            stats->binder_service_registrations = sqlite3_column_int(stmt, 18);
+            stats->binder_service_lookups = sqlite3_column_int(stmt, 19);
+            stats->binder_service_waits = sqlite3_column_int(stmt, 20);
+            stats->binder_service_server_links = sqlite3_column_int(stmt, 21);
+            stats->binder_service_interface_links = sqlite3_column_int(stmt, 22);
+            stats->jni_static_edges = sqlite3_column_int(stmt, 23);
+            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 24);
             rc = 0;
         }
     } else {
@@ -1943,11 +2433,20 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
     const char *edge_sql =
         "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties)"
         " VALUES(?1,?2,?3,?4,?5,?6);";
+    const char *service_sql =
+        "INSERT INTO protocol_nodes(protocol_id,workspace_id,repo_id,kind,name,qualified_name,"
+        "file_path,symbol_global_id,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) "
+        "ON CONFLICT(protocol_id) DO UPDATE SET repo_id=CASE "
+        "WHEN excluded.repo_id<protocol_nodes.repo_id THEN excluded.repo_id "
+        "ELSE protocol_nodes.repo_id END,file_path=CASE "
+        "WHEN excluded.repo_id<protocol_nodes.repo_id THEN excluded.file_path "
+        "ELSE protocol_nodes.file_path END,properties=excluded.properties;";
     const char *find_sql =
         "SELECT global_id,repo_id,name,qualified_name,file_path,label FROM symbols "
         "WHERE workspace_id=?1 AND name=?2;";
     if (sqlite3_prepare_v2(db, node_sql, -1, &ctx.insert_node, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db, edge_sql, -1, &ctx.insert_edge, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, service_sql, -1, &ctx.insert_service, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db, find_sql, -1, &ctx.find_symbols, NULL) != SQLITE_OK) goto fail_ctx;
     int rc = 0;
     for (int i = 0; i < workspace->repo_count && rc == 0; i++) {
@@ -1956,9 +2455,11 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
         }
     }
     if (rc == 0) rc = resolve_aidl_references(&ctx);
+    if (rc == 0) rc = resolve_binder_services(&ctx);
     if (rc == 0) rc = link_static_jni(&ctx);
     sqlite3_finalize(ctx.insert_node);
     sqlite3_finalize(ctx.insert_edge);
+    sqlite3_finalize(ctx.insert_service);
     sqlite3_finalize(ctx.find_symbols);
     if (rc != 0 || sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) goto fail;
     sqlite3_close(db);
@@ -1967,6 +2468,7 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
 fail_ctx:
     sqlite3_finalize(ctx.insert_node);
     sqlite3_finalize(ctx.insert_edge);
+    sqlite3_finalize(ctx.insert_service);
     sqlite3_finalize(ctx.find_symbols);
 fail:
     sqlite3_finalize(clear);

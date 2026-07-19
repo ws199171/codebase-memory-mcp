@@ -537,6 +537,31 @@ without direct inheritance evidence remain unlinked. The protocol graph records
 transaction, and owner evidence. Refresh remains atomic and idempotent, including
 shared `onTransact` handlers used by multiple methods.
 
+## ServiceManager Paths
+
+P3 recognizes literal service names passed to common native, NDK, Java, and Kotlin
+ServiceManager registration, lookup, check, and wait APIs. Each call becomes a
+source-located registration, lookup, or wait operation under its smallest indexed
+enclosing function or method. All repositories in a workspace share the same
+deterministic `BINDER_SERVICE` identity for a service name, so client and server
+paths meet even when they are indexed from different manifest projects.
+
+Registration arguments retain a concrete implementation hint when the call names
+one. That hint links the service to P2 implementation methods only when their
+owner has direct generated-Binder inheritance evidence. Lookup and wait callers
+retain an AIDL interface hint from their indexed source range and link the service
+to the exact `AIDL_INTERFACE` name. Service properties report separate server and
+interface candidate counts with `resolved`, `not_found`, or `ambiguous` state.
+Server and interface edges are emitted only for a unique candidate identity;
+ambiguous short implementation or interface names retain candidate evidence but
+produce no speculative edge.
+
+The graph uses `CALLS_SERVICE_MANAGER`, `REGISTERS_BINDER_SERVICE`,
+`LOOKS_UP_BINDER_SERVICE`, `WAITS_FOR_BINDER_SERVICE`, `BINDER_SERVICE_SERVER`,
+and `BINDER_SERVICE_INTERFACE` edges. Calls with computed service names do not
+produce a guessed service identity; only literal names enter the static protocol
+graph. Refresh remains transactional and idempotent.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

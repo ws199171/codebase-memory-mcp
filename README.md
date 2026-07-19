@@ -611,10 +611,12 @@ type references resolve across manifest repositories; callback parameters,
 annotations, oneway semantics, and declared stability remain structured protocol
 evidence. Generated Binder transaction constants are linked to matching
 `onTransact` cases, proxy `transact` calls, generated server methods, and concrete
-methods whose owner directly inherits the generated server type. The linker also
-resolves exported JNI names and parses `JNINativeMethod` dynamic registration
-tables. Each protocol edge records its confidence and evidence; ambiguous
-name-only candidates are not linked.
+methods whose owner directly inherits the generated server type. Literal
+ServiceManager registration, lookup, and wait calls become shared service nodes
+that connect enclosing client/server callers to direct Binder implementations and
+AIDL interfaces. The linker also resolves exported JNI names and parses
+`JNINativeMethod` dynamic registration tables. Each protocol edge records its
+confidence and evidence; ambiguous name-only candidates are not linked.
 
 `aosp modules --details` exposes bounded outgoing dependency records and file
 declarations for matching modules. Each record retains structured variant,

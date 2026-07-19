@@ -663,7 +663,7 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"workspace_root\"]}"},
 
     {"aosp_trace_protocol", "Trace AOSP protocol",
-     "Read complete AIDL declarations, Binder transaction/dispatch/proxy/implementation "
+     "Read complete AIDL declarations, Binder transaction and ServiceManager client/server "
      "flows, and JNI link coverage from an AOSP workspace. Run the CLI aosp link command "
      "after shard indexing to refresh protocol evidence.",
      "{\"type\":\"object\",\"properties\":{"
@@ -8725,6 +8725,16 @@ static char *handle_aosp_trace_protocol(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "binder_transact_calls", stats.binder_transact_calls);
     yyjson_mut_obj_add_int(doc, root, "binder_implementation_methods",
                            stats.binder_implementation_methods);
+    yyjson_mut_obj_add_int(doc, root, "binder_services", stats.binder_services);
+    yyjson_mut_obj_add_int(doc, root, "binder_service_registrations",
+                           stats.binder_service_registrations);
+    yyjson_mut_obj_add_int(doc, root, "binder_service_lookups",
+                           stats.binder_service_lookups);
+    yyjson_mut_obj_add_int(doc, root, "binder_service_waits", stats.binder_service_waits);
+    yyjson_mut_obj_add_int(doc, root, "binder_service_server_links",
+                           stats.binder_service_server_links);
+    yyjson_mut_obj_add_int(doc, root, "binder_service_interface_links",
+                           stats.binder_service_interface_links);
     yyjson_mut_obj_add_int(doc, root, "jni_static_edges", stats.jni_static_edges);
     yyjson_mut_obj_add_int(doc, root, "jni_dynamic_edges", stats.jni_dynamic_edges);
     yyjson_mut_obj_add_int(doc, root, "count", count);

@@ -3720,6 +3720,11 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    "%d transact calls, %d implementation methods\n",
                    stats.binder_transaction_constants, stats.binder_on_transact_handlers,
                    stats.binder_transact_calls, stats.binder_implementation_methods);
+            printf("  Binder services: %d services, %d registrations, %d lookups, "
+                   "%d waits, %d server links, %d interface links\n",
+                   stats.binder_services, stats.binder_service_registrations,
+                   stats.binder_service_lookups, stats.binder_service_waits,
+                   stats.binder_service_server_links, stats.binder_service_interface_links);
             printf("  JNI: %d static, %d dynamic edges\n",
                    stats.jni_static_edges, stats.jni_dynamic_edges);
             printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);

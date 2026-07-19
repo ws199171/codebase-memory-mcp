@@ -23,6 +23,12 @@ typedef struct {
     int binder_on_transact_handlers;
     int binder_transact_calls;
     int binder_implementation_methods;
+    int binder_services;
+    int binder_service_registrations;
+    int binder_service_lookups;
+    int binder_service_waits;
+    int binder_service_server_links;
+    int binder_service_interface_links;
     int jni_static_edges;
     int jni_dynamic_edges;
 } cbm_aosp_protocol_stats_t;
