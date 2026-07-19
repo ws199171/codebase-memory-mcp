@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `B7` - parse product makefiles, product packages, inheritance,
-  BoardConfig, device/vendor, and partition ownership.
-- Next task: `B8` - import supported Bazel mixed-build module and dependency
+- Current task: `B8` - import supported Bazel mixed-build module and dependency
   metadata.
+- Next task: `B9` - link build modules to source files, generated files, and
+  definition symbols.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -84,7 +84,13 @@ complete:
     24 AOSP tests, 159 MCP tests, production `-Werror` build, and production
     CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
     verification completion.
-- Worktree baseline: B5 generated build dependency checkpoint `b83a195` on
+  - `B7` product Makefiles and fragments, `PRODUCT_PACKAGES*`, resolved and
+    unresolved inheritance, package provenance, BoardConfig variables,
+    device/vendor ownership, explicit partition evidence, and schema v11 product
+    tables; 25 AOSP tests, 159 MCP tests, production `-Werror` build, and
+    production CLI/MCP smoke pass; Linux ASan/UBSan execution remains required
+    before verification completion.
+- Worktree baseline: B7 product build semantics checkpoint `5c45fd7` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -285,3 +291,5 @@ unaccepted critical coverage gap.
 | `B3` | `16b31ea` | Target/arch/multilib/product/Soong-config/select dependency variants, conditional defaults composition, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B4` | `c0c6e51` | Namespace/import/global/explicit resolution, package/default visibility, ambiguity and visibility evidence, schema v8 boundaries, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B5` | `b83a195` | Filegroup/genrule declarations, literal file separation, generated/tool edges, tagged references, defaults file provenance, schema v9 `module_files`, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B6` | `5e72c53` | Common Make variables, deterministic conditions, includes, user macros and functions, semantic module classes, schema v10 coverage gaps, 24 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B7` | `5c45fd7` | Product Makefiles/fragments, inheritance states and provenance, product package resolution, BoardConfig/device/vendor/partition ownership, schema v11 product tables, 25 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
