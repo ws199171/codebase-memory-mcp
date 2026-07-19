@@ -101,6 +101,28 @@ typedef struct {
     size_t err_size;
 } link_ctx_t;
 
+typedef struct {
+    char *global_id;
+    char *repo_id;
+    char *name;
+    char *qualified_name;
+    char *file_path;
+    char *label;
+    int start_line;
+    int end_line;
+} binder_symbol_t;
+
+typedef struct {
+    binder_symbol_t *items;
+    int count;
+    int cap;
+} binder_symbols_t;
+
+static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *method,
+                            const char *interface_name, const char *stem);
+static void hash_id(const char *workspace_id, const char *kind, const char *qualified,
+                    char out[65]);
+
 static void pg_error(char *err, size_t err_size, const char *message, const char *detail) {
     if (!err || err_size == 0) return;
     if (detail && detail[0]) {
@@ -136,6 +158,168 @@ static char *pg_read_file(const char *path, size_t *length_out) {
     source[read] = '\0';
     if (length_out) *length_out = read;
     return source;
+}
+
+static void binder_symbols_free(binder_symbols_t *symbols) {
+    if (!symbols) return;
+    for (int i = 0; i < symbols->count; i++) {
+        free(symbols->items[i].global_id);
+        free(symbols->items[i].repo_id);
+        free(symbols->items[i].name);
+        free(symbols->items[i].qualified_name);
+        free(symbols->items[i].file_path);
+        free(symbols->items[i].label);
+    }
+    free(symbols->items);
+    memset(symbols, 0, sizeof(*symbols));
+}
+
+static int binder_symbols_load(link_ctx_t *ctx, const char *name, binder_symbols_t *symbols) {
+    const char *sql =
+        "SELECT global_id,repo_id,name,qualified_name,file_path,label,start_line,end_line "
+        "FROM symbols WHERE workspace_id=?1 AND name=?2 ORDER BY qualified_name,global_id;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, ctx->workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
+    int rc = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (symbols->count == symbols->cap) {
+            int new_cap = symbols->cap ? symbols->cap * 2 : 8;
+            binder_symbol_t *items = realloc(symbols->items,
+                                             (size_t)new_cap * sizeof(*items));
+            if (!items) {
+                rc = -1;
+                break;
+            }
+            symbols->items = items;
+            symbols->cap = new_cap;
+        }
+        binder_symbol_t *item = &symbols->items[symbols->count];
+        memset(item, 0, sizeof(*item));
+        const char *global_id = (const char *)sqlite3_column_text(stmt, 0);
+        const char *repo_id = (const char *)sqlite3_column_text(stmt, 1);
+        const char *symbol_name = (const char *)sqlite3_column_text(stmt, 2);
+        const char *qualified = (const char *)sqlite3_column_text(stmt, 3);
+        const char *file_path = (const char *)sqlite3_column_text(stmt, 4);
+        const char *label = (const char *)sqlite3_column_text(stmt, 5);
+        item->global_id = strdup(global_id ? global_id : "");
+        item->repo_id = strdup(repo_id ? repo_id : "");
+        item->name = strdup(symbol_name ? symbol_name : "");
+        item->qualified_name = strdup(qualified ? qualified : "");
+        item->file_path = strdup(file_path ? file_path : "");
+        item->label = strdup(label ? label : "");
+        item->start_line = sqlite3_column_int(stmt, 6);
+        item->end_line = sqlite3_column_int(stmt, 7);
+        if (!item->global_id || !item->repo_id || !item->name ||
+            !item->qualified_name || !item->file_path || !item->label) {
+            symbols->count++;
+            rc = -1;
+            break;
+        }
+        symbols->count++;
+    }
+    if (rc == 0 && sqlite3_errcode(ctx->db) != SQLITE_OK &&
+        sqlite3_errcode(ctx->db) != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    if (rc != 0) binder_symbols_free(symbols);
+    return rc;
+}
+
+static int binder_symbols_add_source_constant(link_ctx_t *ctx, binder_symbols_t *symbols,
+                                              const binder_symbol_t *handler,
+                                              const char *transaction_name) {
+    if (symbols->count == symbols->cap) {
+        int new_cap = symbols->cap ? symbols->cap * 2 : 4;
+        binder_symbol_t *items = realloc(symbols->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return -1;
+        symbols->items = items;
+        symbols->cap = new_cap;
+    }
+    size_t qualified_length = strlen(handler->qualified_name);
+    size_t handler_length = strlen(handler->name);
+    if (qualified_length <= handler_length) return -1;
+    size_t prefix_length = qualified_length - handler_length;
+    size_t size = prefix_length + strlen(transaction_name) + 1;
+    char *qualified = malloc(size);
+    if (!qualified) return -1;
+    memcpy(qualified, handler->qualified_name, prefix_length);
+    (void)snprintf(qualified + prefix_length, size - prefix_length, "%s", transaction_name);
+    char global_id[65];
+    hash_id(ctx->workspace->workspace_id, "BINDER_TRANSACTION_CONSTANT", qualified, global_id);
+
+    binder_symbol_t *item = &symbols->items[symbols->count];
+    memset(item, 0, sizeof(*item));
+    item->global_id = strdup(global_id);
+    item->repo_id = strdup(handler->repo_id);
+    item->name = strdup(transaction_name);
+    item->qualified_name = qualified;
+    item->file_path = strdup(handler->file_path);
+    item->label = strdup("SourceConstant");
+    item->start_line = handler->start_line;
+    item->end_line = handler->end_line;
+    if (!item->global_id || !item->repo_id || !item->name || !item->qualified_name ||
+        !item->file_path || !item->label) {
+        symbols->count++;
+        return -1;
+    }
+    symbols->count++;
+    return 0;
+}
+
+static const cbm_aosp_repo_t *binder_symbol_repo(const link_ctx_t *ctx, const char *repo_id) {
+    for (int i = 0; i < ctx->workspace->repo_count; i++) {
+        if (repo_id && strcmp(ctx->workspace->repos[i].repo_id, repo_id) == 0) {
+            return &ctx->workspace->repos[i];
+        }
+    }
+    return NULL;
+}
+
+static char *binder_symbol_source(const link_ctx_t *ctx, const binder_symbol_t *symbol,
+                                  bool range_only) {
+    const cbm_aosp_repo_t *repo = binder_symbol_repo(ctx, symbol->repo_id);
+    if (!repo || !repo->abs_path || !symbol->file_path || !symbol->file_path[0]) return NULL;
+    char path[PG_PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%s", repo->abs_path, symbol->file_path);
+    if (written < 0 || (size_t)written >= sizeof(path)) return NULL;
+    size_t length = 0;
+    char *source = pg_read_file(path, &length);
+    if (!source || !range_only || symbol->start_line <= 0 || symbol->end_line <= 0) return source;
+    size_t start = 0;
+    size_t end = length;
+    int line = 1;
+    bool found_start = symbol->start_line == 1;
+    for (size_t i = 0; i < length; i++) {
+        if (line == symbol->start_line) {
+            start = i;
+            found_start = true;
+            break;
+        }
+        if (source[i] == '\n') line++;
+    }
+    if (!found_start) {
+        free(source);
+        return NULL;
+    }
+    line = 1;
+    for (size_t i = 0; i < length; i++) {
+        if (source[i] == '\n') {
+            if (line == symbol->end_line) {
+                end = i + 1;
+                break;
+            }
+            line++;
+        }
+    }
+    if (end < start) end = start;
+    char *range = malloc(end - start + 1);
+    if (range) {
+        memcpy(range, source + start, end - start);
+        range[end - start] = '\0';
+    }
+    free(source);
+    return range;
 }
 
 static bool pg_strings_add(pg_strings_t *strings, const char *value) {
@@ -276,6 +460,60 @@ static pg_token_t pg_next(pg_lexer_t *lexer) {
     }
     token.kind = PG_OTHER;
     return token;
+}
+
+static char *binder_symbol_owner(const char *qualified_name, const char *method_name) {
+    if (!qualified_name || !method_name) return NULL;
+    size_t length = strlen(qualified_name);
+    size_t method_length = strlen(method_name);
+    if (length <= method_length) return NULL;
+    size_t end = length - method_length;
+    while (end > 0 && (qualified_name[end - 1] == '.' || qualified_name[end - 1] == ':' ||
+                       qualified_name[end - 1] == '$')) end--;
+    if (end == 0) return NULL;
+    size_t start = end;
+    while (start > 0 && qualified_name[start - 1] != '.' &&
+           qualified_name[start - 1] != ':' && qualified_name[start - 1] != '$') start--;
+    char *owner = malloc(end - start + 1);
+    if (!owner) return NULL;
+    memcpy(owner, qualified_name + start, end - start);
+    owner[end - start] = '\0';
+    return owner;
+}
+
+static bool binder_source_declares_implementation(const char *source, const char *owner,
+                                                  const char *bn_name,
+                                                  const char *interface_name) {
+    if (!source || !owner || !owner[0]) return false;
+    pg_lexer_t lexer = {.source = source, .length = strlen(source)};
+    bool after_class = false;
+    bool matching_owner = false;
+    pg_token_t token;
+    while ((token = pg_next(&lexer)).kind != PG_EOF) {
+        if (token.kind == PG_IDENT && token.text &&
+            (strcmp(token.text, "class") == 0 || strcmp(token.text, "struct") == 0)) {
+            after_class = true;
+            matching_owner = false;
+        } else if (after_class && token.kind == PG_IDENT && token.text) {
+            matching_owner = strcmp(token.text, owner) == 0;
+            after_class = false;
+        } else if (matching_owner && token.kind == PG_LBRACE) {
+            matching_owner = false;
+        } else if (matching_owner && token.kind == PG_SEMI) {
+            matching_owner = false;
+        } else if (matching_owner && token.kind == PG_IDENT && token.text) {
+            bool cpp_base = bn_name && strcmp(token.text, bn_name) == 0;
+            bool java_base = interface_name && strstr(token.text, interface_name) &&
+                             strstr(token.text, ".Stub");
+            if (cpp_base || java_base) {
+                pg_token_free(&token);
+                return true;
+            }
+        }
+        pg_token_free(&token);
+    }
+    pg_token_free(&token);
+    return false;
 }
 
 static void aidl_method_free(aidl_method_t *method) {
@@ -689,9 +927,10 @@ static bool contains_class_token(const char *qualified_name, const char *token) 
     if (!qualified_name || !token || !token[0]) return false;
     const char *hit = strstr(qualified_name, token);
     while (hit) {
-        bool left = hit == qualified_name || hit[-1] == '.' || hit[-1] == '$';
+        bool left = hit == qualified_name || hit[-1] == '.' || hit[-1] == '$' || hit[-1] == ':';
         char right_char = hit[strlen(token)];
-        bool right = right_char == '\0' || right_char == '.' || right_char == '$';
+        bool right = right_char == '\0' || right_char == '.' || right_char == '$' ||
+                     right_char == ':';
         if (left && right) return true;
         hit = strstr(hit + 1, token);
     }
@@ -709,6 +948,29 @@ static int add_symbol_endpoint(link_ctx_t *ctx, sqlite3_stmt *row, const char *k
     (void)snprintf(id_out, 65, "%s", global_id);
     return insert_protocol_node(ctx, global_id, repo_id, kind, name, qualified,
                                 file_path ? file_path : "", global_id);
+}
+
+static int add_binder_symbol_endpoint(link_ctx_t *ctx, const binder_symbol_t *symbol,
+                                      const char *kind) {
+    return insert_protocol_node(ctx, symbol->global_id, symbol->repo_id, kind,
+                                symbol->name, symbol->qualified_name, symbol->file_path,
+                                symbol->global_id);
+}
+
+static char *binder_evidence_properties(const char *transaction_name,
+                                        const char *method_name,
+                                        const char *owner_name) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "transaction", transaction_name);
+    yyjson_mut_obj_add_strcpy(doc, root, "method", method_name);
+    if (owner_name) yyjson_mut_obj_add_strcpy(doc, root, "owner", owner_name);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
 }
 
 static int link_generated_type(link_ctx_t *ctx, const char *aidl_id, const char *candidate,
@@ -740,8 +1002,10 @@ static int link_binder_method(link_ctx_t *ctx, const char *method_id, const char
     (void)snprintf(bp, sizeof(bp), "Bp%s", stem);
     while (sqlite3_step(ctx->find_symbols) == SQLITE_ROW) {
         const char *qualified = (const char *)sqlite3_column_text(ctx->find_symbols, 3);
+        const char *label = (const char *)sqlite3_column_text(ctx->find_symbols, 5);
         const char *kind = NULL;
         const char *edge_type = NULL;
+        if (!label || strcmp(label, "Method") != 0) continue;
         if (contains_class_token(qualified, bn) ||
             (strstr(qualified, interface_name) && strstr(qualified, ".Stub."))) {
             kind = "BINDER_SERVER_METHOD";
@@ -1006,6 +1270,9 @@ static int link_aidl_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
         }
         if (rc == 0 && strcmp(decl.kind, "interface") == 0) {
             rc = link_binder_method(ctx, method_id, method->name, decl.name, stem);
+        }
+        if (rc == 0 && strcmp(decl.kind, "interface") == 0) {
+            rc = link_binder_flow(ctx, method_id, method->name, decl.name, stem);
         }
         if (rc == 0 && !aidl_is_builtin_type(method->return_type)) {
             rc = add_aidl_reference(ctx, repo, &decl, method_id, method_qn,
@@ -1391,6 +1658,180 @@ static int resolve_aidl_references(link_ctx_t *ctx) {
     return 0;
 }
 
+static bool binder_generated_server(const char *qualified_name, const char *bn_name,
+                                    const char *interface_name) {
+    return contains_class_token(qualified_name, bn_name) ||
+           (strstr(qualified_name ? qualified_name : "", interface_name) &&
+            strstr(qualified_name, ".Stub."));
+}
+
+static bool binder_generated_proxy(const char *qualified_name, const char *bp_name,
+                                   const char *interface_name) {
+    return contains_class_token(qualified_name, bp_name) ||
+           (strstr(qualified_name ? qualified_name : "", interface_name) &&
+            strstr(qualified_name, ".Proxy."));
+}
+
+static bool binder_range_contains(link_ctx_t *ctx, const binder_symbol_t *symbol,
+                                  const char *first, const char *second) {
+    char *source = binder_symbol_source(ctx, symbol, true);
+    if (!source) return false;
+    bool found_first = false;
+    bool found_second = second == NULL;
+    pg_lexer_t lexer = {.source = source, .length = strlen(source)};
+    pg_token_t token;
+    while ((token = pg_next(&lexer)).kind != PG_EOF) {
+        if (token.kind == PG_IDENT && token.text) {
+            if (strcmp(token.text, first) == 0) found_first = true;
+            if (second && strcmp(token.text, second) == 0) found_second = true;
+        }
+        pg_token_free(&token);
+    }
+    pg_token_free(&token);
+    bool matches = found_first && found_second;
+    free(source);
+    return matches;
+}
+
+static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *method,
+                            const char *interface_name, const char *stem) {
+    char bn[512];
+    char bp[512];
+    char transaction[768];
+    (void)snprintf(bn, sizeof(bn), "Bn%s", stem);
+    (void)snprintf(bp, sizeof(bp), "Bp%s", stem);
+    (void)snprintf(transaction, sizeof(transaction), "TRANSACTION_%s", method);
+
+    binder_symbols_t methods = {0};
+    binder_symbols_t constants = {0};
+    binder_symbols_t handlers = {0};
+    int rc = binder_symbols_load(ctx, method, &methods);
+    if (rc == 0) rc = binder_symbols_load(ctx, transaction, &constants);
+    if (rc == 0) rc = binder_symbols_load(ctx, "onTransact", &handlers);
+    if (rc != 0) goto done;
+
+    int server_count = 0;
+    for (int s = 0; s < methods.count; s++) {
+        binder_symbol_t *server = &methods.items[s];
+        if (strcmp(server->label, "Method") == 0 &&
+            binder_generated_server(server->qualified_name, bn, interface_name)) server_count++;
+    }
+    for (int i = 0; i < methods.count && rc == 0; i++) {
+        binder_symbol_t *implementation = &methods.items[i];
+        if (strcmp(implementation->label, "Method") != 0 ||
+            binder_generated_server(implementation->qualified_name, bn, interface_name) ||
+            binder_generated_proxy(implementation->qualified_name, bp, interface_name)) continue;
+        char *owner = binder_symbol_owner(implementation->qualified_name, method);
+        char *source = binder_symbol_source(ctx, implementation, false);
+        bool direct_implementation = source && owner &&
+            binder_source_declares_implementation(source, owner, bn, interface_name);
+        free(source);
+        if (!direct_implementation) {
+            free(owner);
+            continue;
+        }
+        char *properties = binder_evidence_properties(transaction, method, owner);
+        if (!properties ||
+            add_binder_symbol_endpoint(ctx, implementation,
+                                       "BINDER_IMPLEMENTATION_METHOD") != 0) {
+            rc = -1;
+        }
+        for (int s = 0; s < methods.count && rc == 0; s++) {
+            binder_symbol_t *server = &methods.items[s];
+            if (strcmp(server->label, "Method") != 0 ||
+                !binder_generated_server(server->qualified_name, bn, interface_name)) continue;
+            if (insert_protocol_edge_properties(ctx, server->global_id,
+                    implementation->global_id, "BINDER_IMPLEMENTED_BY", 1.0,
+                    "binder_direct_inheritance", properties) != 0) rc = -1;
+        }
+        if (rc == 0 && server_count == 0 &&
+            insert_protocol_edge_properties(ctx, method_id, implementation->global_id,
+                "BINDER_IMPLEMENTED_BY", 1.0, "binder_direct_inheritance",
+                properties) != 0) rc = -1;
+        free(properties);
+        free(owner);
+    }
+
+    if (constants.count == 0) {
+        for (int h = 0; h < handlers.count && rc == 0; h++) {
+            binder_symbol_t *handler = &handlers.items[h];
+            if (strcmp(handler->label, "Method") == 0 &&
+                binder_generated_server(handler->qualified_name, bn, interface_name) &&
+                binder_range_contains(ctx, handler, transaction, method)) {
+                rc = binder_symbols_add_source_constant(ctx, &constants, handler, transaction);
+                break;
+            }
+        }
+    }
+
+    for (int c = 0; c < constants.count && rc == 0; c++) {
+        binder_symbol_t *constant = &constants.items[c];
+        if (strcmp(constant->label, "Method") == 0 ||
+            !binder_generated_server(constant->qualified_name, bn, interface_name)) continue;
+        char *properties = binder_evidence_properties(transaction, method, NULL);
+        if (!properties) {
+            rc = -1;
+            break;
+        }
+        int endpoint_rc = strcmp(constant->label, "SourceConstant") == 0
+            ? insert_protocol_node_properties(ctx, constant->global_id, constant->repo_id,
+                "BINDER_TRANSACTION_CONSTANT", constant->name, constant->qualified_name,
+                constant->file_path, NULL, properties)
+            : add_binder_symbol_endpoint(ctx, constant, "BINDER_TRANSACTION_CONSTANT");
+        if (endpoint_rc != 0 ||
+            insert_protocol_edge_properties(ctx, method_id, constant->global_id,
+                "BINDER_TRANSACTION", 1.0, "binder_transaction_constant", properties) != 0) {
+            free(properties);
+            rc = -1;
+            break;
+        }
+
+        for (int h = 0; h < handlers.count && rc == 0; h++) {
+            binder_symbol_t *handler = &handlers.items[h];
+            if (strcmp(handler->label, "Method") != 0 ||
+                !binder_generated_server(handler->qualified_name, bn, interface_name) ||
+                !binder_range_contains(ctx, handler, transaction, method)) continue;
+            if (add_binder_symbol_endpoint(ctx, handler, "BINDER_ON_TRANSACT_HANDLER") != 0 ||
+                insert_protocol_edge_properties(ctx, constant->global_id, handler->global_id,
+                    "BINDER_DISPATCH_CASE", 1.0, "binder_on_transact_case", properties) != 0) {
+                rc = -1;
+                break;
+            }
+            bool dispatched_to_server = false;
+            for (int s = 0; s < methods.count && rc == 0; s++) {
+                binder_symbol_t *server = &methods.items[s];
+                if (strcmp(server->label, "Method") != 0 ||
+                    !binder_generated_server(server->qualified_name, bn, interface_name)) continue;
+                dispatched_to_server = true;
+                if (insert_protocol_edge_properties(ctx, handler->global_id, server->global_id,
+                        "BINDER_DISPATCHES_TO", 1.0, "binder_on_transact_case",
+                        properties) != 0) rc = -1;
+            }
+            if (rc == 0 && !dispatched_to_server &&
+                insert_protocol_edge_properties(ctx, handler->global_id, method_id,
+                    "BINDER_DISPATCHES_TO", 1.0, "binder_on_transact_case",
+                    properties) != 0) rc = -1;
+        }
+
+        for (int p = 0; p < methods.count && rc == 0; p++) {
+            binder_symbol_t *proxy = &methods.items[p];
+            if (strcmp(proxy->label, "Method") != 0 ||
+                !binder_generated_proxy(proxy->qualified_name, bp, interface_name) ||
+                !binder_range_contains(ctx, proxy, transaction, "transact")) continue;
+            if (insert_protocol_edge_properties(ctx, proxy->global_id, constant->global_id,
+                    "BINDER_TRANSACT_CALL", 1.0, "binder_proxy_transact_call",
+                    properties) != 0) rc = -1;
+        }
+        free(properties);
+    }
+
+done:
+    binder_symbols_free(&methods);
+    binder_symbols_free(&constants);
+    binder_symbols_free(&handlers);
+    return rc;
+}
+
 int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
                             cbm_aosp_protocol_stats_t *stats, char *err, size_t err_size) {
     if (!workspace || !stats) return -1;
@@ -1421,6 +1862,10 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         "AND json_extract(properties,'$.stability')!='local'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVER_IMPL'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_CLIENT_PROXY'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_TRANSACTION_CONSTANT'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_ON_TRANSACT_HANDLER'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_TRANSACT_CALL'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_IMPLEMENTATION_METHOD'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_exported_name'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_native_method_table');";
     sqlite3_stmt *stmt = NULL;
@@ -1441,8 +1886,12 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
             stats->aidl_stable_types = sqlite3_column_int(stmt, 10);
             stats->binder_server_edges = sqlite3_column_int(stmt, 11);
             stats->binder_client_edges = sqlite3_column_int(stmt, 12);
-            stats->jni_static_edges = sqlite3_column_int(stmt, 13);
-            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 14);
+            stats->binder_transaction_constants = sqlite3_column_int(stmt, 13);
+            stats->binder_on_transact_handlers = sqlite3_column_int(stmt, 14);
+            stats->binder_transact_calls = sqlite3_column_int(stmt, 15);
+            stats->binder_implementation_methods = sqlite3_column_int(stmt, 16);
+            stats->jni_static_edges = sqlite3_column_int(stmt, 17);
+            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 18);
             rc = 0;
         }
     } else {
@@ -1485,8 +1934,12 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
 
     link_ctx_t ctx = {.db = db, .workspace = workspace, .err = err, .err_size = err_size};
     const char *node_sql =
-        "INSERT OR REPLACE INTO protocol_nodes(protocol_id,workspace_id,repo_id,kind,name,"
-        "qualified_name,file_path,symbol_global_id,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);";
+        "INSERT INTO protocol_nodes(protocol_id,workspace_id,repo_id,kind,name,qualified_name,"
+        "file_path,symbol_global_id,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) "
+        "ON CONFLICT(protocol_id) DO UPDATE SET workspace_id=excluded.workspace_id,"
+        "repo_id=excluded.repo_id,kind=excluded.kind,name=excluded.name,"
+        "qualified_name=excluded.qualified_name,file_path=excluded.file_path,"
+        "symbol_global_id=excluded.symbol_global_id,properties=excluded.properties;";
     const char *edge_sql =
         "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties)"
         " VALUES(?1,?2,?3,?4,?5,?6);";

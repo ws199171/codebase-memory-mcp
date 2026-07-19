@@ -19,6 +19,10 @@ typedef struct {
     int aidl_stable_types;
     int binder_server_edges;
     int binder_client_edges;
+    int binder_transaction_constants;
+    int binder_on_transact_handlers;
+    int binder_transact_calls;
+    int binder_implementation_methods;
     int jni_static_edges;
     int jni_dynamic_edges;
 } cbm_aosp_protocol_stats_t;

@@ -648,6 +648,49 @@ static int create_complete_aidl_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_binder_flow_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_binder_p2_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "service/android/media") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest><project name=\"platform/service\" path=\"service\"/></manifest>") != 0 ||
+        write_relative(root, "service/android/media/IAudioService.aidl",
+            "package android.media;\n"
+            "interface IAudioService { int start(); void stop(); }\n") != 0 ||
+        write_relative(root, "service/android/media/AudioBinder.cpp",
+            "class AudioService : public BnAudioService {\n"
+            " public:\n"
+            "  int start() override { return 0; }\n"
+            "  void stop() override {}\n"
+            "};\n"
+            "enum { TRANSACTION_start = 1, TRANSACTION_stop = 2 };\n"
+            "int BnAudioService::start() { return 0; }\n"
+            "void BnAudioService::stop() {}\n"
+            "int BnAudioService::onTransact(int code) {\n"
+            "  if (code == TRANSACTION_start) return start();\n"
+            "  if (code == TRANSACTION_stop) { stop(); return 0; }\n"
+            "  return -1;\n"
+            "}\n"
+            "int BpAudioService::start() {\n"
+            "  return remote()->transact(TRANSACTION_start);\n"
+            "}\n"
+            "void BpAudioService::stop() {\n"
+            "  remote()->transact(TRANSACTION_stop);\n"
+            "}\n"
+            "class Unrelated { public: int start(); };\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3432,6 +3475,104 @@ TEST(aosp_protocol_graph_models_complete_aidl_declarations) {
     PASS();
 }
 
+TEST(aosp_protocol_graph_links_binder_transaction_flow) {
+    char *root = NULL;
+    ASSERT_EQ(create_binder_flow_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_path[4096];
+    (void)snprintf(shard_path, sizeof(shard_path), "%s/binder-flow-shard.db", root);
+    sqlite3 *shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_path, &shard), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(shard,
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+        "INSERT INTO nodes VALUES"
+        "(2,'start','android.media.BpAudioService.start','Method',"
+        "'android/media/AudioBinder.cpp',14,16,'{}'),"
+        "(3,'start','android.media.AudioService.start','Method',"
+        "'android/media/AudioBinder.cpp',3,3,'{}'),"
+        "(5,'onTransact','android.media.BnAudioService.onTransact','Method',"
+        "'android/media/AudioBinder.cpp',9,13,'{}'),"
+        "(6,'start','android.media.Unrelated.start','Method',"
+        "'android/media/AudioBinder.cpp',20,20,'{}'),"
+        "(8,'stop','android.media.BpAudioService.stop','Method',"
+        "'android/media/AudioBinder.cpp',17,19,'{}'),"
+        "(9,'stop','android.media.AudioService.stop','Method',"
+        "'android/media/AudioBinder.cpp',4,4,'{}');",
+        NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(shard);
+    ASSERT_EQ(cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[0], shard_path,
+                                       err, sizeof(err)), 0);
+
+    cbm_aosp_protocol_stats_t stats;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.aidl_interfaces, 1);
+    ASSERT_EQ(stats.aidl_methods, 2);
+    ASSERT_EQ(stats.binder_server_edges, 0);
+    ASSERT_EQ(stats.binder_client_edges, 2);
+    ASSERT_EQ(stats.binder_transaction_constants, 2);
+    ASSERT_EQ(stats.binder_on_transact_handlers, 1);
+    ASSERT_EQ(stats.binder_transact_calls, 2);
+    ASSERT_EQ(stats.binder_implementation_methods, 2);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(type,',') FROM (SELECT type FROM protocol_edges e "
+        "JOIN protocol_nodes s ON s.protocol_id=e.source_id WHERE s.workspace_id=?1 "
+        "AND type IN('BINDER_TRANSACTION','BINDER_DISPATCH_CASE','BINDER_DISPATCHES_TO',"
+        "'BINDER_TRANSACT_CALL','BINDER_IMPLEMENTED_BY') ORDER BY type);",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+        "BINDER_DISPATCHES_TO,BINDER_DISPATCHES_TO,BINDER_DISPATCH_CASE,"
+        "BINDER_DISPATCH_CASE,BINDER_IMPLEMENTED_BY,BINDER_IMPLEMENTED_BY,"
+        "BINDER_TRANSACTION,BINDER_TRANSACTION,BINDER_TRANSACT_CALL,"
+        "BINDER_TRANSACT_CALL");
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 "
+        "AND kind='BINDER_IMPLEMENTATION_METHOD' AND qualified_name LIKE '%Unrelated%';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"start\",\"limit\":50}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_trace_protocol", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"binder_transaction_constants\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"binder_on_transact_handlers\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"binder_transact_calls\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"binder_implementation_methods\":2"));
+    ASSERT_NOT_NULL(strstr(response, "binder_proxy_transact_call"));
+    ASSERT_NOT_NULL(strstr(response, "binder_direct_inheritance"));
+    free(response);
+
+    int edge_count = stats.edge_count;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.edge_count, edge_count);
+    ASSERT_EQ(stats.binder_transact_calls, 2);
+    ASSERT_EQ(stats.binder_implementation_methods, 2);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -4564,6 +4705,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols);
     RUN_TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance);
     RUN_TEST(aosp_protocol_graph_models_complete_aidl_declarations);
+    RUN_TEST(aosp_protocol_graph_links_binder_transaction_flow);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

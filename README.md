@@ -609,9 +609,12 @@ AIDL interfaces, parcelables, unions, enums, fields, values, and methods to
 generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy` symbols. Imports and custom
 type references resolve across manifest repositories; callback parameters,
 annotations, oneway semantics, and declared stability remain structured protocol
-evidence. The linker also resolves exported JNI names and parses `JNINativeMethod`
-dynamic registration tables. Each protocol edge records its confidence and
-evidence; ambiguous name-only candidates are not linked.
+evidence. Generated Binder transaction constants are linked to matching
+`onTransact` cases, proxy `transact` calls, generated server methods, and concrete
+methods whose owner directly inherits the generated server type. The linker also
+resolves exported JNI names and parses `JNINativeMethod` dynamic registration
+tables. Each protocol edge records its confidence and evidence; ambiguous
+name-only candidates are not linked.
 
 `aosp modules --details` exposes bounded outgoing dependency records and file
 declarations for matching modules. Each record retains structured variant,

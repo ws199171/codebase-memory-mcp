@@ -3716,6 +3716,10 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.aidl_oneway_methods, stats.aidl_stable_types);
             printf("  Binder: %d server, %d client edges\n",
                    stats.binder_server_edges, stats.binder_client_edges);
+            printf("  Binder flow: %d transaction constants, %d onTransact handlers, "
+                   "%d transact calls, %d implementation methods\n",
+                   stats.binder_transaction_constants, stats.binder_on_transact_handlers,
+                   stats.binder_transact_calls, stats.binder_implementation_methods);
             printf("  JNI: %d static, %d dynamic edges\n",
                    stats.jni_static_edges, stats.jni_dynamic_edges);
             printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);

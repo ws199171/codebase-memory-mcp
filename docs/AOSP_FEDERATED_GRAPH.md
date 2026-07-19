@@ -513,6 +513,30 @@ does not require a new persistence schema. `aosp link`, `aosp protocols`, and
 oneway methods, stable types, node properties, and edge properties. Protocol graph
 replacement remains transactional and independent of repository scan order.
 
+## Binder Transaction Flow
+
+P2 extends each AIDL method with source-backed generated Binder flow. Exact
+`TRANSACTION_<method>` symbols owned by the generated `Bn*` or Java `Stub` type
+become transaction nodes. A generated `onTransact` range is linked only when it
+contains both that transaction constant and the method dispatch. A generated
+`Bp*` or Java `Proxy` method is linked only when its indexed source range contains
+both the transaction constant and a `transact` call.
+
+Some language extractors omit nested transaction enum constants and pure virtual
+server declarations. In that case, the exact identifiers in the indexed
+`onTransact` source range create a source-backed transaction node, and the AIDL
+method remains the dispatch anchor. This preserves explicit evidence without
+inventing a missing catalog symbol.
+
+Concrete implementation methods require three matching facts: the method name,
+the containing symbol owner, and a source declaration showing that owner directly
+inherits the generated `Bn*` type or Java `<Interface>.Stub`. Same-named methods
+without direct inheritance evidence remain unlinked. The protocol graph records
+`BINDER_TRANSACTION`, `BINDER_DISPATCH_CASE`, `BINDER_DISPATCHES_TO`,
+`BINDER_TRANSACT_CALL`, and `BINDER_IMPLEMENTED_BY` edges with structured method,
+transaction, and owner evidence. Refresh remains atomic and idempotent, including
+shared `onTransact` handlers used by multiple methods.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On
