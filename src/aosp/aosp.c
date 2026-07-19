@@ -3377,7 +3377,8 @@ static void print_aosp_usage(FILE *stream) {
         "  codebase-memory-mcp aosp init [root]\n"
         "  codebase-memory-mcp aosp index [root] [--repo manifest-path]\n"
         "  codebase-memory-mcp aosp build [root]\n"
-        "  codebase-memory-mcp aosp modules [root] [--query text] [--limit N]\n"
+        "  codebase-memory-mcp aosp modules [root] [--query text] [--limit N] "
+        "[--details] [--detail-limit N]\n"
         "  codebase-memory-mcp aosp link [root]\n"
         "  codebase-memory-mcp aosp federate [root]\n"
         "  codebase-memory-mcp aosp protocols [root] [--query text] [--limit N]\n"
@@ -3402,6 +3403,8 @@ int cbm_cmd_aosp(int argc, char **argv) {
     const char *repo_filter = NULL;
     const char *search_query = NULL;
     int search_limit = 20;
+    int detail_limit = 200;
+    bool module_details = false;
     const char *query_reference = NULL;
     int trace_depth = 3;
     cbm_aosp_trace_direction_t trace_direction = CBM_AOSP_TRACE_OUTGOING;
@@ -3493,6 +3496,17 @@ int cbm_cmd_aosp(int argc, char **argv) {
                 search_query = argv[++i];
             } else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
                 search_limit = atoi(argv[++i]);
+            } else if (strcmp(action, "modules") == 0 &&
+                       strcmp(argv[i], "--details") == 0) {
+                module_details = true;
+            } else if (strcmp(action, "modules") == 0 &&
+                       strcmp(argv[i], "--detail-limit") == 0 && i + 1 < argc) {
+                if (aosp_parse_int(argv[++i], 1, 2000, &detail_limit) != 0) {
+                    (void)fprintf(stderr,
+                                  "error: --detail-limit must be between 1 and 2000\n");
+                    return 1;
+                }
+                module_details = true;
             } else if (argv[i][0] != '-') {
                 root = argv[i];
             } else {
@@ -3629,19 +3643,63 @@ int cbm_cmd_aosp(int argc, char **argv) {
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;
+        cbm_aosp_build_gap_t *gaps = NULL;
         int count = 0;
+        int gap_count = 0;
+        bool details_truncated = false;
+        bool gaps_truncated = false;
         if (cbm_aosp_search_modules(&workspace, search_query, search_limit, &modules, &count,
                                     err, sizeof(err)) != 0) {
             (void)fprintf(stderr, "error: %s\n", err[0] ? err : "AOSP module search failed");
+            exit_code = 1;
+        } else if (module_details &&
+                   (cbm_aosp_load_module_details(&workspace, modules, count, detail_limit,
+                                                 &details_truncated, err, sizeof(err)) != 0 ||
+                    cbm_aosp_build_gaps(&workspace, detail_limit, &gaps, &gap_count,
+                                        &gaps_truncated, err, sizeof(err)) != 0)) {
+            (void)fprintf(stderr, "error: %s\n",
+                          err[0] ? err : "AOSP module detail query failed");
             exit_code = 1;
         } else {
             for (int i = 0; i < count; i++) {
                 printf("%s\t%s\t%s\t%s\tout:%d\tin:%d\n", modules[i].repo_path,
                        modules[i].module_type, modules[i].name, modules[i].file_path,
                        modules[i].outgoing_dependencies, modules[i].incoming_dependencies);
+                if (!module_details) continue;
+                printf("module_properties\t%s\t%s\t%s\n", modules[i].repo_path,
+                       modules[i].name, modules[i].properties);
+                for (int d = 0; d < modules[i].dependency_count; d++) {
+                    cbm_aosp_module_dependency_t *dependency = &modules[i].dependencies[d];
+                    printf("dependency\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                           modules[i].repo_path, modules[i].name,
+                           dependency->dependency_type, dependency->target_name,
+                           dependency->resolved ? "resolved" : "unresolved",
+                           dependency->target_repo_path, dependency->target_module_name,
+                           dependency->properties);
+                }
+                for (int f = 0; f < modules[i].file_count; f++) {
+                    cbm_aosp_module_file_t *file = &modules[i].files[f];
+                    printf("file\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                           modules[i].repo_path, modules[i].name, file->role,
+                           file->declared_path, file->status, file->workspace_path,
+                           file->properties);
+                }
+            }
+            if (module_details) {
+                for (int i = 0; i < gap_count; i++) {
+                    printf("coverage_gap\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                           gaps[i].kind, gaps[i].repo_path, gaps[i].file_path,
+                           gaps[i].subject, gaps[i].status, gaps[i].properties);
+                }
+                if (details_truncated || gaps_truncated) {
+                    printf("details_truncated\tmodules:%s\tcoverage_gaps:%s\n",
+                           details_truncated ? "true" : "false",
+                           gaps_truncated ? "true" : "false");
+                }
             }
             printf("%d module%s\n", count, count == 1 ? "" : "s");
         }
+        cbm_aosp_build_gaps_free(gaps, gap_count);
         cbm_aosp_modules_free(modules, count);
     } else if (strcmp(action, "link") == 0) {
         cbm_aosp_protocol_stats_t stats;

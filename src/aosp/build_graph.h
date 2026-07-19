@@ -70,14 +70,49 @@ typedef struct {
 } cbm_aosp_build_stats_t;
 
 typedef struct {
+    char *target_name;
+    char *dependency_type;
+    char *target_module_id;
+    char *target_repo_path;
+    char *target_module_name;
+    char *properties;
+    int resolved;
+} cbm_aosp_module_dependency_t;
+
+typedef struct {
+    char *declared_path;
+    char *role;
+    char *workspace_path;
+    char *status;
+    char *file_global_id;
+    char *generated_id;
+    char *properties;
+} cbm_aosp_module_file_t;
+
+typedef struct {
     char *module_id;
     char *repo_path;
     char *name;
     char *module_type;
     char *file_path;
+    char *properties;
     int outgoing_dependencies;
     int incoming_dependencies;
+    cbm_aosp_module_dependency_t *dependencies;
+    int dependency_count;
+    cbm_aosp_module_file_t *files;
+    int file_count;
+    int details_truncated;
 } cbm_aosp_module_t;
+
+typedef struct {
+    char *kind;
+    char *repo_path;
+    char *file_path;
+    char *subject;
+    char *status;
+    char *properties;
+} cbm_aosp_build_gap_t;
 
 int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_stats_t *stats,
                         char *err, size_t err_size);
@@ -85,6 +120,13 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
                          char *err, size_t err_size);
 int cbm_aosp_search_modules(const cbm_aosp_workspace_t *workspace, const char *query, int limit,
                             cbm_aosp_module_t **results, int *count, char *err, size_t err_size);
+int cbm_aosp_load_module_details(const cbm_aosp_workspace_t *workspace,
+                                 cbm_aosp_module_t *modules, int count, int detail_limit,
+                                 bool *truncated, char *err, size_t err_size);
 void cbm_aosp_modules_free(cbm_aosp_module_t *results, int count);
+int cbm_aosp_build_gaps(const cbm_aosp_workspace_t *workspace, int limit,
+                        cbm_aosp_build_gap_t **results, int *count, bool *truncated,
+                        char *err, size_t err_size);
+void cbm_aosp_build_gaps_free(cbm_aosp_build_gap_t *results, int count);
 
 #endif

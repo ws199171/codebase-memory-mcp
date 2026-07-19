@@ -1987,6 +1987,9 @@ TEST(aosp_build_graph_resolves_cross_repo_modules) {
     ASSERT(strstr(response, "\"isError\":false") != NULL);
     ASSERT(strstr(response, "libframework_audio") != NULL);
     ASSERT(strstr(response, "dependencies_unresolved") != NULL);
+    ASSERT(strstr(response, "\"dependencies\"") != NULL);
+    ASSERT(strstr(response, "libmissing") != NULL);
+    ASSERT(strstr(response, "\"resolved\":false") != NULL);
     free(response);
 
     cbm_aosp_workspace_free(&workspace);
@@ -3072,10 +3075,11 @@ TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols) {
     sqlite3_finalize(stmt);
 
     ASSERT_EQ(sqlite3_prepare_v2(master,
-        "SELECT group_concat(s.name||':'||l.link_type,',') FROM module_symbol_links l "
-        "JOIN symbols s ON s.global_id=l.symbol_global_id WHERE l.source_id="
+        "SELECT group_concat(link,',') FROM (SELECT s.name||':'||l.link_type AS link "
+        "FROM module_symbol_links l JOIN symbols s ON s.global_id=l.symbol_global_id "
+        "WHERE l.source_id="
         "(SELECT module_id FROM modules WHERE workspace_id=?1 AND name='linked_consumer') "
-        "ORDER BY s.name;", -1, &stmt, NULL), SQLITE_OK);
+        "ORDER BY s.name);", -1, &stmt, NULL), SQLITE_OK);
     sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
@@ -3120,6 +3124,100 @@ TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols) {
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
     sqlite3_finalize(stmt);
     sqlite3_close(master);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
+TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance) {
+    char *root = NULL;
+    ASSERT_EQ(create_variants_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+
+    cbm_aosp_module_t *modules = NULL;
+    int count = 0;
+    bool truncated = false;
+    ASSERT_EQ(cbm_aosp_search_modules(&workspace, "libvariant_consumer", 10,
+                                      &modules, &count, err, sizeof(err)), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(cbm_aosp_load_module_details(&workspace, modules, count, 100,
+                                           &truncated, err, sizeof(err)), 0);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(strstr(modules[0].properties, "\"compile_multilib\":\"both\""));
+    ASSERT_TRUE(modules[0].dependency_count >= 13);
+    bool found_inherited_variant = false;
+    for (int i = 0; i < modules[0].dependency_count; i++) {
+        cbm_aosp_module_dependency_t *dependency = &modules[0].dependencies[i];
+        if (strcmp(dependency->target_name, "libfromdefaults") != 0) continue;
+        ASSERT_TRUE(dependency->resolved);
+        ASSERT_STR_EQ(dependency->target_repo_path, "project");
+        ASSERT_NOT_NULL(strstr(dependency->properties, "\"origin\":\"defaults\""));
+        ASSERT_NOT_NULL(strstr(dependency->properties,
+                               "target.android&arch.arm64"));
+        found_inherited_variant = true;
+    }
+    ASSERT_TRUE(found_inherited_variant);
+    cbm_aosp_modules_free(modules, count);
+
+    modules = NULL;
+    count = 0;
+    truncated = false;
+    ASSERT_EQ(cbm_aosp_search_modules(&workspace, "libvariant_consumer", 10,
+                                      &modules, &count, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_load_module_details(&workspace, modules, count, 1,
+                                           &truncated, err, sizeof(err)), 0);
+    ASSERT_TRUE(truncated);
+    ASSERT_EQ(modules[0].dependency_count, 1);
+    ASSERT_TRUE(modules[0].details_truncated);
+    cbm_aosp_modules_free(modules, count);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"libvariant_consumer\","
+        "\"detail_limit\":100}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"details_included\":true"));
+    ASSERT_NOT_NULL(strstr(response, "\"dependencies\""));
+    ASSERT_NOT_NULL(strstr(response, "target.android&arch.arm64"));
+    ASSERT_NOT_NULL(strstr(response, "\"origin\":\"defaults\""));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+
+    root = NULL;
+    ASSERT_EQ(create_make_semantics_workspace_fixture(&root), 0);
+    memset(&workspace, 0, sizeof(workspace));
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    cbm_aosp_build_gap_t *gaps = NULL;
+    int gap_count = 0;
+    truncated = false;
+    ASSERT_EQ(cbm_aosp_build_gaps(&workspace, 10, &gaps, &gap_count, &truncated,
+                                  err, sizeof(err)), 0);
+    ASSERT_FALSE(truncated);
+    ASSERT_EQ(gap_count, 1);
+    ASSERT_STR_EQ(gaps[0].kind, "make_expression");
+    ASSERT_STR_EQ(gaps[0].repo_path, "project");
+    ASSERT_STR_EQ(gaps[0].subject, "ifeq ($(TARGET_ARCH),arm64)");
+    ASSERT_STR_EQ(gaps[0].status, "unsupported_expression");
+    cbm_aosp_build_gaps_free(gaps, gap_count);
+
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"make\"}", root);
+    response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"coverage_gaps\""));
+    ASSERT_NOT_NULL(strstr(response, "ifeq ($(TARGET_ARCH),arm64)"));
+    free(response);
 
     cbm_aosp_workspace_free(&workspace);
     th_rmtree(root);
@@ -4257,6 +4355,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership);
     RUN_TEST(aosp_build_graph_imports_bazel_mixed_build_metadata);
     RUN_TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols);
+    RUN_TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

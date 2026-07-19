@@ -362,6 +362,23 @@ removed by the current scan. CLI and MCP architecture coverage report physical
 file resolution, missing/unindexed/ambiguous states, generated-output consumer
 links, and definition-symbol links.
 
+## Build Query Detail
+
+B10 exposes the stored build evidence without adding another persistence schema.
+`aosp modules --details` and `aosp_get_architecture` return each selected module's
+outgoing declared dependencies, including unresolved declarations. Resolved edges
+identify the target module and repository. Every edge retains its exact type,
+resolution state, candidate count, variant branches, unconditional flag,
+declared reference spellings, output tags, visibility evidence, and direct or
+defaults-inherited provenance. Module properties and literal file declarations
+are returned with the same structured provenance and B9 link state.
+
+The query also materializes workspace coverage-gap rows from unsupported Android.mk
+expressions, Bazel artifact/target provider gaps, unresolved Bazel targets, and
+unresolved Bazel dependencies. Results are deterministically ordered. Dependency,
+file, and coverage-gap details use bounded budgets and explicit truncation flags;
+MCP callers may request `summary_only` to omit all detail arrays.
+
 ## Android Make Evaluation
 
 Android.mk extraction evaluates a bounded, deterministic Make subset rather than

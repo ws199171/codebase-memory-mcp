@@ -651,13 +651,15 @@ static const tool_def_t TOOLS[] = {
 
     {"aosp_get_architecture", "Get AOSP architecture",
      "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
-     "counts, Soong namespaces, package visibility boundaries, products, BoardConfig and "
-     "partition ownership, and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build "
-     "command first.",
+     "edges with variant/provenance evidence, unresolved Make/Bazel coverage gaps, Soong "
+     "namespaces, package visibility boundaries, products, BoardConfig and partition ownership, "
+     "and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Optional module name/type filter\"},"
-     "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500}},"
+     "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500},"
+     "\"detail_limit\":{\"type\":\"integer\",\"default\":200,\"minimum\":1,\"maximum\":2000},"
+     "\"summary_only\":{\"type\":\"boolean\",\"default\":false}},"
      "\"required\":[\"workspace_root\"]}"},
 
     {"aosp_trace_protocol", "Trace AOSP protocol",
@@ -8431,12 +8433,26 @@ static char *handle_aosp_get_status(const char *args) {
     return result;
 }
 
+static yyjson_mut_val *aosp_copy_json(yyjson_mut_doc *doc, const char *json,
+                                      bool array_fallback) {
+    yyjson_doc *source = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    yyjson_val *root = source ? yyjson_doc_get_root(source) : NULL;
+    yyjson_mut_val *copy = root ? yyjson_val_mut_copy(doc, root) : NULL;
+    yyjson_doc_free(source);
+    if (copy) return copy;
+    return array_fallback ? yyjson_mut_arr(doc) : yyjson_mut_obj(doc);
+}
+
 static char *handle_aosp_get_architecture(const char *args) {
     char *workspace_root = cbm_mcp_get_string_arg(args, "workspace_root");
     char *query = cbm_mcp_get_string_arg(args, "query");
     int limit = cbm_mcp_get_int_arg(args, "limit", 50);
+    int detail_limit = cbm_mcp_get_int_arg(args, "detail_limit", 200);
+    bool summary_only = cbm_mcp_get_bool_arg(args, "summary_only");
     if (limit <= 0) limit = 50;
     if (limit > 500) limit = 500;
+    if (detail_limit <= 0) detail_limit = 200;
+    if (detail_limit > 2000) detail_limit = 2000;
     if (!workspace_root || !workspace_root[0]) {
         free(workspace_root);
         free(query);
@@ -8445,7 +8461,11 @@ static char *handle_aosp_get_architecture(const char *args) {
     cbm_aosp_workspace_t workspace = {0};
     cbm_aosp_build_stats_t stats;
     cbm_aosp_module_t *modules = NULL;
+    cbm_aosp_build_gap_t *gaps = NULL;
     int count = 0;
+    int gap_count = 0;
+    bool details_truncated = false;
+    bool gaps_truncated = false;
     char err[CBM_SZ_1K] = {0};
     if (cbm_aosp_discover(workspace_root, &workspace, err, sizeof(err)) != 0 ||
         cbm_aosp_build_stats(&workspace, &stats, err, sizeof(err)) != 0 ||
@@ -8454,6 +8474,19 @@ static char *handle_aosp_get_architecture(const char *args) {
         free(workspace_root);
         free(query);
         return cbm_mcp_text_result(err[0] ? err : "AOSP architecture query failed", true);
+    }
+    if (!summary_only &&
+        (cbm_aosp_load_module_details(&workspace, modules, count, detail_limit,
+                                      &details_truncated, err, sizeof(err)) != 0 ||
+         cbm_aosp_build_gaps(&workspace, detail_limit, &gaps, &gap_count,
+                             &gaps_truncated, err, sizeof(err)) != 0)) {
+        cbm_aosp_build_gaps_free(gaps, gap_count);
+        cbm_aosp_modules_free(modules, count);
+        cbm_aosp_workspace_free(&workspace);
+        free(workspace_root);
+        free(query);
+        return cbm_mcp_text_result(err[0] ? err : "AOSP architecture detail query failed",
+                                   true);
     }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -8543,6 +8576,8 @@ static char *handle_aosp_get_architecture(const char *args) {
                            stats.generated_link_unresolved_count);
     yyjson_mut_obj_add_int(doc, root, "definition_symbol_links",
                            stats.definition_symbol_link_count);
+    yyjson_mut_obj_add_bool(doc, root, "details_included", !summary_only);
+    yyjson_mut_obj_add_bool(doc, root, "details_truncated", details_truncated);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
@@ -8553,11 +8588,78 @@ static char *handle_aosp_get_architecture(const char *args) {
         yyjson_mut_obj_add_strcpy(doc, item, "file", modules[i].file_path);
         yyjson_mut_obj_add_int(doc, item, "outgoing_dependencies", modules[i].outgoing_dependencies);
         yyjson_mut_obj_add_int(doc, item, "incoming_dependencies", modules[i].incoming_dependencies);
+        if (!summary_only) {
+            yyjson_mut_obj_add_val(doc, item, "properties",
+                                   aosp_copy_json(doc, modules[i].properties, false));
+            yyjson_mut_obj_add_bool(doc, item, "details_truncated",
+                                    modules[i].details_truncated != 0);
+            yyjson_mut_val *dependencies = yyjson_mut_arr(doc);
+            for (int d = 0; d < modules[i].dependency_count; d++) {
+                cbm_aosp_module_dependency_t *edge = &modules[i].dependencies[d];
+                yyjson_mut_val *dependency = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, dependency, "target_name", edge->target_name);
+                yyjson_mut_obj_add_strcpy(doc, dependency, "type", edge->dependency_type);
+                yyjson_mut_obj_add_bool(doc, dependency, "resolved", edge->resolved != 0);
+                if (edge->resolved) {
+                    yyjson_mut_val *target = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, target, "module_id",
+                                              edge->target_module_id);
+                    yyjson_mut_obj_add_strcpy(doc, target, "repo", edge->target_repo_path);
+                    yyjson_mut_obj_add_strcpy(doc, target, "name",
+                                              edge->target_module_name);
+                    yyjson_mut_obj_add_val(doc, dependency, "target", target);
+                }
+                yyjson_mut_obj_add_val(doc, dependency, "properties",
+                                       aosp_copy_json(doc, edge->properties, false));
+                yyjson_mut_arr_add_val(dependencies, dependency);
+            }
+            yyjson_mut_obj_add_val(doc, item, "dependencies", dependencies);
+            yyjson_mut_val *files = yyjson_mut_arr(doc);
+            for (int f = 0; f < modules[i].file_count; f++) {
+                cbm_aosp_module_file_t *declaration = &modules[i].files[f];
+                yyjson_mut_val *file = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, file, "declared_path",
+                                          declaration->declared_path);
+                yyjson_mut_obj_add_strcpy(doc, file, "role", declaration->role);
+                yyjson_mut_obj_add_strcpy(doc, file, "workspace_path",
+                                          declaration->workspace_path);
+                yyjson_mut_obj_add_strcpy(doc, file, "status", declaration->status);
+                if (declaration->file_global_id[0]) {
+                    yyjson_mut_obj_add_strcpy(doc, file, "file_global_id",
+                                              declaration->file_global_id);
+                }
+                if (declaration->generated_id[0]) {
+                    yyjson_mut_obj_add_strcpy(doc, file, "generated_id",
+                                              declaration->generated_id);
+                }
+                yyjson_mut_obj_add_val(doc, file, "properties",
+                                       aosp_copy_json(doc, declaration->properties, false));
+                yyjson_mut_arr_add_val(files, file);
+            }
+            yyjson_mut_obj_add_val(doc, item, "files", files);
+        }
         yyjson_mut_arr_add_val(items, item);
     }
     yyjson_mut_obj_add_val(doc, root, "modules", items);
+    if (!summary_only) {
+        yyjson_mut_obj_add_bool(doc, root, "coverage_gaps_truncated", gaps_truncated);
+        yyjson_mut_val *gap_items = yyjson_mut_arr(doc);
+        for (int i = 0; i < gap_count; i++) {
+            yyjson_mut_val *gap = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, gap, "kind", gaps[i].kind);
+            yyjson_mut_obj_add_strcpy(doc, gap, "repo", gaps[i].repo_path);
+            yyjson_mut_obj_add_strcpy(doc, gap, "file", gaps[i].file_path);
+            yyjson_mut_obj_add_strcpy(doc, gap, "subject", gaps[i].subject);
+            yyjson_mut_obj_add_strcpy(doc, gap, "status", gaps[i].status);
+            yyjson_mut_obj_add_val(doc, gap, "properties",
+                                   aosp_copy_json(doc, gaps[i].properties, false));
+            yyjson_mut_arr_add_val(gap_items, gap);
+        }
+        yyjson_mut_obj_add_val(doc, root, "coverage_gaps", gap_items);
+    }
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_aosp_build_gaps_free(gaps, gap_count);
     cbm_aosp_modules_free(modules, count);
     cbm_aosp_workspace_free(&workspace);
     free(workspace_root);

@@ -552,6 +552,7 @@ codebase-memory-mcp aosp index /path/to/aosp --repo frameworks/base
 # Build the workspace-level Soong/Android.mk/AIDL module dependency graph.
 codebase-memory-mcp aosp build /path/to/aosp
 codebase-memory-mcp aosp modules /path/to/aosp --query libbinder
+codebase-memory-mcp aosp modules /path/to/aosp --query libbinder --details
 
 # Link and inspect Binder/AIDL/JNI protocol evidence after repository indexing.
 codebase-memory-mcp aosp link /path/to/aosp
@@ -593,12 +594,12 @@ outputs receive stable identities and consumer links when the producer output or
 tag is unique; missing files, unindexed repositories, ambiguous `File` nodes, and
 unsupported output tags remain explicit coverage states. Android.mk extraction
 evaluates common variable assignment and expansion, deterministic conditions,
-relative include fragments, user macros, and semantic `BUILD_*` module classes. Unknown
-product/target conditions and unsupported Make functions are counted and returned
-as coverage gaps instead of selecting a branch speculatively. Product Makefiles,
-`PRODUCT_PACKAGES`, inheritance, BoardConfig evidence, device/vendor ownership,
-and explicit partition ownership are retained in the workspace build graph. The
-scanner also imports versioned `aosp_bazel_mixed_build.json` artifacts exported
+relative include fragments, user macros, and semantic `BUILD_*` module classes.
+Unknown product/target conditions and unsupported Make functions are counted and
+returned as coverage gaps instead of selecting a branch speculatively. Product
+Makefiles, `PRODUCT_PACKAGES`, inheritance, BoardConfig evidence, device/vendor
+ownership, and explicit partition ownership are retained in the workspace build
+graph. The scanner also imports versioned `aosp_bazel_mixed_build.json` artifacts exported
 from supported Bazel mixed-build tooling. Configured labels, transitions, target
 kinds, Soong module mappings, dependencies, and unsupported-provider evidence are
 stored without evaluating Starlark; only unique label and module mappings become
@@ -608,6 +609,14 @@ AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy
 symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
 registration tables. Each protocol edge records its confidence and evidence;
 ambiguous name-only candidates are not linked.
+
+`aosp modules --details` exposes bounded outgoing dependency records and file
+declarations for matching modules. Each record retains structured variant,
+defaults-inheritance, resolution, visibility, declared-reference, and output-tag
+evidence. The same query reports concrete unsupported Make expressions and Bazel
+coverage gaps; `--detail-limit` controls each detail class and reports truncation.
+`aosp_get_architecture` returns this structured detail by default and accepts
+`summary_only` when only aggregate coverage is needed.
 
 Implementation status, remaining milestones, acceptance criteria, and verification
 evidence are tracked in [`docs/AOSP_SUPPORT_PLAN.md`](docs/AOSP_SUPPORT_PLAN.md).
@@ -640,7 +649,7 @@ implementation, annotation, call, and usage relationships.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
-| `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, products, BoardConfig and partition ownership, generated-file declarations, namespace/package boundaries, and dependency coverage. |
+| `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, bounded dependency/file details with variants and provenance, concrete coverage gaps, products, BoardConfig and partition ownership, and namespace/package boundaries. |
 | `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |

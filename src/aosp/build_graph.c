@@ -5624,6 +5624,26 @@ void cbm_aosp_modules_free(cbm_aosp_module_t *results, int count) {
         free(results[i].name);
         free(results[i].module_type);
         free(results[i].file_path);
+        free(results[i].properties);
+        for (int d = 0; d < results[i].dependency_count; d++) {
+            free(results[i].dependencies[d].target_name);
+            free(results[i].dependencies[d].dependency_type);
+            free(results[i].dependencies[d].target_module_id);
+            free(results[i].dependencies[d].target_repo_path);
+            free(results[i].dependencies[d].target_module_name);
+            free(results[i].dependencies[d].properties);
+        }
+        free(results[i].dependencies);
+        for (int f = 0; f < results[i].file_count; f++) {
+            free(results[i].files[f].declared_path);
+            free(results[i].files[f].role);
+            free(results[i].files[f].workspace_path);
+            free(results[i].files[f].status);
+            free(results[i].files[f].file_global_id);
+            free(results[i].files[f].generated_id);
+            free(results[i].files[f].properties);
+        }
+        free(results[i].files);
     }
     free(results);
 }
@@ -5649,7 +5669,7 @@ int cbm_aosp_search_modules(const cbm_aosp_workspace_t *workspace, const char *q
         return -1;
     }
     const char *sql =
-        "SELECT m.module_id,r.path,m.name,m.module_type,m.file_path,"
+        "SELECT m.module_id,r.path,m.name,m.module_type,m.file_path,m.properties,"
         "(SELECT count(*) FROM module_edges e WHERE e.source_id=m.module_id),"
         "(SELECT count(*) FROM module_edges e WHERE e.target_id=m.module_id) "
         "FROM modules m JOIN repos r ON r.repo_id=m.repo_id WHERE m.workspace_id=?1 "
@@ -5679,10 +5699,11 @@ int cbm_aosp_search_modules(const cbm_aosp_workspace_t *workspace, const char *q
         item->name = column_dup(stmt, 2);
         item->module_type = column_dup(stmt, 3);
         item->file_path = column_dup(stmt, 4);
-        item->outgoing_dependencies = sqlite3_column_int(stmt, 5);
-        item->incoming_dependencies = sqlite3_column_int(stmt, 6);
+        item->properties = column_dup(stmt, 5);
+        item->outgoing_dependencies = sqlite3_column_int(stmt, 6);
+        item->incoming_dependencies = sqlite3_column_int(stmt, 7);
         if (!item->module_id || !item->repo_path || !item->name || !item->module_type ||
-            !item->file_path) {
+            !item->file_path || !item->properties) {
             cbm_aosp_modules_free(items, n + 1);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
@@ -5693,6 +5714,264 @@ int cbm_aosp_search_modules(const cbm_aosp_workspace_t *workspace, const char *q
     if (step_rc != SQLITE_DONE) {
         bg_error(err, err_size, "cannot search AOSP modules", sqlite3_errmsg(db));
         cbm_aosp_modules_free(items, n);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    *results = items;
+    *count = n;
+    return 0;
+}
+
+static bool append_module_dependency(cbm_aosp_module_t *module, sqlite3_stmt *stmt) {
+    cbm_aosp_module_dependency_t *grown = realloc(
+        module->dependencies,
+        (size_t)(module->dependency_count + 1) * sizeof(*module->dependencies));
+    if (!grown) return false;
+    module->dependencies = grown;
+    cbm_aosp_module_dependency_t *item = &grown[module->dependency_count];
+    memset(item, 0, sizeof(*item));
+    item->target_name = column_dup(stmt, 0);
+    item->dependency_type = column_dup(stmt, 1);
+    item->target_module_id = column_dup(stmt, 2);
+    item->resolved = sqlite3_column_int(stmt, 3);
+    item->target_repo_path = column_dup(stmt, 4);
+    item->target_module_name = column_dup(stmt, 5);
+    item->properties = column_dup(stmt, 6);
+    if (!item->target_name || !item->dependency_type || !item->target_module_id ||
+        !item->target_repo_path || !item->target_module_name || !item->properties) {
+        free(item->target_name);
+        free(item->dependency_type);
+        free(item->target_module_id);
+        free(item->target_repo_path);
+        free(item->target_module_name);
+        free(item->properties);
+        memset(item, 0, sizeof(*item));
+        return false;
+    }
+    module->dependency_count++;
+    return true;
+}
+
+static bool append_module_file(cbm_aosp_module_t *module, sqlite3_stmt *stmt) {
+    cbm_aosp_module_file_t *grown = realloc(
+        module->files, (size_t)(module->file_count + 1) * sizeof(*module->files));
+    if (!grown) return false;
+    module->files = grown;
+    cbm_aosp_module_file_t *item = &grown[module->file_count];
+    memset(item, 0, sizeof(*item));
+    item->declared_path = column_dup(stmt, 0);
+    item->role = column_dup(stmt, 1);
+    item->properties = column_dup(stmt, 2);
+    item->workspace_path = column_dup(stmt, 3);
+    item->status = column_dup(stmt, 4);
+    item->file_global_id = column_dup(stmt, 5);
+    item->generated_id = column_dup(stmt, 6);
+    if (!item->declared_path || !item->role || !item->properties ||
+        !item->workspace_path || !item->status || !item->file_global_id ||
+        !item->generated_id) {
+        free(item->declared_path);
+        free(item->role);
+        free(item->properties);
+        free(item->workspace_path);
+        free(item->status);
+        free(item->file_global_id);
+        free(item->generated_id);
+        memset(item, 0, sizeof(*item));
+        return false;
+    }
+    module->file_count++;
+    return true;
+}
+
+int cbm_aosp_load_module_details(const cbm_aosp_workspace_t *workspace,
+                                 cbm_aosp_module_t *modules, int count, int detail_limit,
+                                 bool *truncated, char *err, size_t err_size) {
+    if (!workspace || (count > 0 && !modules) || !truncated) return -1;
+    *truncated = false;
+    if (detail_limit <= 0) detail_limit = 200;
+    if (detail_limit > 2000) detail_limit = 2000;
+    char path[BG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *dependencies = NULL;
+    sqlite3_stmt *files = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "AOSP workspace is not initialized", path);
+        sqlite3_close(db);
+        return -1;
+    }
+    const char *dependency_sql =
+        "SELECT d.target_name,d.type,coalesce(d.target_id,''),d.resolved,"
+        "coalesce(r.path,''),coalesce(t.name,''),d.properties "
+        "FROM module_dependencies d LEFT JOIN modules t ON t.module_id=d.target_id "
+        "LEFT JOIN repos r ON r.repo_id=t.repo_id WHERE d.source_id=?1 "
+        "ORDER BY d.type,d.target_name;";
+    const char *file_sql =
+        "SELECT f.path,f.role,f.properties,coalesce(l.workspace_path,''),"
+        "coalesce(l.status,'unlinked'),coalesce(l.file_global_id,''),"
+        "coalesce(l.generated_id,'') FROM module_files f "
+        "LEFT JOIN module_file_links l ON l.source_id=f.source_id "
+        "AND l.declared_path=f.path AND l.role=f.role WHERE f.source_id=?1 "
+        "ORDER BY f.role,f.path;";
+    if (sqlite3_prepare_v2(db, dependency_sql, -1, &dependencies, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, file_sql, -1, &files, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "cannot prepare AOSP module detail query", sqlite3_errmsg(db));
+        sqlite3_finalize(dependencies);
+        sqlite3_finalize(files);
+        sqlite3_close(db);
+        return -1;
+    }
+    int dependency_remaining = detail_limit;
+    int file_remaining = detail_limit;
+    int rc = 0;
+    for (int i = 0; i < count && rc == 0; i++) {
+        sqlite3_reset(dependencies);
+        sqlite3_clear_bindings(dependencies);
+        sqlite3_bind_text(dependencies, 1, modules[i].module_id, -1, SQLITE_TRANSIENT);
+        int step = SQLITE_OK;
+        while ((step = sqlite3_step(dependencies)) == SQLITE_ROW) {
+            if (dependency_remaining == 0) {
+                modules[i].details_truncated = 1;
+                *truncated = true;
+                break;
+            }
+            if (!append_module_dependency(&modules[i], dependencies)) {
+                rc = -1;
+                break;
+            }
+            dependency_remaining--;
+        }
+        if (rc != 0 || (step != SQLITE_DONE && step != SQLITE_ROW)) {
+            rc = -1;
+            break;
+        }
+        sqlite3_reset(files);
+        sqlite3_clear_bindings(files);
+        sqlite3_bind_text(files, 1, modules[i].module_id, -1, SQLITE_TRANSIENT);
+        while ((step = sqlite3_step(files)) == SQLITE_ROW) {
+            if (file_remaining == 0) {
+                modules[i].details_truncated = 1;
+                *truncated = true;
+                break;
+            }
+            if (!append_module_file(&modules[i], files)) {
+                rc = -1;
+                break;
+            }
+            file_remaining--;
+        }
+        if (rc != 0 || (step != SQLITE_DONE && step != SQLITE_ROW)) {
+            rc = -1;
+            break;
+        }
+    }
+    if (rc != 0) {
+        bg_error(err, err_size, "cannot query AOSP module details", sqlite3_errmsg(db));
+    }
+    sqlite3_finalize(dependencies);
+    sqlite3_finalize(files);
+    sqlite3_close(db);
+    return rc;
+}
+
+void cbm_aosp_build_gaps_free(cbm_aosp_build_gap_t *results, int count) {
+    if (!results) return;
+    for (int i = 0; i < count; i++) {
+        free(results[i].kind);
+        free(results[i].repo_path);
+        free(results[i].file_path);
+        free(results[i].subject);
+        free(results[i].status);
+        free(results[i].properties);
+    }
+    free(results);
+}
+
+int cbm_aosp_build_gaps(const cbm_aosp_workspace_t *workspace, int limit,
+                        cbm_aosp_build_gap_t **results, int *count, bool *truncated,
+                        char *err, size_t err_size) {
+    if (!workspace || !results || !count || !truncated) return -1;
+    *results = NULL;
+    *count = 0;
+    *truncated = false;
+    if (limit <= 0) limit = 200;
+    if (limit > 2000) limit = 2000;
+    char path[BG_PATH_MAX];
+    if (cbm_aosp_master_path(workspace, path, sizeof(path), false) != 0) return -1;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "AOSP workspace is not initialized", path);
+        sqlite3_close(db);
+        return -1;
+    }
+    const char *sql =
+        "SELECT kind,repo_path,file_path,subject,status,properties FROM ("
+        "SELECT 'make_expression' kind,r.path repo_path,b.file_path,j.value subject,"
+        "'unsupported_expression' status,'{}' properties "
+        "FROM build_make_files b JOIN repos r ON r.repo_id=b.repo_id,"
+        "json_each(b.unsupported_expressions) j WHERE b.workspace_id=?1 "
+        "UNION ALL "
+        "SELECT 'bazel_artifact',r.path,a.file_path,j.value,'coverage_gap',"
+        "json_object('format_version',a.format_version,'configuration',a.configuration) "
+        "FROM build_bazel_artifacts a JOIN repos r ON r.repo_id=a.repo_id,"
+        "json_each(a.coverage_gaps) j WHERE a.workspace_id=?1 "
+        "UNION ALL "
+        "SELECT 'bazel_target',r.path,t.artifact_path,j.value,'coverage_gap',t.properties "
+        "FROM build_bazel_targets t JOIN repos r ON r.repo_id=t.repo_id,"
+        "json_each(t.properties,'$.coverage_gaps') j WHERE t.workspace_id=?1 "
+        "UNION ALL "
+        "SELECT 'bazel_target',r.path,t.artifact_path,t.label,t.status,t.properties "
+        "FROM build_bazel_targets t JOIN repos r ON r.repo_id=t.repo_id "
+        "WHERE t.workspace_id=?1 AND t.status!='resolved' "
+        "UNION ALL "
+        "SELECT 'bazel_dependency',r.path,d.artifact_path,"
+        "d.source_label||' -> '||d.target_label,d.status,d.properties "
+        "FROM build_bazel_dependencies d JOIN repos r ON r.repo_id=d.source_repo_id "
+        "WHERE d.workspace_id=?1 AND d.status!='resolved') "
+        "ORDER BY kind,repo_path,file_path,subject,status LIMIT ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        bg_error(err, err_size, "cannot prepare AOSP build gap query", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, limit + 1);
+    cbm_aosp_build_gap_t *items = calloc((size_t)limit, sizeof(*items));
+    if (!items) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    int n = 0;
+    int step = SQLITE_OK;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n == limit) {
+            *truncated = true;
+            break;
+        }
+        cbm_aosp_build_gap_t *item = &items[n];
+        item->kind = column_dup(stmt, 0);
+        item->repo_path = column_dup(stmt, 1);
+        item->file_path = column_dup(stmt, 2);
+        item->subject = column_dup(stmt, 3);
+        item->status = column_dup(stmt, 4);
+        item->properties = column_dup(stmt, 5);
+        if (!item->kind || !item->repo_path || !item->file_path || !item->subject ||
+            !item->status || !item->properties) {
+            cbm_aosp_build_gaps_free(items, n + 1);
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            return -1;
+        }
+        n++;
+    }
+    if (step != SQLITE_DONE && step != SQLITE_ROW) {
+        bg_error(err, err_size, "cannot query AOSP build gaps", sqlite3_errmsg(db));
+        cbm_aosp_build_gaps_free(items, n);
         sqlite3_finalize(stmt);
         sqlite3_close(db);
         return -1;
