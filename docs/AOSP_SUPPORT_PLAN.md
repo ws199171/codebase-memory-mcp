@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `P2` - link generated Binder transaction constants, `onTransact`,
-  proxy transact calls, and implementation methods.
-- Next task: `P3` - link ServiceManager registration, lookup, wait, client, and
+- Current task: `P3` - link ServiceManager registration, lookup, wait, client, and
   server paths.
+- Next task: `P4` - cover Java, C++/NDK, and Rust AIDL generated naming
+  conventions.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -112,7 +112,12 @@ complete:
     reference resolution evidence; 29 AOSP tests, 159 MCP tests, production
     `-Werror` build, and production CLI/MCP smoke pass; Linux ASan/UBSan execution
     remains required before verification completion.
-- Worktree baseline: P1 complete AIDL declaration checkpoint `45a045c` on
+  - `P2` Binder transaction constants, shared `onTransact` dispatch cases, proxy
+    transact calls, direct implementation inheritance, source-backed fallback for
+    omitted generated symbols, and idempotent refresh; 30 AOSP tests, 159 MCP
+    tests, production `-Werror` build, and real-index CLI/MCP smoke pass; Linux
+    ASan/UBSan execution remains required before verification completion.
+- Worktree baseline: P2 Binder transaction-flow checkpoint `841f5b7` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -214,7 +219,7 @@ unevaluated constructs must be counted and returned as coverage gaps.
 
 - [x] `P1` Support AIDL imports, annotations, parcelables, unions, enums, callbacks,
   one-way methods, and declared stability.
-- [ ] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
+- [x] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
   calls, and implementation methods.
 - [ ] `P3` Link ServiceManager registration, lookup, wait, client, and server paths.
 - [ ] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
@@ -319,3 +324,4 @@ unaccepted critical coverage gap.
 | `B9` | `9ff3fe4` | Module-to-file resolution with filegroup path normalization, stable generated outputs and consumer links, exact definition-symbol links, explicit coverage states, atomic stale-link cleanup, schema v13 link tables, 27 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B10` | `8e9f381` | Bounded CLI/MCP module details, resolved/unresolved dependency edges, structured variant/defaults/visibility/reference provenance, file declaration link states, concrete Make/Bazel gaps, deterministic truncation, 28 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `P1` | `45a045c` | Complete AIDL declarations, imports, annotations, parcelables, unions, enums, callbacks, effective oneway and stability metadata, explicit resolved/ambiguous/not-found reference evidence, 29 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `P2` | `841f5b7` | Source-backed Binder transaction constants, shared `onTransact` dispatch, proxy transact calls, direct implementation inheritance, omitted-symbol fallback, same-name negative coverage, idempotent refresh, 30 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
