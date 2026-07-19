@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `P1` - support complete AIDL declarations, imports, annotations,
-  callbacks, and stability metadata.
-- Next task: `P2` - link generated Binder transaction constants, `onTransact`,
+- Current task: `P2` - link generated Binder transaction constants, `onTransact`,
   proxy transact calls, and implementation methods.
+- Next task: `P3` - link ServiceManager registration, lookup, wait, client, and
+  server paths.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -107,7 +107,12 @@ complete:
     truncation reporting, and MCP summary mode; 28 AOSP tests, 159 MCP tests,
     production `-Werror` build, and production CLI/MCP smoke pass; Linux ASan/UBSan
     execution remains required before verification completion.
-- Worktree baseline: B10 build-query detail checkpoint `8e9f381` on
+  - `P1` complete AIDL declarations, imports, annotations, parcelables, unions,
+    enums, callbacks, effective oneway methods, declared stability, and explicit
+    reference resolution evidence; 29 AOSP tests, 159 MCP tests, production
+    `-Werror` build, and production CLI/MCP smoke pass; Linux ASan/UBSan execution
+    remains required before verification completion.
+- Worktree baseline: P1 complete AIDL declaration checkpoint `45a045c` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -207,7 +212,7 @@ unevaluated constructs must be counted and returned as coverage gaps.
 
 ### P - Complete Android Protocol and System Boundaries
 
-- [ ] `P1` Support AIDL imports, annotations, parcelables, unions, enums, callbacks,
+- [x] `P1` Support AIDL imports, annotations, parcelables, unions, enums, callbacks,
   one-way methods, and declared stability.
 - [ ] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
   calls, and implementation methods.
@@ -313,3 +318,4 @@ unaccepted critical coverage gap.
 | `B8` | `888813e` | Versioned Bazel mixed-build artifacts, configured labels/transitions, unique Soong-module mapping, cross-repository dependency projection, ambiguity/missing/external/unsupported evidence, schema v12 Bazel tables, 26 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B9` | `9ff3fe4` | Module-to-file resolution with filegroup path normalization, stable generated outputs and consumer links, exact definition-symbol links, explicit coverage states, atomic stale-link cleanup, schema v13 link tables, 27 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B10` | `8e9f381` | Bounded CLI/MCP module details, resolved/unresolved dependency edges, structured variant/defaults/visibility/reference provenance, file declaration link states, concrete Make/Bazel gaps, deterministic truncation, 28 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `P1` | `45a045c` | Complete AIDL declarations, imports, annotations, parcelables, unions, enums, callbacks, effective oneway and stability metadata, explicit resolved/ambiguous/not-found reference evidence, 29 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
