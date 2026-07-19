@@ -1,7 +1,8 @@
 # AOSP Support Execution Plan
 
 This document is the single progress baseline for AOSP support. Work is performed
-in task ID order unless a dependency recorded here requires a different order.
+in delivery-phase priority and then task ID order unless a dependency recorded
+here requires a different order.
 
 ## Scope
 
@@ -14,6 +15,31 @@ scale.
 It does not mean replacing Soong, Kati, Bazel, the Android compiler toolchain, or
 runtime instrumentation. Static analysis limitations must be visible as unresolved
 records or coverage metrics instead of being silently treated as resolved facts.
+
+## Delivery Priority
+
+Delivery is split into two phases so core graph functionality is completed before
+supplementary query, operations, and release work:
+
+1. **Core functional milestone (53 tasks):** `W1-W7`, `B0.1-B0.6`, `P0.1-P0.7`,
+   `F1-F6`, `Q1-Q7`, `B1-B10`, and `P1-P10`. These tasks define workspace
+   discovery, federated indexing and traversal, build semantics, and Android
+   protocol coverage. New implementation work remains prioritized here until all
+   53 tasks are complete.
+2. **Supplementary milestone (27 tasks):** `A1-A7`, `O1-O10`, and `V1-V10`.
+   Architecture-answer conveniences, full-checkout operations, and release
+   validation remain in the roadmap but are scheduled after the core functional
+   milestone. They may then be implemented in risk and dependency order.
+
+At the P5 checkpoint, 48 of 53 core tasks have implementations and Windows
+evidence; the remaining new core implementations are `P6-P10`. Formal checklist
+completion is 35 of 53 because `Q5-Q7` and `B1-B10` still require the deferred
+Linux ASan/UBSan runs. That verification debt should be closed when a suitable
+environment is available, but it does not preempt completing `P6-P10`.
+
+The core milestone is a functional-coverage claim, not a full-scale production or
+release-readiness claim. Reliable full-checkout operation and a public complete-
+AOSP-support claim still require the applicable `O` and `V` acceptance work.
 
 ## Progress Rules
 
@@ -40,9 +66,11 @@ complete:
 
 ## Current Queue
 
+- Active milestone: core functional scope (`48/53` implemented, `35/53` verified).
 - Current task: `P6` - model HIDL and HwBinder interfaces, clients, and services.
 - Next task: `P7` - parse VINTF manifests and compatibility matrices and link HAL
   instances.
+- Supplementary `A`, `O`, and `V` tasks remain queued until `P6-P10` are complete.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
