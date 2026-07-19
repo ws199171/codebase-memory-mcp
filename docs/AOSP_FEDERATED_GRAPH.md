@@ -354,6 +354,33 @@ Master schema v10 adds `build_make_files`. Each root Android.mk row stores inclu
 fragments, condition and macro-expansion counts, and the exact unsupported
 expressions used by CLI and MCP coverage reporting.
 
+## Product And Board Semantics
+
+Product extraction scans Make fragments that declare `PRODUCT_*` values and treats
+files with `PRODUCT_NAME` as selectable products. `inherit-product` and
+`inherit-product-if-exists` create explicit file-level edges. Resolved inheritance
+expands metadata, package declarations, and partition evidence with provenance;
+missing, optional-missing, cyclic, and unsupported-expression edges remain stored
+with distinct statuses.
+
+`PRODUCT_PACKAGES*` entries resolve only when a module name is unique across the
+workspace. Direct, inherited, removed, ambiguous, and missing declarations remain
+queryable. Partition ownership is recorded only from explicit partition-qualified
+package variables, `PRODUCT_COPY_FILES` destinations, and supported BoardConfig
+variables. Plain `PRODUCT_PACKAGES` entries use `unspecified` rather than assuming
+an install partition.
+
+BoardConfig extraction retains supported `BOARD_*`, `TARGET_BOARD_*`, bootloader,
+and VINTF variables as an evidence object. Device and vendor ownership comes from
+the manifest-scoped workspace path of the declaring product or BoardConfig file.
+Unknown Make values are preserved as coverage gaps instead of being evaluated from
+ambient build state.
+
+Master schema v11 adds `build_products`, `build_product_inheritance`,
+`build_product_packages`, and `build_board_configs`. CLI and MCP architecture
+coverage report product, inheritance, package-resolution, BoardConfig, and
+partition totals from these tables.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

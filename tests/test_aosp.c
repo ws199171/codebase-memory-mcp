@@ -422,6 +422,64 @@ static int create_make_semantics_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_product_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_product_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "device/acme/demo") != 0 ||
+        make_dir(root, "vendor/acme/demo") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"device/acme/demo\" path=\"device/acme/demo\"/>"
+            "<project name=\"vendor/acme/demo\" path=\"vendor/acme/demo\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "device/acme/demo/Android.bp",
+            "android_app { name: \"DirectApp\" }\n"
+            "android_app { name: \"DeviceApp\" }\n") != 0 ||
+        write_relative(root, "vendor/acme/demo/Android.bp",
+            "android_app { name: \"VendorApp\" }\n"
+            "android_app { name: \"BaseApp\" }\n") != 0 ||
+        write_relative(root, "device/acme/demo/aosp_demo.mk",
+            "$(call inherit-product, device/acme/demo/device.mk)\n"
+            "$(call inherit-product-if-exists, vendor/acme/demo/missing.mk)\n"
+            "PRODUCT_NAME := aosp_demo\n"
+            "PRODUCT_DEVICE := demo\n"
+            "PRODUCT_BRAND := Acme\n"
+            "PRODUCT_MODEL := Demo Phone\n"
+            "PRODUCT_MANUFACTURER := Acme Devices\n"
+            "PRODUCT_PACKAGES += DirectApp\n"
+            "PRODUCT_PACKAGES_VENDOR += VendorApp MissingVendor\n"
+            "PRODUCT_COPY_FILES += device/acme/demo/init.demo.rc:vendor/etc/init/init.demo.rc "
+            "device/acme/demo/permissions.xml:product/etc/permissions/demo.xml\n") != 0 ||
+        write_relative(root, "device/acme/demo/device.mk",
+            "$(call inherit-product, vendor/acme/demo/vendor.mk)\n"
+            "PRODUCT_PACKAGES += DeviceApp\n") != 0 ||
+        write_relative(root, "vendor/acme/demo/vendor.mk",
+            "PRODUCT_PACKAGES += BaseApp\n") != 0 ||
+        write_relative(root, "device/acme/demo/cycle_a.mk",
+            "$(call inherit-product, device/acme/demo/cycle_b.mk)\n"
+            "PRODUCT_PACKAGES += CycleA\n") != 0 ||
+        write_relative(root, "device/acme/demo/cycle_b.mk",
+            "$(call inherit-product, device/acme/demo/cycle_a.mk)\n"
+            "PRODUCT_PACKAGES += CycleB\n") != 0 ||
+        write_relative(root, "device/acme/demo/BoardConfig.mk",
+            "TARGET_BOARD_PLATFORM := demo\n"
+            "BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4\n"
+            "BOARD_PRODUCTIMAGE_PARTITION_SIZE := 1048576\n"
+            "BOARD_SYSTEM_EXTIMAGE_FILE_SYSTEM_TYPE := ext4\n"
+            "BOARD_ODMIMAGE_PARTITION_SIZE := $(UNKNOWN_SIZE)\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2504,6 +2562,152 @@ TEST(aosp_build_graph_evaluates_common_android_make_semantics) {
     PASS();
 }
 
+TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership) {
+    char *root = NULL;
+    ASSERT_EQ(create_product_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.blueprint_files, 2);
+    ASSERT_EQ(stats.make_files, 0);
+    ASSERT_EQ(stats.product_make_files, 5);
+    ASSERT_EQ(stats.board_config_files, 1);
+    ASSERT_EQ(stats.product_count, 1);
+    ASSERT_EQ(stats.product_fragment_count, 4);
+    ASSERT_EQ(stats.product_inheritance_count, 5);
+    ASSERT_EQ(stats.product_inheritance_resolved_count, 3);
+    ASSERT_EQ(stats.product_inheritance_cycle_count, 2);
+    ASSERT_EQ(stats.product_package_count, 5);
+    ASSERT_EQ(stats.product_package_resolved_count, 4);
+    ASSERT_EQ(stats.product_package_unresolved_count, 1);
+    ASSERT_EQ(stats.board_config_count, 1);
+    ASSERT_EQ(stats.product_partition_count, 4);
+    ASSERT_EQ(stats.make_unsupported_count, 1);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT device,brand,model,manufacturer,device_owner,vendor_owner,"
+                  "json_extract(partitions,'$[0]'),json_extract(properties,'$.inheritance_cycle') "
+                  "FROM build_products WHERE workspace_id=?1 AND name='aosp_demo';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "demo");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "Acme");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "Demo Phone");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "Acme Devices");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), "device/acme/demo");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 5), "");
+    ASSERT_NOT_NULL(sqlite3_column_text(stmt, 6));
+    ASSERT_EQ(sqlite3_column_int(stmt, 7), 0);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(inherited_path||':'||status,',') FROM ("
+                  "SELECT i.inherited_path,i.status FROM build_product_inheritance i "
+                  "JOIN build_products p ON p.product_id=i.source_product_id "
+                  "WHERE p.workspace_id=?1 AND p.name='aosp_demo' ORDER BY i.inherited_path);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "device/acme/demo/device.mk:resolved,"
+                  "vendor/acme/demo/missing.mk:optional_missing");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT group_concat(module_name||':'||partition_name||':'||resolved||':'||"
+                  "json_extract(properties,'$.origin'),',') FROM ("
+                  "SELECT pp.* FROM build_product_packages pp JOIN build_products p "
+                  "ON p.product_id=pp.product_id WHERE p.workspace_id=?1 AND p.name='aosp_demo' "
+                  "AND pp.included=1 ORDER BY pp.module_name);",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "BaseApp:unspecified:1:inherit-product,"
+                  "DeviceApp:unspecified:1:inherit-product,"
+                  "DirectApp:unspecified:1:direct,"
+                  "MissingVendor:vendor:0:direct,"
+                  "VendorApp:vendor:1:direct");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(pp.properties,'$.inherited_from'),"
+                  "json_extract(pp.properties,'$.inheritance_path'),"
+                  "json_extract(pp.properties,'$.inheritance_depth') "
+                  "FROM build_product_packages pp JOIN build_products p "
+                  "ON p.product_id=pp.product_id WHERE p.workspace_id=?1 "
+                  "AND p.name='aosp_demo' AND pp.module_name='BaseApp';",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "device/acme/demo/device.mk");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1),
+                  "device/acme/demo/device.mk>vendor/acme/demo/vendor.mk");
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), 2);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  master,
+                  "SELECT json_extract(variables,'$.TARGET_BOARD_PLATFORM'),"
+                  "json_extract(variables,'$.BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE'),"
+                  "json_array_length(partitions),device_owner,vendor_owner "
+                  "FROM build_board_configs WHERE workspace_id=?1;",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "demo");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "ext4");
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), 4);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "device/acme/demo");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), "");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+                  "SELECT count(*) FROM schema_versions WHERE version=11;",
+                  -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"App\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"products\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"product_fragments\":4"));
+    ASSERT_NOT_NULL(strstr(response, "\"product_inheritance\":5"));
+    ASSERT_NOT_NULL(strstr(response, "\"product_packages\":5"));
+    ASSERT_NOT_NULL(strstr(response, "\"product_packages_resolved\":4"));
+    ASSERT_NOT_NULL(strstr(response, "\"board_configs\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"product_partitions\":4"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3631,6 +3835,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_models_namespaces_packages_and_visibility);
     RUN_TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags);
     RUN_TEST(aosp_build_graph_evaluates_common_android_make_semantics);
+    RUN_TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

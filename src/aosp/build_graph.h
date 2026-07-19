@@ -32,8 +32,20 @@ typedef struct {
     int make_condition_count;
     int make_macro_count;
     int make_unsupported_count;
+    int product_count;
+    int product_fragment_count;
+    int product_inheritance_count;
+    int product_inheritance_resolved_count;
+    int product_inheritance_cycle_count;
+    int product_package_count;
+    int product_package_resolved_count;
+    int product_package_unresolved_count;
+    int board_config_count;
+    int product_partition_count;
     int blueprint_files;
     int make_files;
+    int product_make_files;
+    int board_config_files;
     int aidl_files;
 } cbm_aosp_build_stats_t;
 

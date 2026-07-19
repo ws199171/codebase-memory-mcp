@@ -82,6 +82,77 @@ typedef struct {
 
 typedef struct {
     char *name;
+    char *partition;
+    char *source_variable;
+    char *source_file;
+    char *inherited_from;
+    char *inheritance_path;
+    int inheritance_depth;
+    bool included;
+    char *resolved_target_id;
+    char *resolution;
+} product_package_decl_t;
+
+typedef struct {
+    char *path;
+    char *source_file;
+    char *resolved_product_id;
+    char *status;
+    bool optional;
+} product_inherit_decl_t;
+
+typedef struct {
+    char *name;
+    char *kind;
+    char *file_path;
+    char *workspace_path;
+    char *device;
+    char *brand;
+    char *model;
+    char *manufacturer;
+    char *device_owner;
+    char *vendor_owner;
+    product_package_decl_t *packages;
+    int package_count;
+    int package_cap;
+    product_inherit_decl_t *inherits;
+    int inherit_count;
+    int inherit_cap;
+    str_vec_t partitions;
+    int expansion_state;
+    bool inheritance_cycle;
+} product_decl_t;
+
+typedef struct {
+    product_decl_t *items;
+    int count;
+    int cap;
+} product_vec_t;
+
+typedef struct {
+    char *name;
+    char *value;
+} name_value_t;
+
+typedef struct {
+    char *file_path;
+    char *workspace_path;
+    char *device_owner;
+    char *vendor_owner;
+    name_value_t *variables;
+    int variable_count;
+    int variable_cap;
+    str_vec_t partitions;
+} board_config_decl_t;
+
+typedef struct {
+    board_config_decl_t *items;
+    int count;
+    int cap;
+} board_config_vec_t;
+
+typedef struct {
+    char *name;
     char *type;
     char *file_path;
     dep_decl_t *deps;
@@ -165,6 +236,8 @@ typedef struct {
     scope_vec_t namespaces;
     scope_vec_t packages;
     make_file_vec_t make_files;
+    product_vec_t products;
+    board_config_vec_t board_configs;
     cbm_aosp_build_stats_t stats;
     char *err;
     size_t err_size;
@@ -322,6 +395,75 @@ static void make_file_vec_free(make_file_vec_t *vec) {
         str_vec_free(&vec->items[i].includes);
         str_vec_free(&vec->items[i].unsupported);
     }
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static void product_package_free(product_package_decl_t *package) {
+    if (!package) return;
+    free(package->name);
+    free(package->partition);
+    free(package->source_variable);
+    free(package->source_file);
+    free(package->inherited_from);
+    free(package->inheritance_path);
+    free(package->resolved_target_id);
+    free(package->resolution);
+    memset(package, 0, sizeof(*package));
+}
+
+static void product_free(product_decl_t *product) {
+    if (!product) return;
+    free(product->name);
+    free(product->kind);
+    free(product->file_path);
+    free(product->workspace_path);
+    free(product->device);
+    free(product->brand);
+    free(product->model);
+    free(product->manufacturer);
+    free(product->device_owner);
+    free(product->vendor_owner);
+    for (int i = 0; i < product->package_count; i++) {
+        product_package_free(&product->packages[i]);
+    }
+    free(product->packages);
+    for (int i = 0; i < product->inherit_count; i++) {
+        free(product->inherits[i].path);
+        free(product->inherits[i].source_file);
+        free(product->inherits[i].resolved_product_id);
+        free(product->inherits[i].status);
+    }
+    free(product->inherits);
+    str_vec_free(&product->partitions);
+    memset(product, 0, sizeof(*product));
+}
+
+static void product_vec_free(product_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) product_free(&vec->items[i]);
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static void board_config_free(board_config_decl_t *board) {
+    if (!board) return;
+    free(board->file_path);
+    free(board->workspace_path);
+    free(board->device_owner);
+    free(board->vendor_owner);
+    for (int i = 0; i < board->variable_count; i++) {
+        free(board->variables[i].name);
+        free(board->variables[i].value);
+    }
+    free(board->variables);
+    str_vec_free(&board->partitions);
+    memset(board, 0, sizeof(*board));
+}
+
+static void board_config_vec_free(board_config_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) board_config_free(&vec->items[i]);
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
 }
@@ -1144,6 +1286,33 @@ static char *workspace_dir_path(const cbm_aosp_repo_t *repo, const char *file_pa
     return path;
 }
 
+static char *workspace_file_path(const cbm_aosp_repo_t *repo, const char *file_path) {
+    if (!repo || !repo->path || !file_path) return NULL;
+    const char *repo_path = strcmp(repo->path, ".") == 0 ? "" : repo->path;
+    size_t size = strlen(repo_path) + strlen(file_path) + (repo_path[0] ? 2 : 1);
+    char *path = malloc(size);
+    if (!path) return NULL;
+    if (repo_path[0]) {
+        (void)snprintf(path, size, "%s/%s", repo_path, file_path);
+    } else {
+        (void)snprintf(path, size, "%s", file_path);
+    }
+    for (char *p = path; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    while (strncmp(path, "./", 2) == 0) memmove(path, path + 2, strlen(path + 2) + 1);
+    return path;
+}
+
+static char *workspace_owner_path(const char *workspace_path, const char *prefix) {
+    if (!workspace_path || !prefix) return NULL;
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(workspace_path, prefix, prefix_length) != 0) return NULL;
+    const char *slash = strrchr(workspace_path, '/');
+    if (!slash || slash <= workspace_path + prefix_length) return NULL;
+    return cbm_strndup(workspace_path, (size_t)(slash - workspace_path));
+}
+
 static bool parse_blueprint(scan_ctx_t *ctx, const char *source, size_t length,
                             const char *file_path) {
     char *package_path = workspace_dir_path(ctx->repo, file_path);
@@ -1236,6 +1405,173 @@ static char *trim(char *text) {
     return text;
 }
 
+static product_decl_t *product_vec_add(scan_ctx_t *ctx, const char *file_path) {
+    product_vec_t *vec = &ctx->products;
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 16;
+        product_decl_t *items = realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return NULL;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    product_decl_t *product = &vec->items[vec->count];
+    memset(product, 0, sizeof(*product));
+    product->file_path = strdup(file_path);
+    product->workspace_path = workspace_file_path(ctx->repo, file_path);
+    if (product->workspace_path) {
+        product->device_owner = workspace_owner_path(product->workspace_path, "device/");
+        product->vendor_owner = workspace_owner_path(product->workspace_path, "vendor/");
+    }
+    if (!product->file_path || !product->workspace_path) {
+        product_free(product);
+        return NULL;
+    }
+    vec->count++;
+    return product;
+}
+
+static bool product_add_inherit(product_decl_t *product, const char *path,
+                                const char *source_file, bool optional,
+                                const char *status) {
+    if (!product || !path || !path[0]) return true;
+    if (product->inherit_count == product->inherit_cap) {
+        int new_cap = product->inherit_cap ? product->inherit_cap * 2 : 8;
+        product_inherit_decl_t *items =
+            realloc(product->inherits, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        product->inherits = items;
+        product->inherit_cap = new_cap;
+    }
+    product_inherit_decl_t *inherit = &product->inherits[product->inherit_count];
+    memset(inherit, 0, sizeof(*inherit));
+    inherit->path = strdup(path);
+    inherit->source_file = strdup(source_file ? source_file : product->file_path);
+    inherit->status = strdup(status ? status : "pending");
+    inherit->optional = optional;
+    if (!inherit->path || !inherit->source_file || !inherit->status) {
+        free(inherit->path);
+        free(inherit->source_file);
+        free(inherit->status);
+        memset(inherit, 0, sizeof(*inherit));
+        return false;
+    }
+    product->inherit_count++;
+    return true;
+}
+
+static product_package_decl_t *product_find_package(product_decl_t *product,
+                                                    const char *name,
+                                                    const char *partition) {
+    for (int i = 0; product && i < product->package_count; i++) {
+        product_package_decl_t *package = &product->packages[i];
+        if (strcmp(package->name, name) == 0 &&
+            (strcmp(package->partition, partition) == 0 || !package->included)) {
+            return package;
+        }
+    }
+    return NULL;
+}
+
+static bool product_add_package(product_decl_t *product, const char *name,
+                                const char *partition, const char *source_variable,
+                                const char *source_file, bool included,
+                                const product_package_decl_t *inherited,
+                                const char *inherit_source_path) {
+    if (!product || !name || !name[0] || !partition) return true;
+    product_package_decl_t *existing = product_find_package(product, name, partition);
+    if (existing) return true;
+    if (product->package_count == product->package_cap) {
+        int new_cap = product->package_cap ? product->package_cap * 2 : 32;
+        product_package_decl_t *items =
+            realloc(product->packages, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        product->packages = items;
+        product->package_cap = new_cap;
+    }
+    product_package_decl_t *package = &product->packages[product->package_count];
+    memset(package, 0, sizeof(*package));
+    package->name = strdup(name);
+    package->partition = strdup(partition);
+    package->source_variable = strdup(source_variable ? source_variable : "PRODUCT_PACKAGES");
+    package->source_file = strdup(source_file ? source_file : product->file_path);
+    package->included = included;
+    if (inherited) {
+        package->inherited_from = strdup(inherit_source_path);
+        size_t path_size = strlen(inherited->inheritance_path ? inherited->inheritance_path : "") +
+                           strlen(inherit_source_path) + 3;
+        package->inheritance_path = malloc(path_size);
+        if (package->inheritance_path) {
+            if (inherited->inheritance_path && inherited->inheritance_path[0]) {
+                (void)snprintf(package->inheritance_path, path_size, "%s>%s",
+                               inherit_source_path, inherited->inheritance_path);
+            } else {
+                (void)snprintf(package->inheritance_path, path_size, "%s",
+                               inherit_source_path);
+            }
+        }
+        package->inheritance_depth = inherited->inheritance_depth + 1;
+    }
+    if (!package->name || !package->partition || !package->source_variable ||
+        !package->source_file || (inherited && (!package->inherited_from ||
+                                                !package->inheritance_path))) {
+        product_package_free(package);
+        return false;
+    }
+    product->package_count++;
+    if (included && strcmp(partition, "unspecified") != 0) {
+        return str_vec_add_unique(&product->partitions, partition);
+    }
+    return true;
+}
+
+static board_config_decl_t *board_config_vec_add(scan_ctx_t *ctx,
+                                                 const char *file_path) {
+    board_config_vec_t *vec = &ctx->board_configs;
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 8;
+        board_config_decl_t *items =
+            realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return NULL;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    board_config_decl_t *board = &vec->items[vec->count];
+    memset(board, 0, sizeof(*board));
+    board->file_path = strdup(file_path);
+    board->workspace_path = workspace_file_path(ctx->repo, file_path);
+    if (board->workspace_path) {
+        board->device_owner = workspace_owner_path(board->workspace_path, "device/");
+        board->vendor_owner = workspace_owner_path(board->workspace_path, "vendor/");
+    }
+    if (!board->file_path || !board->workspace_path) {
+        board_config_free(board);
+        return NULL;
+    }
+    vec->count++;
+    return board;
+}
+
+static bool board_add_variable(board_config_decl_t *board, const char *name,
+                               const char *value) {
+    if (board->variable_count == board->variable_cap) {
+        int new_cap = board->variable_cap ? board->variable_cap * 2 : 32;
+        name_value_t *items = realloc(board->variables, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        board->variables = items;
+        board->variable_cap = new_cap;
+    }
+    name_value_t *variable = &board->variables[board->variable_count];
+    variable->name = strdup(name);
+    variable->value = strdup(value ? value : "");
+    if (!variable->name || !variable->value) {
+        free(variable->name);
+        free(variable->value);
+        return false;
+    }
+    board->variable_count++;
+    return true;
+}
+
 typedef struct {
     char *name;
     char *value;
@@ -1259,6 +1595,7 @@ typedef struct {
 typedef struct {
     scan_ctx_t *ctx;
     make_file_decl_t *coverage;
+    product_decl_t *product;
     make_var_vec_t vars;
     str_vec_t include_stack;
     const char *current_file;
@@ -1644,6 +1981,47 @@ fail:
     return NULL;
 }
 
+static bool make_handle_product_inherit(make_eval_t *eval, const char *line,
+                                        bool *handled) {
+    *handled = false;
+    if (!eval->product || strncmp(line, "$(call ", 7) != 0) return true;
+    size_t length = strlen(line);
+    if (length < 9 || line[length - 1] != ')') return true;
+    char *expression = cbm_strndup(line + 7, length - 8);
+    if (!expression) return false;
+    str_vec_t args = {0};
+    bool ok = make_split_args(expression, &args);
+    if (!ok || args.count != 2 ||
+        (strcmp(args.items[0], "inherit-product") != 0 &&
+         strcmp(args.items[0], "inherit-product-if-exists") != 0)) {
+        str_vec_free(&args);
+        free(expression);
+        return ok;
+    }
+    *handled = true;
+    bool complete = true;
+    char *expanded = make_expand_text(eval, args.items[1], 0, &complete);
+    char *normalized = expanded ? trim(expanded) : NULL;
+    while (normalized && strncmp(normalized, "./", 2) == 0) normalized += 2;
+    if (!expanded || !normalized[0]) {
+        ok = false;
+    } else {
+        for (char *p = normalized; *p; p++) {
+            if (*p == '\\') *p = '/';
+        }
+        const char *status = complete ? "pending" : "unsupported_expression";
+        ok = product_add_inherit(eval->product, normalized, eval->current_file,
+                                 strcmp(args.items[0], "inherit-product-if-exists") == 0,
+                                 status);
+        if (!complete) ok = make_record_unsupported(eval, line) && ok;
+    }
+    eval->coverage->macro_count++;
+    free(expanded);
+    str_vec_free(&args);
+    free(expression);
+    return ok;
+}
+
 static bool make_add_words(module_decl_t *module, const char *value,
                            const char *kind) {
     char *copy = strdup(value ? value : "");
@@ -1963,6 +2341,11 @@ static bool make_include_file(make_eval_t *eval, const char *file_path, bool opt
                    normalized);
     size_t length = 0;
     char *source = bg_read_file(absolute, &length);
+    if (!source && eval->ctx->workspace && eval->ctx->workspace->root) {
+        (void)snprintf(absolute, sizeof(absolute), "%s/%s",
+                       eval->ctx->workspace->root, normalized);
+        source = bg_read_file(absolute, &length);
+    }
     if (!source) {
         bool ok = optional || make_record_unsupported(eval, normalized);
         free(normalized);
@@ -2152,6 +2535,9 @@ static bool make_parse_source(make_eval_t *eval, char *source, const char *file_
             ok = make_record_unsupported(eval, line);
             continue;
         }
+        bool product_inherit = false;
+        ok = make_handle_product_inherit(eval, line, &product_inherit);
+        if (!ok || product_inherit) continue;
         if (strncmp(line, "include ", 8) == 0 ||
             strncmp(line, "-include ", 9) == 0 ||
             strncmp(line, "sinclude ", 9) == 0) {
@@ -2177,6 +2563,215 @@ static bool parse_android_mk(scan_ctx_t *ctx, char *source, const char *file_pat
     bool ok = make_parse_source(&eval, source, file_path);
     if (eval.condition_depth != 0) {
         ok = make_record_unsupported(&eval, "unterminated conditional") && ok;
+    }
+    make_var_vec_free(&eval.vars);
+    str_vec_free(&eval.include_stack);
+    return ok;
+}
+
+static bool make_seed_product_vars(make_eval_t *eval) {
+    char *local_path = workspace_dir_path(eval->ctx->repo, eval->current_file);
+    if (!local_path) return false;
+    bool ok = make_var_set(&eval->vars, "LOCAL_PATH", local_path, false, false, false) &&
+              make_var_set(&eval->vars, "SRC_TARGET_DIR", "build/make/target",
+                           false, false, false) &&
+              make_var_set(&eval->vars, "BUILD_SYSTEM", "build/make/core",
+                           false, false, false);
+    free(local_path);
+    return ok;
+}
+
+static bool make_copy_named_value(make_eval_t *eval, const char *name, char **target) {
+    make_var_t *var = make_var_find(&eval->vars, name);
+    if (!var) return true;
+    bool complete = true;
+    char *value = make_value(eval, name, &complete);
+    if (!value) return false;
+    char *clean = trim(value);
+    char *copy = strdup(clean);
+    bool ok = copy != NULL;
+    if (!complete) ok = make_record_unsupported(eval, var->value) && ok;
+    if (ok) {
+        free(*target);
+        *target = copy;
+    } else {
+        free(copy);
+    }
+    free(value);
+    return ok;
+}
+
+static const char *product_package_partition(const char *variable) {
+    if (strcmp(variable, "PRODUCT_PACKAGES_VENDOR") == 0) return "vendor";
+    if (strcmp(variable, "PRODUCT_PACKAGES_PRODUCT") == 0) return "product";
+    if (strcmp(variable, "PRODUCT_PACKAGES_SYSTEM_EXT") == 0) return "system_ext";
+    if (strcmp(variable, "PRODUCT_PACKAGES_ODM") == 0) return "odm";
+    if (strcmp(variable, "PRODUCT_PACKAGES_SYSTEM") == 0) return "system";
+    return "unspecified";
+}
+
+static const char *copy_target_partition(const char *target) {
+    static const char *partitions[] = {
+        "system_ext", "vendor_boot", "init_boot", "system", "vendor", "product",
+        "odm", "oem", "recovery", "boot", "data",
+    };
+    for (size_t i = 0; i < sizeof(partitions) / sizeof(partitions[0]); i++) {
+        size_t length = strlen(partitions[i]);
+        if (strncmp(target, partitions[i], length) == 0 &&
+            (target[length] == '/' || target[length] == '\0')) {
+            return partitions[i];
+        }
+    }
+    return NULL;
+}
+
+static bool collect_product_copy_partitions(make_eval_t *eval,
+                                            product_decl_t *product) {
+    make_var_t *var = make_var_find(&eval->vars, "PRODUCT_COPY_FILES");
+    if (!var) return true;
+    bool complete = true;
+    char *value = make_value(eval, "PRODUCT_COPY_FILES", &complete);
+    if (!value) return false;
+    bool ok = true;
+    char *save = NULL;
+    for (char *entry = strtok_r(value, " \t\r\n", &save); entry && ok;
+         entry = strtok_r(NULL, " \t\r\n", &save)) {
+        char *separator = strchr(entry, ':');
+        if (!separator || !separator[1]) {
+            ok = make_record_unsupported(eval, entry);
+            continue;
+        }
+        char *target = separator + 1;
+        char *owner = strchr(target, ':');
+        if (owner) *owner = '\0';
+        const char *partition = copy_target_partition(target);
+        if (partition) ok = str_vec_add_unique(&product->partitions, partition);
+    }
+    if (!complete) ok = make_record_unsupported(eval, var->value) && ok;
+    free(value);
+    return ok;
+}
+
+static bool collect_product_packages(make_eval_t *eval, product_decl_t *product) {
+    static const char prefix[] = "PRODUCT_PACKAGES";
+    bool ok = true;
+    for (int i = 0; i < eval->vars.count && ok; i++) {
+        make_var_t *var = &eval->vars.items[i];
+        if (strncmp(var->name, prefix, sizeof(prefix) - 1) != 0 ||
+            (var->name[sizeof(prefix) - 1] != '\0' &&
+             var->name[sizeof(prefix) - 1] != '_')) {
+            continue;
+        }
+        bool complete = true;
+        char *value = make_value(eval, var->name, &complete);
+        if (!value) return false;
+        char *save = NULL;
+        for (char *word = strtok_r(value, " \t\r\n", &save); word && ok;
+             word = strtok_r(NULL, " \t\r\n", &save)) {
+            bool included = word[0] != '-';
+            const char *name = included ? word : word + 1;
+            if (!name[0] || strstr(name, "$(") || strstr(name, "${")) {
+                ok = make_record_unsupported(eval, word);
+                continue;
+            }
+            ok = product_add_package(product, name,
+                                     product_package_partition(var->name), var->name,
+                                     eval->current_file, included, NULL, NULL);
+        }
+        if (!complete) ok = make_record_unsupported(eval, var->value) && ok;
+        free(value);
+    }
+    return ok;
+}
+
+static char *product_fallback_name(const char *workspace_path) {
+    const char *base = strrchr(workspace_path, '/');
+    base = base ? base + 1 : workspace_path;
+    size_t length = strlen(base);
+    if (length > 3 && strcmp(base + length - 3, ".mk") == 0) length -= 3;
+    return cbm_strndup(base, length);
+}
+
+static bool parse_product_make(scan_ctx_t *ctx, char *source, const char *file_path) {
+    make_file_decl_t *coverage = make_file_vec_add(&ctx->make_files, file_path);
+    product_decl_t *product = product_vec_add(ctx, file_path);
+    if (!coverage || !product) return false;
+    make_eval_t eval = {
+        .ctx = ctx, .coverage = coverage, .product = product, .current_file = file_path,
+    };
+    bool ok = str_vec_add(&eval.include_stack, file_path) && make_seed_product_vars(&eval) &&
+              make_parse_source(&eval, source, file_path);
+    if (eval.condition_depth != 0) {
+        ok = make_record_unsupported(&eval, "unterminated conditional") && ok;
+    }
+    if (ok) ok = make_copy_named_value(&eval, "PRODUCT_NAME", &product->name);
+    if (ok) ok = make_copy_named_value(&eval, "PRODUCT_DEVICE", &product->device);
+    if (ok) ok = make_copy_named_value(&eval, "PRODUCT_BRAND", &product->brand);
+    if (ok) ok = make_copy_named_value(&eval, "PRODUCT_MODEL", &product->model);
+    if (ok) ok = make_copy_named_value(&eval, "PRODUCT_MANUFACTURER", &product->manufacturer);
+    if (ok) ok = collect_product_packages(&eval, product);
+    if (ok) ok = collect_product_copy_partitions(&eval, product);
+    product->kind = strdup(product->name && product->name[0] ? "product" : "fragment");
+    if (!product->name || !product->name[0]) {
+        free(product->name);
+        product->name = product_fallback_name(product->workspace_path);
+    }
+    if (!product->kind || !product->name) ok = false;
+    make_var_vec_free(&eval.vars);
+    str_vec_free(&eval.include_stack);
+    return ok;
+}
+
+static const char *board_partition_for_variable(const char *name) {
+    if (strstr(name, "SYSTEM_EXT")) return "system_ext";
+    if (strstr(name, "VENDOR_BOOT")) return "vendor_boot";
+    if (strstr(name, "INIT_BOOT")) return "init_boot";
+    if (strstr(name, "VENDORIMAGE")) return "vendor";
+    if (strstr(name, "PRODUCTIMAGE")) return "product";
+    if (strstr(name, "ODMIMAGE")) return "odm";
+    if (strstr(name, "SYSTEMIMAGE")) return "system";
+    if (strstr(name, "RECOVERYIMAGE")) return "recovery";
+    if (strstr(name, "USERDATAIMAGE")) return "userdata";
+    if (strstr(name, "CACHEIMAGE")) return "cache";
+    if (strstr(name, "DTBOIMG")) return "dtbo";
+    if (strstr(name, "BOOTIMAGE")) return "boot";
+    if (strstr(name, "SUPER_PARTITION")) return "super";
+    return NULL;
+}
+
+static bool board_variable_supported(const char *name) {
+    return strncmp(name, "BOARD_", 6) == 0 ||
+           strncmp(name, "TARGET_BOARD_", 13) == 0 ||
+           strncmp(name, "TARGET_BOOTLOADER_", 18) == 0 ||
+           strcmp(name, "DEVICE_MANIFEST_FILE") == 0 ||
+           strcmp(name, "DEVICE_MATRIX_FILE") == 0 ||
+           strcmp(name, "ODM_MANIFEST_FILES") == 0;
+}
+
+static bool parse_board_config(scan_ctx_t *ctx, char *source, const char *file_path) {
+    make_file_decl_t *coverage = make_file_vec_add(&ctx->make_files, file_path);
+    board_config_decl_t *board = board_config_vec_add(ctx, file_path);
+    if (!coverage || !board) return false;
+    make_eval_t eval = {.ctx = ctx, .coverage = coverage, .current_file = file_path};
+    bool ok = str_vec_add(&eval.include_stack, file_path) && make_seed_product_vars(&eval) &&
+              make_parse_source(&eval, source, file_path);
+    if (eval.condition_depth != 0) {
+        ok = make_record_unsupported(&eval, "unterminated conditional") && ok;
+    }
+    for (int i = 0; i < eval.vars.count && ok; i++) {
+        make_var_t *var = &eval.vars.items[i];
+        if (!board_variable_supported(var->name)) continue;
+        bool complete = true;
+        char *value = make_value(&eval, var->name, &complete);
+        if (!value) {
+            ok = false;
+            break;
+        }
+        ok = board_add_variable(board, var->name, trim(value));
+        const char *partition = board_partition_for_variable(var->name);
+        if (partition) ok = str_vec_add_unique(&board->partitions, partition) && ok;
+        if (!complete) ok = make_record_unsupported(&eval, var->value) && ok;
+        free(value);
     }
     make_var_vec_free(&eval.vars);
     str_vec_free(&eval.include_stack);
@@ -2258,6 +2853,8 @@ typedef struct {
 } module_stack_t;
 
 static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, char out[65]);
+static void product_id(const cbm_aosp_workspace_t *workspace,
+                       const product_decl_t *product, char out[65]);
 
 static bool module_stack_push(module_stack_t *stack, module_decl_t *module) {
     if (stack->count == stack->cap) {
@@ -2712,6 +3309,129 @@ static bool resolve_all_dependencies(scan_ctx_t *contexts, int context_count,
     return true;
 }
 
+static product_decl_t *find_product_by_path(scan_ctx_t *contexts, int context_count,
+                                            const char *workspace_path) {
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].products.count; i++) {
+            product_decl_t *product = &contexts[c].products.items[i];
+            if (strcmp(product->workspace_path, workspace_path) == 0) return product;
+        }
+    }
+    return NULL;
+}
+
+static bool product_copy_value_if_missing(char **target, const char *source) {
+    if (*target || !source || !source[0]) return true;
+    *target = strdup(source);
+    return *target != NULL;
+}
+
+static bool expand_product_inheritance(scan_ctx_t *contexts, int context_count,
+                                       product_decl_t *product,
+                                       const cbm_aosp_workspace_t *workspace) {
+    if (product->expansion_state == 2) return true;
+    if (product->expansion_state == 1) {
+        product->inheritance_cycle = true;
+        return true;
+    }
+    product->expansion_state = 1;
+    for (int i = 0; i < product->inherit_count; i++) {
+        product_inherit_decl_t *inherit = &product->inherits[i];
+        if (strcmp(inherit->status, "unsupported_expression") == 0) continue;
+        product_decl_t *target = find_product_by_path(contexts, context_count, inherit->path);
+        free(inherit->status);
+        inherit->status = NULL;
+        if (!target) {
+            inherit->status = strdup(inherit->optional ? "optional_missing" : "not_found");
+            if (!inherit->status) return false;
+            continue;
+        }
+        if (target->expansion_state == 1) {
+            inherit->status = strdup("cycle");
+            product->inheritance_cycle = true;
+            target->inheritance_cycle = true;
+            if (!inherit->status) return false;
+            continue;
+        }
+        if (!expand_product_inheritance(contexts, context_count, target, workspace)) return false;
+        inherit->status = strdup("resolved");
+        char target_id[65];
+        product_id(workspace, target, target_id);
+        inherit->resolved_product_id = strdup(target_id);
+        if (!inherit->status || !inherit->resolved_product_id ||
+            !product_copy_value_if_missing(&product->device, target->device) ||
+            !product_copy_value_if_missing(&product->brand, target->brand) ||
+            !product_copy_value_if_missing(&product->model, target->model) ||
+            !product_copy_value_if_missing(&product->manufacturer, target->manufacturer)) {
+            return false;
+        }
+        for (int p = 0; p < target->package_count; p++) {
+            product_package_decl_t *package = &target->packages[p];
+            if (!product_add_package(product, package->name, package->partition,
+                                     package->source_variable, package->source_file,
+                                     package->included, package, target->workspace_path)) {
+                return false;
+            }
+        }
+        for (int p = 0; p < target->partitions.count; p++) {
+            if (!str_vec_add_unique(&product->partitions, target->partitions.items[p])) return false;
+        }
+        if (target->inheritance_cycle) product->inheritance_cycle = true;
+    }
+    product->expansion_state = 2;
+    return true;
+}
+
+static bool expand_all_products(scan_ctx_t *contexts, int context_count,
+                                const cbm_aosp_workspace_t *workspace) {
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].products.count; i++) {
+            if (!expand_product_inheritance(contexts, context_count,
+                                            &contexts[c].products.items[i], workspace)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool resolve_product_packages(scan_ctx_t *contexts, int context_count,
+                                     const module_index_t *index) {
+    for (int c = 0; c < context_count; c++) {
+        for (int i = 0; i < contexts[c].products.count; i++) {
+            product_decl_t *product = &contexts[c].products.items[i];
+            for (int p = 0; p < product->package_count; p++) {
+                product_package_decl_t *package = &product->packages[p];
+                if (!package->included) {
+                    package->resolution = strdup("removed");
+                    if (!package->resolution) return false;
+                    continue;
+                }
+                module_index_item_t *match = NULL;
+                int candidates = 0;
+                for (int m = 0; m < index->count; m++) {
+                    if (strcmp(index->items[m].name, package->name) == 0) {
+                        match = &index->items[m];
+                        candidates++;
+                    }
+                }
+                if (candidates == 1) {
+                    char id[65];
+                    module_id(match->ctx->repo, match->module, id);
+                    package->resolved_target_id = strdup(id);
+                    package->resolution = strdup("unique_module");
+                } else {
+                    package->resolution = strdup(candidates ? "ambiguous" : "not_found");
+                }
+                if (!package->resolution || (candidates == 1 && !package->resolved_target_id)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, int depth) {
     if (depth > BG_MAX_WALK_DEPTH) {
         bg_error(ctx->err, ctx->err_size, "AOSP build scan depth exceeded", rel_dir);
@@ -2737,13 +3457,22 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
         bool is_bp = strcmp(entry->name, "Android.bp") == 0;
         bool is_mk = strcmp(entry->name, "Android.mk") == 0;
         size_t name_len = strlen(entry->name);
+        bool is_any_mk = name_len > 3 && strcmp(entry->name + name_len - 3, ".mk") == 0;
+        bool is_board = is_any_mk && strncmp(entry->name, "BoardConfig", 11) == 0;
         bool is_aidl = name_len > 5 && strcmp(entry->name + name_len - 5, ".aidl") == 0;
-        if (!is_bp && !is_mk && !is_aidl) continue;
+        if (!is_bp && !is_any_mk && !is_aidl) continue;
         size_t length = 0;
         char *source = bg_read_file(abs_path, &length);
         if (!source) {
             bg_error(ctx->err, ctx->err_size, "cannot read AOSP build file", abs_path);
             rc = -1;
+            continue;
+        }
+        bool is_product = is_any_mk && !is_mk && !is_board &&
+                          (strstr(source, "PRODUCT_") != NULL ||
+                           strstr(source, "inherit-product") != NULL);
+        if (is_any_mk && !is_mk && !is_board && !is_product) {
+            free(source);
             continue;
         }
         bool ok;
@@ -2753,6 +3482,12 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
         } else if (is_mk) {
             ctx->stats.make_files++;
             ok = parse_android_mk(ctx, source, rel_path);
+        } else if (is_board) {
+            ctx->stats.board_config_files++;
+            ok = parse_board_config(ctx, source, rel_path);
+        } else if (is_product) {
+            ctx->stats.product_make_files++;
+            ok = parse_product_make(ctx, source, rel_path);
         } else {
             ctx->stats.aidl_files++;
             ok = parse_aidl(source, length, rel_path, &ctx->modules);
@@ -2778,6 +3513,23 @@ static void module_id(const cbm_aosp_repo_t *repo, const module_decl_t *module, 
     cbm_sha256_update(&ctx, module->type, strlen(module->type));
     cbm_sha256_update(&ctx, "\0", 1);
     cbm_sha256_update(&ctx, module->name, strlen(module->name));
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
+}
+
+static void product_id(const cbm_aosp_workspace_t *workspace,
+                       const product_decl_t *product, char out[65]) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&ctx);
+    cbm_sha256_update(&ctx, workspace->workspace_id, strlen(workspace->workspace_id));
+    cbm_sha256_update(&ctx, "\0product\0", 9);
+    cbm_sha256_update(&ctx, product->workspace_path, strlen(product->workspace_path));
     cbm_sha256_final(&ctx, digest);
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
@@ -2921,6 +3673,55 @@ static char *string_array_json(const str_vec_t *values) {
     return json;
 }
 
+static char *name_value_object_json(const name_value_t *values, int count) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_obj_add_strcpy(doc, object, values[i].name, values[i].value);
+    }
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *product_properties_json(const product_decl_t *product) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_bool(doc, object, "inheritance_cycle", product->inheritance_cycle);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *product_package_properties_json(const product_package_decl_t *package) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_strcpy(doc, object, "resolution",
+                             package->resolution ? package->resolution : "not_found");
+    if (package->inherited_from) {
+        yyjson_mut_obj_add_strcpy(doc, object, "origin", "inherit-product");
+        yyjson_mut_obj_add_strcpy(doc, object, "inherited_from", package->inherited_from);
+        yyjson_mut_obj_add_strcpy(doc, object, "inheritance_path",
+                                 package->inheritance_path ? package->inheritance_path : "");
+        yyjson_mut_obj_add_int(doc, object, "inheritance_depth",
+                               package->inheritance_depth);
+    } else {
+        yyjson_mut_obj_add_strcpy(doc, object, "origin", "direct");
+    }
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
 static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t *contexts,
                                int context_count, char *err, size_t err_size) {
     char path[BG_PATH_MAX];
@@ -2941,6 +3742,10 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_stmt *insert_namespace = NULL;
     sqlite3_stmt *insert_package = NULL;
     sqlite3_stmt *insert_make = NULL;
+    sqlite3_stmt *insert_product = NULL;
+    sqlite3_stmt *insert_product_inherit = NULL;
+    sqlite3_stmt *insert_product_package = NULL;
+    sqlite3_stmt *insert_board = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
     const char *reset_sql =
         "DELETE FROM module_edges WHERE source_id IN "
@@ -2992,6 +3797,34 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_product_packages WHERE product_id IN "
+            "(SELECT product_id FROM build_products WHERE workspace_id=?1);",
+            -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_product_inheritance WHERE source_product_id IN "
+            "(SELECT product_id FROM build_products WHERE workspace_id=?1);",
+            -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM build_products WHERE workspace_id=?1;",
+                           -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM build_board_configs WHERE workspace_id=?1;",
+                           -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR IGNORE INTO modules(module_id,workspace_id,repo_id,name,module_type,file_path,properties)"
@@ -3014,6 +3847,25 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             "INSERT OR REPLACE INTO build_make_files("
             "workspace_id,repo_id,file_path,includes,condition_count,macro_count,unsupported_expressions) "
             "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_make, NULL) != SQLITE_OK)
+        goto fail_insert;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_products("
+            "product_id,workspace_id,repo_id,name,kind,file_path,workspace_path,device,brand,model,"
+            "manufacturer,device_owner,vendor_owner,partitions,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15);",
+            -1, &insert_product, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_product_inheritance("
+            "source_product_id,inherited_path,target_product_id,status,optional,source_file,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,'{}');", -1, &insert_product_inherit, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_product_packages("
+            "product_id,module_name,partition_name,module_id,resolved,included,source_variable,source_file,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1, &insert_product_package, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_board_configs("
+            "workspace_id,repo_id,file_path,workspace_path,device_owner,vendor_owner,variables,partitions) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8);", -1, &insert_board, NULL) != SQLITE_OK)
         goto fail_insert;
     for (int c = 0; c < context_count; c++) {
         for (int i = 0; i < contexts[c].make_files.count; i++) {
@@ -3068,6 +3920,124 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             int package_step = sqlite3_step(insert_package);
             free(visibility);
             if (package_step != SQLITE_DONE) goto fail_insert;
+        }
+        for (int i = 0; i < contexts[c].products.count; i++) {
+            product_decl_t *product = &contexts[c].products.items[i];
+            char id[65];
+            product_id(workspace, product, id);
+            char *partitions = string_array_json(&product->partitions);
+            char *properties = product_properties_json(product);
+            if (!partitions || !properties) {
+                free(partitions);
+                free(properties);
+                goto fail_insert;
+            }
+            sqlite3_reset(insert_product);
+            sqlite3_clear_bindings(insert_product);
+            sqlite3_bind_text(insert_product, 1, id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 2, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 3, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 4, product->name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 5, product->kind, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 6, product->file_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 7, product->workspace_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 8, product->device ? product->device : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 9, product->brand ? product->brand : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 10, product->model ? product->model : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 11,
+                              product->manufacturer ? product->manufacturer : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 12,
+                              product->device_owner ? product->device_owner : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 13,
+                              product->vendor_owner ? product->vendor_owner : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 14, partitions, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_product, 15, properties, -1, SQLITE_TRANSIENT);
+            int product_step = sqlite3_step(insert_product);
+            free(partitions);
+            free(properties);
+            if (product_step != SQLITE_DONE) goto fail_insert;
+            for (int h = 0; h < product->inherit_count; h++) {
+                product_inherit_decl_t *inherit = &product->inherits[h];
+                sqlite3_reset(insert_product_inherit);
+                sqlite3_clear_bindings(insert_product_inherit);
+                sqlite3_bind_text(insert_product_inherit, 1, id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_product_inherit, 2, inherit->path, -1, SQLITE_TRANSIENT);
+                if (inherit->resolved_product_id) {
+                    sqlite3_bind_text(insert_product_inherit, 3, inherit->resolved_product_id,
+                                      -1, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_null(insert_product_inherit, 3);
+                }
+                sqlite3_bind_text(insert_product_inherit, 4, inherit->status, -1,
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_int(insert_product_inherit, 5, inherit->optional);
+                sqlite3_bind_text(insert_product_inherit, 6, inherit->source_file, -1,
+                                  SQLITE_TRANSIENT);
+                if (sqlite3_step(insert_product_inherit) != SQLITE_DONE) goto fail_insert;
+            }
+            for (int p = 0; p < product->package_count; p++) {
+                product_package_decl_t *package = &product->packages[p];
+                char *package_properties = product_package_properties_json(package);
+                if (!package_properties) goto fail_insert;
+                sqlite3_reset(insert_product_package);
+                sqlite3_clear_bindings(insert_product_package);
+                sqlite3_bind_text(insert_product_package, 1, id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_product_package, 2, package->name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_product_package, 3, package->partition, -1,
+                                  SQLITE_TRANSIENT);
+                if (package->resolved_target_id) {
+                    sqlite3_bind_text(insert_product_package, 4, package->resolved_target_id,
+                                      -1, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_null(insert_product_package, 4);
+                }
+                sqlite3_bind_int(insert_product_package, 5,
+                                 package->resolved_target_id != NULL);
+                sqlite3_bind_int(insert_product_package, 6, package->included);
+                sqlite3_bind_text(insert_product_package, 7, package->source_variable, -1,
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_product_package, 8, package->source_file, -1,
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_product_package, 9, package_properties, -1,
+                                  SQLITE_TRANSIENT);
+                int package_step = sqlite3_step(insert_product_package);
+                free(package_properties);
+                if (package_step != SQLITE_DONE) goto fail_insert;
+            }
+        }
+        for (int i = 0; i < contexts[c].board_configs.count; i++) {
+            board_config_decl_t *board = &contexts[c].board_configs.items[i];
+            char *variables = name_value_object_json(board->variables, board->variable_count);
+            char *partitions = string_array_json(&board->partitions);
+            if (!variables || !partitions) {
+                free(variables);
+                free(partitions);
+                goto fail_insert;
+            }
+            sqlite3_reset(insert_board);
+            sqlite3_clear_bindings(insert_board);
+            sqlite3_bind_text(insert_board, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 2, contexts[c].repo->repo_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 3, board->file_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 4, board->workspace_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 5,
+                              board->device_owner ? board->device_owner : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 6,
+                              board->vendor_owner ? board->vendor_owner : "", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 7, variables, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_board, 8, partitions, -1, SQLITE_TRANSIENT);
+            int board_step = sqlite3_step(insert_board);
+            free(variables);
+            free(partitions);
+            if (board_step != SQLITE_DONE) goto fail_insert;
         }
         for (int i = 0; i < contexts[c].modules.count; i++) {
             module_decl_t *module = &contexts[c].modules.items[i];
@@ -3131,12 +4101,20 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
     sqlite3_finalize(insert_make);
+    sqlite3_finalize(insert_product);
+    sqlite3_finalize(insert_product_inherit);
+    sqlite3_finalize(insert_product_package);
+    sqlite3_finalize(insert_board);
     insert_module = NULL;
     insert_dep = NULL;
     insert_file = NULL;
     insert_namespace = NULL;
     insert_package = NULL;
     insert_make = NULL;
+    insert_product = NULL;
+    insert_product_inherit = NULL;
+    insert_product_package = NULL;
+    insert_board = NULL;
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
@@ -3158,6 +4136,10 @@ fail_insert:
     sqlite3_finalize(insert_namespace);
     sqlite3_finalize(insert_package);
     sqlite3_finalize(insert_make);
+    sqlite3_finalize(insert_product);
+    sqlite3_finalize(insert_product_inherit);
+    sqlite3_finalize(insert_product_package);
+    sqlite3_finalize(insert_board);
 fail:
     sqlite3_finalize(reset);
     sqlite3_finalize(stmt);
@@ -3225,7 +4207,29 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "(SELECT coalesce(sum(condition_count),0) FROM build_make_files WHERE workspace_id=?1),"
         "(SELECT coalesce(sum(macro_count),0) FROM build_make_files WHERE workspace_id=?1),"
         "(SELECT coalesce(sum(json_array_length(unsupported_expressions)),0) "
-        "FROM build_make_files WHERE workspace_id=?1);";
+        "FROM build_make_files WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM build_products WHERE workspace_id=?1 AND kind='product'),"
+        "(SELECT count(*) FROM build_products WHERE workspace_id=?1 AND kind='fragment'),"
+        "(SELECT count(*) FROM build_product_inheritance i JOIN build_products p "
+        "ON p.product_id=i.source_product_id WHERE p.workspace_id=?1),"
+        "(SELECT count(*) FROM build_product_inheritance i JOIN build_products p "
+        "ON p.product_id=i.source_product_id WHERE p.workspace_id=?1 AND i.status='resolved'),"
+        "(SELECT count(*) FROM build_products WHERE workspace_id=?1 "
+        "AND json_extract(properties,'$.inheritance_cycle')=1),"
+        "(SELECT count(*) FROM build_product_packages pp JOIN build_products p "
+        "ON p.product_id=pp.product_id WHERE p.workspace_id=?1 AND p.kind='product' AND pp.included=1),"
+        "(SELECT count(*) FROM build_product_packages pp JOIN build_products p "
+        "ON p.product_id=pp.product_id WHERE p.workspace_id=?1 AND p.kind='product' "
+        "AND pp.included=1 AND pp.resolved=1),"
+        "(SELECT count(*) FROM build_product_packages pp JOIN build_products p "
+        "ON p.product_id=pp.product_id WHERE p.workspace_id=?1 AND p.kind='product' "
+        "AND pp.included=1 AND pp.resolved=0),"
+        "(SELECT count(*) FROM build_board_configs WHERE workspace_id=?1),"
+        "(SELECT count(DISTINCT value) FROM ("
+        "SELECT j.value AS value FROM build_products p,json_each(p.partitions) j "
+        "WHERE p.workspace_id=?1 AND p.kind='product' UNION ALL "
+        "SELECT j.value AS value FROM build_board_configs b,json_each(b.partitions) j "
+        "WHERE b.workspace_id=?1));";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -3259,6 +4263,16 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->make_condition_count = sqlite3_column_int(stmt, 23);
             stats->make_macro_count = sqlite3_column_int(stmt, 24);
             stats->make_unsupported_count = sqlite3_column_int(stmt, 25);
+            stats->product_count = sqlite3_column_int(stmt, 26);
+            stats->product_fragment_count = sqlite3_column_int(stmt, 27);
+            stats->product_inheritance_count = sqlite3_column_int(stmt, 28);
+            stats->product_inheritance_resolved_count = sqlite3_column_int(stmt, 29);
+            stats->product_inheritance_cycle_count = sqlite3_column_int(stmt, 30);
+            stats->product_package_count = sqlite3_column_int(stmt, 31);
+            stats->product_package_resolved_count = sqlite3_column_int(stmt, 32);
+            stats->product_package_unresolved_count = sqlite3_column_int(stmt, 33);
+            stats->board_config_count = sqlite3_column_int(stmt, 34);
+            stats->product_partition_count = sqlite3_column_int(stmt, 35);
             rc = 0;
         }
     }
@@ -3285,6 +4299,8 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
             rc = scan_tree(&contexts[i], workspace->repos[i].abs_path, "", 0);
             file_stats.blueprint_files += contexts[i].stats.blueprint_files;
             file_stats.make_files += contexts[i].stats.make_files;
+            file_stats.product_make_files += contexts[i].stats.product_make_files;
+            file_stats.board_config_files += contexts[i].stats.board_config_files;
             file_stats.aidl_files += contexts[i].stats.aidl_files;
         }
     }
@@ -3305,11 +4321,22 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         bg_error(err, err_size, "cannot resolve AOSP module dependencies", "out of memory");
         rc = -1;
     }
+    if (rc == 0 && !expand_all_products(contexts, workspace->repo_count, workspace)) {
+        bg_error(err, err_size, "cannot expand AOSP product inheritance", "out of memory");
+        rc = -1;
+    }
+    if (rc == 0 &&
+        !resolve_product_packages(contexts, workspace->repo_count, &module_index)) {
+        bg_error(err, err_size, "cannot resolve AOSP product packages", "out of memory");
+        rc = -1;
+    }
     if (rc == 0) rc = persist_build_graph(workspace, contexts, workspace->repo_count, err, err_size);
     if (rc == 0) {
         rc = cbm_aosp_build_stats(workspace, stats, err, err_size);
         stats->blueprint_files = file_stats.blueprint_files;
         stats->make_files = file_stats.make_files;
+        stats->product_make_files = file_stats.product_make_files;
+        stats->board_config_files = file_stats.board_config_files;
         stats->aidl_files = file_stats.aidl_files;
     }
     for (int i = 0; i < workspace->repo_count; i++) {
@@ -3317,6 +4344,8 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         scope_vec_free(&contexts[i].namespaces);
         scope_vec_free(&contexts[i].packages);
         make_file_vec_free(&contexts[i].make_files);
+        product_vec_free(&contexts[i].products);
+        board_config_vec_free(&contexts[i].board_configs);
     }
     free(module_index.items);
     free(contexts);

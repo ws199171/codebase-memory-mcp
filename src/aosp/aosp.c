@@ -694,6 +694,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(8,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(9,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(10,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(11,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -732,6 +733,31 @@ static const char *AOSP_SCHEMA =
     " workspace_id TEXT NOT NULL,package_path TEXT NOT NULL,repo_id TEXT NOT NULL,"
     " file_path TEXT NOT NULL,default_visibility TEXT NOT NULL DEFAULT '[]',"
     " PRIMARY KEY(workspace_id,package_path));"
+    "CREATE TABLE IF NOT EXISTS build_products("
+    " product_id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,"
+    " name TEXT NOT NULL,kind TEXT NOT NULL,file_path TEXT NOT NULL,workspace_path TEXT NOT NULL,"
+    " device TEXT NOT NULL DEFAULT '',brand TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',"
+    " manufacturer TEXT NOT NULL DEFAULT '',device_owner TEXT NOT NULL DEFAULT '',"
+    " vendor_owner TEXT NOT NULL DEFAULT '',partitions TEXT NOT NULL DEFAULT '[]',"
+    " properties TEXT NOT NULL DEFAULT '{}');"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_build_products_name "
+    "ON build_products(workspace_id,name);"
+    "CREATE TABLE IF NOT EXISTS build_product_inheritance("
+    " source_product_id TEXT NOT NULL,inherited_path TEXT NOT NULL,target_product_id TEXT,"
+    " status TEXT NOT NULL,optional INTEGER NOT NULL DEFAULT 0,source_file TEXT NOT NULL,"
+    " properties TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(source_product_id,inherited_path));"
+    "CREATE TABLE IF NOT EXISTS build_product_packages("
+    " product_id TEXT NOT NULL,module_name TEXT NOT NULL,partition_name TEXT NOT NULL,"
+    " module_id TEXT,resolved INTEGER NOT NULL DEFAULT 0,included INTEGER NOT NULL DEFAULT 1,"
+    " source_variable TEXT NOT NULL,source_file TEXT NOT NULL,properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(product_id,module_name,partition_name));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_product_packages_module "
+    "ON build_product_packages(module_name);"
+    "CREATE TABLE IF NOT EXISTS build_board_configs("
+    " workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,file_path TEXT NOT NULL,"
+    " workspace_path TEXT NOT NULL,device_owner TEXT NOT NULL DEFAULT '',"
+    " vendor_owner TEXT NOT NULL DEFAULT '',variables TEXT NOT NULL DEFAULT '{}',"
+    " partitions TEXT NOT NULL DEFAULT '[]',PRIMARY KEY(workspace_id,repo_id,file_path));"
     "CREATE TABLE IF NOT EXISTS symbols("
     " id INTEGER PRIMARY KEY, global_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " local_node_id INTEGER, name TEXT NOT NULL, qualified_name TEXT NOT NULL, label TEXT NOT NULL,"
@@ -3491,8 +3517,10 @@ int cbm_cmd_aosp(int argc, char **argv) {
             exit_code = 1;
         } else {
             printf("AOSP build graph complete\n");
-            printf("  files: %d Android.bp, %d Android.mk, %d AIDL\n",
-                   stats.blueprint_files, stats.make_files, stats.aidl_files);
+            printf("  files: %d Android.bp, %d Android.mk, %d product Makefiles, "
+                   "%d BoardConfigs, %d AIDL\n",
+                   stats.blueprint_files, stats.make_files, stats.product_make_files,
+                   stats.board_config_files, stats.aidl_files);
             printf("  modules: %d\n  dependencies: %d (%d resolved, %d unresolved)\n",
                    stats.module_count, stats.dependency_count, stats.resolved_count,
                    stats.unresolved_count);
@@ -3519,6 +3547,17 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    "%d unsupported expressions\n",
                    stats.make_include_count, stats.make_condition_count,
                    stats.make_macro_count, stats.make_unsupported_count);
+            printf("  products: %d products, %d fragments, %d inheritance edges "
+                   "(%d resolved, %d cycles)\n",
+                   stats.product_count, stats.product_fragment_count,
+                   stats.product_inheritance_count,
+                   stats.product_inheritance_resolved_count,
+                   stats.product_inheritance_cycle_count);
+            printf("  product packages: %d (%d resolved, %d unresolved), "
+                   "%d BoardConfigs, %d partitions\n",
+                   stats.product_package_count, stats.product_package_resolved_count,
+                   stats.product_package_unresolved_count, stats.board_config_count,
+                   stats.product_partition_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

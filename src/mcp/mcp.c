@@ -651,8 +651,9 @@ static const tool_def_t TOOLS[] = {
 
     {"aosp_get_architecture", "Get AOSP architecture",
      "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
-     "counts, Soong namespaces, package visibility boundaries, and matching "
-     "Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
+     "counts, Soong namespaces, package visibility boundaries, products, BoardConfig and "
+     "partition ownership, and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build "
+     "command first.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Optional module name/type filter\"},"
@@ -8493,6 +8494,24 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "make_macro_expansions", stats.make_macro_count);
     yyjson_mut_obj_add_int(doc, root, "make_unsupported_expressions",
                            stats.make_unsupported_count);
+    yyjson_mut_obj_add_int(doc, root, "products", stats.product_count);
+    yyjson_mut_obj_add_int(doc, root, "product_fragments",
+                           stats.product_fragment_count);
+    yyjson_mut_obj_add_int(doc, root, "product_inheritance",
+                           stats.product_inheritance_count);
+    yyjson_mut_obj_add_int(doc, root, "product_inheritance_resolved",
+                           stats.product_inheritance_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "product_inheritance_cycles",
+                           stats.product_inheritance_cycle_count);
+    yyjson_mut_obj_add_int(doc, root, "product_packages",
+                           stats.product_package_count);
+    yyjson_mut_obj_add_int(doc, root, "product_packages_resolved",
+                           stats.product_package_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "product_packages_unresolved",
+                           stats.product_package_unresolved_count);
+    yyjson_mut_obj_add_int(doc, root, "board_configs", stats.board_config_count);
+    yyjson_mut_obj_add_int(doc, root, "product_partitions",
+                           stats.product_partition_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
