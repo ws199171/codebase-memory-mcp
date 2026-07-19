@@ -17,6 +17,9 @@ typedef struct {
     int aidl_callbacks;
     int aidl_oneway_methods;
     int aidl_stable_types;
+    int aidl_java_generated_nodes;
+    int aidl_cpp_ndk_generated_nodes;
+    int aidl_rust_generated_nodes;
     int binder_server_edges;
     int binder_client_edges;
     int binder_transaction_constants;

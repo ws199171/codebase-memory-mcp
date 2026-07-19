@@ -3714,6 +3714,9 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("  AIDL metadata: %d imports, %d callbacks, %d oneway methods, "
                    "%d stable types\n", stats.aidl_imports, stats.aidl_callbacks,
                    stats.aidl_oneway_methods, stats.aidl_stable_types);
+            printf("  AIDL generated backends: %d Java, %d C++/NDK, %d Rust nodes\n",
+                   stats.aidl_java_generated_nodes, stats.aidl_cpp_ndk_generated_nodes,
+                   stats.aidl_rust_generated_nodes);
             printf("  Binder: %d server, %d client edges\n",
                    stats.binder_server_edges, stats.binder_client_edges);
             printf("  Binder flow: %d transaction constants, %d onTransact handlers, "

@@ -8716,6 +8716,12 @@ static char *handle_aosp_trace_protocol(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "aidl_callbacks", stats.aidl_callbacks);
     yyjson_mut_obj_add_int(doc, root, "aidl_oneway_methods", stats.aidl_oneway_methods);
     yyjson_mut_obj_add_int(doc, root, "aidl_stable_types", stats.aidl_stable_types);
+    yyjson_mut_obj_add_int(doc, root, "aidl_java_generated_nodes",
+                           stats.aidl_java_generated_nodes);
+    yyjson_mut_obj_add_int(doc, root, "aidl_cpp_ndk_generated_nodes",
+                           stats.aidl_cpp_ndk_generated_nodes);
+    yyjson_mut_obj_add_int(doc, root, "aidl_rust_generated_nodes",
+                           stats.aidl_rust_generated_nodes);
     yyjson_mut_obj_add_int(doc, root, "binder_server_edges", stats.binder_server_edges);
     yyjson_mut_obj_add_int(doc, root, "binder_client_edges", stats.binder_client_edges);
     yyjson_mut_obj_add_int(doc, root, "binder_transaction_constants",

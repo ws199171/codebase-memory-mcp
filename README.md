@@ -606,12 +606,16 @@ stored without evaluating Starlark; only unique label and module mappings become
 module edges. External repositories, missing labels, configuration ambiguity, and
 duplicate Soong names remain coverage gaps. The protocol linker maps
 AIDL interfaces, parcelables, unions, enums, fields, values, and methods to
-generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy` symbols. Imports and custom
+generated Binder C++/NDK and Rust `Bn`/`Bp` symbols plus Java `Stub`/`Proxy`
+types. Imports and custom
 type references resolve across manifest repositories; callback parameters,
 annotations, oneway semantics, and declared stability remain structured protocol
 evidence. Generated Binder transaction constants are linked to matching
-`onTransact` cases, proxy `transact` calls, generated server methods, and concrete
-methods whose owner directly inherits the generated server type. Literal
+`onTransact`/`on_transact` cases, proxy `transact` calls, generated server methods,
+and concrete methods whose owner directly inherits the generated server type or
+implements the generated Rust trait. Transaction, dispatch, proxy, and
+implementation edges are paired only within the same generated backend, and CLI/MCP
+statistics report Java, C++/NDK, and Rust generated-node coverage separately. Literal
 ServiceManager registration, lookup, and wait calls become shared service nodes
 that connect enclosing client/server callers to direct Binder implementations and
 AIDL interfaces. The linker also resolves exported JNI names and parses

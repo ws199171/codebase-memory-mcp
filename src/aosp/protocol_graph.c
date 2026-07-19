@@ -119,8 +119,16 @@ typedef struct {
     int cap;
 } binder_symbols_t;
 
+typedef enum {
+    BINDER_BACKEND_UNKNOWN,
+    BINDER_BACKEND_JAVA,
+    BINDER_BACKEND_CPP_NDK,
+    BINDER_BACKEND_RUST,
+} binder_backend_t;
+
 static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *method,
                             const char *interface_name, const char *stem);
+static bool contains_class_token(const char *qualified_name, const char *token);
 static void hash_id(const char *workspace_id, const char *kind, const char *qualified,
                     char out[65]);
 
@@ -241,7 +249,8 @@ static int binder_symbols_load(link_ctx_t *ctx, const char *name, binder_symbols
 
 static int binder_symbols_add_source_constant(link_ctx_t *ctx, binder_symbols_t *symbols,
                                               const binder_symbol_t *handler,
-                                              const char *transaction_name) {
+                                              const char *symbol_name,
+                                              const char *qualified_suffix) {
     if (symbols->count == symbols->cap) {
         int new_cap = symbols->cap ? symbols->cap * 2 : 4;
         binder_symbol_t *items = realloc(symbols->items, (size_t)new_cap * sizeof(*items));
@@ -253,11 +262,11 @@ static int binder_symbols_add_source_constant(link_ctx_t *ctx, binder_symbols_t 
     size_t handler_length = strlen(handler->name);
     if (qualified_length <= handler_length) return -1;
     size_t prefix_length = qualified_length - handler_length;
-    size_t size = prefix_length + strlen(transaction_name) + 1;
+    size_t size = prefix_length + strlen(qualified_suffix) + 1;
     char *qualified = malloc(size);
     if (!qualified) return -1;
     memcpy(qualified, handler->qualified_name, prefix_length);
-    (void)snprintf(qualified + prefix_length, size - prefix_length, "%s", transaction_name);
+    (void)snprintf(qualified + prefix_length, size - prefix_length, "%s", qualified_suffix);
     char global_id[65];
     hash_id(ctx->workspace->workspace_id, "BINDER_TRANSACTION_CONSTANT", qualified, global_id);
 
@@ -265,7 +274,7 @@ static int binder_symbols_add_source_constant(link_ctx_t *ctx, binder_symbols_t 
     memset(item, 0, sizeof(*item));
     item->global_id = strdup(global_id);
     item->repo_id = strdup(handler->repo_id);
-    item->name = strdup(transaction_name);
+    item->name = strdup(symbol_name);
     item->qualified_name = qualified;
     item->file_path = strdup(handler->file_path);
     item->label = strdup("SourceConstant");
@@ -512,10 +521,74 @@ static char *binder_symbol_qualified_owner(const char *qualified_name,
     return owner;
 }
 
+static bool binder_path_has_extension(const char *file_path, const char *extension) {
+    if (!file_path || !extension) return false;
+    size_t path_length = strlen(file_path);
+    size_t extension_length = strlen(extension);
+    if (path_length < extension_length) return false;
+    const char *suffix = file_path + path_length - extension_length;
+    for (size_t i = 0; i < extension_length; i++) {
+        if (tolower((unsigned char)suffix[i]) !=
+            tolower((unsigned char)extension[i])) return false;
+    }
+    return true;
+}
+
+static binder_backend_t binder_backend(const char *qualified_name, const char *file_path) {
+    (void)qualified_name;
+    if (binder_path_has_extension(file_path, ".java") ||
+        binder_path_has_extension(file_path, ".kt")) return BINDER_BACKEND_JAVA;
+    if (binder_path_has_extension(file_path, ".rs")) return BINDER_BACKEND_RUST;
+    static const char *cpp_extensions[] = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+    };
+    for (size_t i = 0; i < sizeof(cpp_extensions) / sizeof(cpp_extensions[0]); i++) {
+        if (binder_path_has_extension(file_path, cpp_extensions[i])) {
+            return BINDER_BACKEND_CPP_NDK;
+        }
+    }
+    return BINDER_BACKEND_UNKNOWN;
+}
+
+static bool binder_same_backend(const binder_symbol_t *left,
+                                const binder_symbol_t *right) {
+    binder_backend_t left_backend = binder_backend(left->qualified_name, left->file_path);
+    binder_backend_t right_backend = binder_backend(right->qualified_name, right->file_path);
+    return left_backend != BINDER_BACKEND_UNKNOWN && left_backend == right_backend;
+}
+
 static bool binder_source_declares_implementation(const char *source, const char *owner,
                                                   const char *bn_name,
                                                   const char *interface_name) {
     if (!source || !owner || !owner[0]) return false;
+    pg_lexer_t rust_lexer = {.source = source, .length = strlen(source)};
+    int rust_state = 0;
+    bool rust_trait_matches = false;
+    pg_token_t rust_token;
+    while ((rust_token = pg_next(&rust_lexer)).kind != PG_EOF) {
+        if (rust_token.kind == PG_IDENT && rust_token.text) {
+            if (strcmp(rust_token.text, "impl") == 0) {
+                rust_state = 1;
+                rust_trait_matches = false;
+            } else if (rust_state == 1 && strcmp(rust_token.text, "for") == 0) {
+                rust_state = rust_trait_matches ? 2 : 0;
+            } else if (rust_state == 1 && interface_name &&
+                       contains_class_token(rust_token.text, interface_name)) {
+                rust_trait_matches = true;
+            } else if (rust_state == 2) {
+                bool matches = contains_class_token(rust_token.text, owner);
+                pg_token_free(&rust_token);
+                if (matches) return true;
+                rust_state = 0;
+            }
+        } else if (rust_token.kind == PG_LBRACE || rust_token.kind == PG_SEMI) {
+            rust_state = 0;
+            rust_trait_matches = false;
+        }
+        pg_token_free(&rust_token);
+    }
+    pg_token_free(&rust_token);
+
     pg_lexer_t lexer = {.source = source, .length = strlen(source)};
     bool after_class = false;
     bool matching_owner = false;
@@ -1025,6 +1098,31 @@ static int link_generated_type(link_ctx_t *ctx, const char *aidl_id, const char 
     return sqlite3_errcode(ctx->db) == SQLITE_OK || sqlite3_errcode(ctx->db) == SQLITE_DONE ? 0 : -1;
 }
 
+static int link_java_generated_type(link_ctx_t *ctx, const char *aidl_id,
+                                    const char *interface_name, const char *candidate,
+                                    bool require_stub_owner, const char *kind,
+                                    const char *edge_type) {
+    sqlite3_reset(ctx->find_symbols);
+    sqlite3_clear_bindings(ctx->find_symbols);
+    sqlite3_bind_text(ctx->find_symbols, 1, ctx->workspace->workspace_id, -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->find_symbols, 2, candidate, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(ctx->find_symbols) == SQLITE_ROW) {
+        const char *qualified = (const char *)sqlite3_column_text(ctx->find_symbols, 3);
+        const char *file_path = (const char *)sqlite3_column_text(ctx->find_symbols, 4);
+        if (binder_backend(qualified, file_path) != BINDER_BACKEND_JAVA ||
+            !contains_class_token(qualified, interface_name) ||
+            !contains_class_token(qualified, candidate) ||
+            (require_stub_owner && !contains_class_token(qualified, "Stub"))) continue;
+        char target_id[65];
+        if (add_symbol_endpoint(ctx, ctx->find_symbols, kind, target_id) != 0 ||
+            insert_protocol_edge(ctx, aidl_id, target_id, edge_type, 1.0,
+                                 "aidl_generated_name") != 0) return -1;
+    }
+    return sqlite3_errcode(ctx->db) == SQLITE_OK ||
+           sqlite3_errcode(ctx->db) == SQLITE_DONE ? 0 : -1;
+}
+
 static int link_binder_method(link_ctx_t *ctx, const char *method_id, const char *method,
                               const char *interface_name, const char *stem) {
     sqlite3_reset(ctx->find_symbols);
@@ -1042,7 +1140,9 @@ static int link_binder_method(link_ctx_t *ctx, const char *method_id, const char
         const char *edge_type = NULL;
         if (!label || strcmp(label, "Method") != 0) continue;
         if (contains_class_token(qualified, bn) ||
-            (strstr(qualified, interface_name) && strstr(qualified, ".Stub."))) {
+            (strstr(qualified, interface_name) &&
+             contains_class_token(qualified, "Stub") &&
+             !contains_class_token(qualified, "Proxy"))) {
             kind = "BINDER_SERVER_METHOD";
             edge_type = "BINDER_SERVER_IMPL";
         } else if (contains_class_token(qualified, bp) ||
@@ -1280,6 +1380,12 @@ static int link_aidl_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
         (void)snprintf(candidate, sizeof(candidate), "Bp%s", stem);
         if (link_generated_type(ctx, declaration_id, candidate, "BINDER_CLIENT_TYPE",
                                 "AIDL_GENERATES_CLIENT") != 0) goto fail;
+        if (link_java_generated_type(ctx, declaration_id, decl.name, "Stub", false,
+                                     "BINDER_SERVER_TYPE",
+                                     "AIDL_GENERATES_SERVER") != 0) goto fail;
+        if (link_java_generated_type(ctx, declaration_id, decl.name, "Proxy", true,
+                                     "BINDER_CLIENT_TYPE",
+                                     "AIDL_GENERATES_CLIENT") != 0) goto fail;
         if (link_generated_type(ctx, declaration_id, decl.name, "BINDER_INTERFACE_TYPE",
                                 "AIDL_GENERATES_INTERFACE") != 0) goto fail;
     }
@@ -2133,7 +2239,8 @@ static bool binder_generated_server(const char *qualified_name, const char *bn_n
                                     const char *interface_name) {
     return contains_class_token(qualified_name, bn_name) ||
            (strstr(qualified_name ? qualified_name : "", interface_name) &&
-            strstr(qualified_name, ".Stub."));
+            contains_class_token(qualified_name, "Stub") &&
+            !contains_class_token(qualified_name, "Proxy"));
 }
 
 static bool binder_generated_proxy(const char *qualified_name, const char *bp_name,
@@ -2153,8 +2260,8 @@ static bool binder_range_contains(link_ctx_t *ctx, const binder_symbol_t *symbol
     pg_token_t token;
     while ((token = pg_next(&lexer)).kind != PG_EOF) {
         if (token.kind == PG_IDENT && token.text) {
-            if (strcmp(token.text, first) == 0) found_first = true;
-            if (second && strcmp(token.text, second) == 0) found_second = true;
+            if (contains_class_token(token.text, first)) found_first = true;
+            if (second && contains_class_token(token.text, second)) found_second = true;
         }
         pg_token_free(&token);
     }
@@ -2178,15 +2285,11 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
     binder_symbols_t handlers = {0};
     int rc = binder_symbols_load(ctx, method, &methods);
     if (rc == 0) rc = binder_symbols_load(ctx, transaction, &constants);
+    if (rc == 0) rc = binder_symbols_load(ctx, method, &constants);
     if (rc == 0) rc = binder_symbols_load(ctx, "onTransact", &handlers);
+    if (rc == 0) rc = binder_symbols_load(ctx, "on_transact", &handlers);
     if (rc != 0) goto done;
 
-    int server_count = 0;
-    for (int s = 0; s < methods.count; s++) {
-        binder_symbol_t *server = &methods.items[s];
-        if (strcmp(server->label, "Method") == 0 &&
-            binder_generated_server(server->qualified_name, bn, interface_name)) server_count++;
-    }
     for (int i = 0; i < methods.count && rc == 0; i++) {
         binder_symbol_t *implementation = &methods.items[i];
         if (strcmp(implementation->label, "Method") != 0 ||
@@ -2204,8 +2307,24 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
             free(qualified_owner);
             continue;
         }
-        char *properties = binder_evidence_properties(transaction, method, owner,
-                                                       qualified_owner);
+        int server_count = 0;
+        for (int s = 0; s < methods.count; s++) {
+            binder_symbol_t *server = &methods.items[s];
+            if (strcmp(server->label, "Method") == 0 &&
+                binder_generated_server(server->qualified_name, bn, interface_name) &&
+                binder_same_backend(server, implementation)) server_count++;
+        }
+        char implementation_transaction[768];
+        if (binder_backend(implementation->qualified_name, implementation->file_path) ==
+            BINDER_BACKEND_RUST) {
+            (void)snprintf(implementation_transaction, sizeof(implementation_transaction),
+                           "transactions::%s", method);
+        } else {
+            (void)snprintf(implementation_transaction, sizeof(implementation_transaction),
+                           "%s", transaction);
+        }
+        char *properties = binder_evidence_properties(implementation_transaction, method,
+                                                       owner, qualified_owner);
         if (!properties ||
             insert_protocol_node_properties(ctx, implementation->global_id,
                 implementation->repo_id, "BINDER_IMPLEMENTATION_METHOD",
@@ -2216,7 +2335,8 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
         for (int s = 0; s < methods.count && rc == 0; s++) {
             binder_symbol_t *server = &methods.items[s];
             if (strcmp(server->label, "Method") != 0 ||
-                !binder_generated_server(server->qualified_name, bn, interface_name)) continue;
+                !binder_generated_server(server->qualified_name, bn, interface_name) ||
+                !binder_same_backend(server, implementation)) continue;
             if (insert_protocol_edge_properties(ctx, server->global_id,
                     implementation->global_id, "BINDER_IMPLEMENTED_BY", 1.0,
                     "binder_direct_inheritance", properties) != 0) rc = -1;
@@ -2230,23 +2350,76 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
         free(qualified_owner);
     }
 
-    if (constants.count == 0) {
-        for (int h = 0; h < handlers.count && rc == 0; h++) {
-            binder_symbol_t *handler = &handlers.items[h];
-            if (strcmp(handler->label, "Method") == 0 &&
-                binder_generated_server(handler->qualified_name, bn, interface_name) &&
-                binder_range_contains(ctx, handler, transaction, method)) {
-                rc = binder_symbols_add_source_constant(ctx, &constants, handler, transaction);
-                break;
-            }
+    bool has_constant_backend[4] = {false};
+    for (int c = 0; c < constants.count; c++) {
+        binder_symbol_t *constant = &constants.items[c];
+        binder_backend_t backend = binder_backend(constant->qualified_name,
+                                                   constant->file_path);
+        bool rust_constant = backend == BINDER_BACKEND_RUST &&
+            strcmp(constant->label, "Method") != 0 &&
+            strcmp(constant->name, method) == 0 &&
+            (strcmp(constant->label, "SourceConstant") == 0 ||
+             contains_class_token(constant->qualified_name, interface_name)) &&
+            contains_class_token(constant->qualified_name, "transactions");
+        bool traditional_constant = strcmp(constant->label, "Method") != 0 &&
+            strcmp(constant->name, transaction) == 0 &&
+            binder_generated_server(constant->qualified_name, bn, interface_name);
+        if (rust_constant || traditional_constant) {
+            has_constant_backend[backend] = true;
+        }
+    }
+    for (int h = 0; h < handlers.count && rc == 0; h++) {
+        binder_symbol_t *handler = &handlers.items[h];
+        binder_backend_t backend = binder_backend(handler->qualified_name,
+                                                   handler->file_path);
+        if (backend == BINDER_BACKEND_UNKNOWN || has_constant_backend[backend] ||
+            strcmp(handler->label, "Method") != 0 ||
+            !binder_generated_server(handler->qualified_name, bn, interface_name)) continue;
+        bool rust_handler = backend == BINDER_BACKEND_RUST &&
+            strcmp(handler->name, "on_transact") == 0 &&
+            binder_range_contains(ctx, handler, "transactions", method);
+        bool traditional_handler = backend != BINDER_BACKEND_RUST &&
+            strcmp(handler->name, "onTransact") == 0 &&
+            binder_range_contains(ctx, handler, transaction, method);
+        if (rust_handler) {
+            char rust_transaction[768];
+            (void)snprintf(rust_transaction, sizeof(rust_transaction),
+                           "transactions::%s", method);
+            rc = binder_symbols_add_source_constant(ctx, &constants, handler, method,
+                                                    rust_transaction);
+        } else if (traditional_handler) {
+            rc = binder_symbols_add_source_constant(ctx, &constants, handler, transaction,
+                                                    transaction);
+        }
+        if (rc == 0 && (rust_handler || traditional_handler)) {
+            has_constant_backend[backend] = true;
         }
     }
 
     for (int c = 0; c < constants.count && rc == 0; c++) {
         binder_symbol_t *constant = &constants.items[c];
-        if (strcmp(constant->label, "Method") == 0 ||
-            !binder_generated_server(constant->qualified_name, bn, interface_name)) continue;
-        char *properties = binder_evidence_properties(transaction, method, NULL, NULL);
+        binder_backend_t constant_backend = binder_backend(constant->qualified_name,
+                                                            constant->file_path);
+        bool rust_constant = constant_backend == BINDER_BACKEND_RUST &&
+            strcmp(constant->label, "Method") != 0 &&
+            strcmp(constant->name, method) == 0 &&
+            (strcmp(constant->label, "SourceConstant") == 0 ||
+             contains_class_token(constant->qualified_name, interface_name)) &&
+            contains_class_token(constant->qualified_name, "transactions");
+        bool traditional_constant = strcmp(constant->label, "Method") != 0 &&
+            strcmp(constant->name, transaction) == 0 &&
+            binder_generated_server(constant->qualified_name, bn, interface_name);
+        if (!rust_constant && !traditional_constant) continue;
+        char transaction_evidence[768];
+        if (rust_constant) {
+            (void)snprintf(transaction_evidence, sizeof(transaction_evidence),
+                           "transactions::%s", method);
+        } else {
+            (void)snprintf(transaction_evidence, sizeof(transaction_evidence), "%s",
+                           transaction);
+        }
+        char *properties = binder_evidence_properties(transaction_evidence, method, NULL,
+                                                       NULL);
         if (!properties) {
             rc = -1;
             break;
@@ -2268,7 +2441,13 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
             binder_symbol_t *handler = &handlers.items[h];
             if (strcmp(handler->label, "Method") != 0 ||
                 !binder_generated_server(handler->qualified_name, bn, interface_name) ||
-                !binder_range_contains(ctx, handler, transaction, method)) continue;
+                !binder_same_backend(constant, handler)) continue;
+            bool handler_matches = rust_constant
+                ? strcmp(handler->name, "on_transact") == 0 &&
+                  binder_range_contains(ctx, handler, "transactions", method)
+                : strcmp(handler->name, "onTransact") == 0 &&
+                  binder_range_contains(ctx, handler, transaction, method);
+            if (!handler_matches) continue;
             if (add_binder_symbol_endpoint(ctx, handler, "BINDER_ON_TRANSACT_HANDLER") != 0 ||
                 insert_protocol_edge_properties(ctx, constant->global_id, handler->global_id,
                     "BINDER_DISPATCH_CASE", 1.0, "binder_on_transact_case", properties) != 0) {
@@ -2279,7 +2458,8 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
             for (int s = 0; s < methods.count && rc == 0; s++) {
                 binder_symbol_t *server = &methods.items[s];
                 if (strcmp(server->label, "Method") != 0 ||
-                    !binder_generated_server(server->qualified_name, bn, interface_name)) continue;
+                    !binder_generated_server(server->qualified_name, bn, interface_name) ||
+                    !binder_same_backend(handler, server)) continue;
                 dispatched_to_server = true;
                 if (insert_protocol_edge_properties(ctx, handler->global_id, server->global_id,
                         "BINDER_DISPATCHES_TO", 1.0, "binder_on_transact_case",
@@ -2295,7 +2475,11 @@ static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *
             binder_symbol_t *proxy = &methods.items[p];
             if (strcmp(proxy->label, "Method") != 0 ||
                 !binder_generated_proxy(proxy->qualified_name, bp, interface_name) ||
-                !binder_range_contains(ctx, proxy, transaction, "transact")) continue;
+                !binder_same_backend(proxy, constant)) continue;
+            bool proxy_matches = rust_constant
+                ? binder_range_contains(ctx, proxy, "transactions", "transact")
+                : binder_range_contains(ctx, proxy, transaction, "transact");
+            if (!proxy_matches) continue;
             if (insert_protocol_edge_properties(ctx, proxy->global_id, constant->global_id,
                     "BINDER_TRANSACT_CALL", 1.0, "binder_proxy_transact_call",
                     properties) != 0) rc = -1;
@@ -2338,6 +2522,23 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 "
         "AND kind IN('AIDL_INTERFACE','AIDL_PARCELABLE','AIDL_UNION','AIDL_ENUM') "
         "AND json_extract(properties,'$.stability')!='local'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind IN("
+        "'BINDER_SERVER_TYPE','BINDER_CLIENT_TYPE','BINDER_INTERFACE_TYPE',"
+        "'BINDER_SERVER_METHOD','BINDER_CLIENT_METHOD','BINDER_TRANSACTION_CONSTANT',"
+        "'BINDER_ON_TRANSACT_HANDLER') AND (lower(file_path) LIKE '%.java' "
+        "OR lower(file_path) LIKE '%.kt')) ,"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind IN("
+        "'BINDER_SERVER_TYPE','BINDER_CLIENT_TYPE','BINDER_INTERFACE_TYPE',"
+        "'BINDER_SERVER_METHOD','BINDER_CLIENT_METHOD','BINDER_TRANSACTION_CONSTANT',"
+        "'BINDER_ON_TRANSACT_HANDLER') AND (lower(file_path) LIKE '%.c' "
+        "OR lower(file_path) LIKE '%.cc' OR lower(file_path) LIKE '%.cpp' "
+        "OR lower(file_path) LIKE '%.cxx' OR lower(file_path) LIKE '%.h' "
+        "OR lower(file_path) LIKE '%.hh' OR lower(file_path) LIKE '%.hpp' "
+        "OR lower(file_path) LIKE '%.hxx')) ,"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind IN("
+        "'BINDER_SERVER_TYPE','BINDER_CLIENT_TYPE','BINDER_INTERFACE_TYPE',"
+        "'BINDER_SERVER_METHOD','BINDER_CLIENT_METHOD','BINDER_TRANSACTION_CONSTANT',"
+        "'BINDER_ON_TRANSACT_HANDLER') AND lower(file_path) LIKE '%.rs'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVER_IMPL'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_CLIENT_PROXY'),"
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='BINDER_TRANSACTION_CONSTANT'),"
@@ -2368,20 +2569,23 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
             stats->aidl_callbacks = sqlite3_column_int(stmt, 8);
             stats->aidl_oneway_methods = sqlite3_column_int(stmt, 9);
             stats->aidl_stable_types = sqlite3_column_int(stmt, 10);
-            stats->binder_server_edges = sqlite3_column_int(stmt, 11);
-            stats->binder_client_edges = sqlite3_column_int(stmt, 12);
-            stats->binder_transaction_constants = sqlite3_column_int(stmt, 13);
-            stats->binder_on_transact_handlers = sqlite3_column_int(stmt, 14);
-            stats->binder_transact_calls = sqlite3_column_int(stmt, 15);
-            stats->binder_implementation_methods = sqlite3_column_int(stmt, 16);
-            stats->binder_services = sqlite3_column_int(stmt, 17);
-            stats->binder_service_registrations = sqlite3_column_int(stmt, 18);
-            stats->binder_service_lookups = sqlite3_column_int(stmt, 19);
-            stats->binder_service_waits = sqlite3_column_int(stmt, 20);
-            stats->binder_service_server_links = sqlite3_column_int(stmt, 21);
-            stats->binder_service_interface_links = sqlite3_column_int(stmt, 22);
-            stats->jni_static_edges = sqlite3_column_int(stmt, 23);
-            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 24);
+            stats->aidl_java_generated_nodes = sqlite3_column_int(stmt, 11);
+            stats->aidl_cpp_ndk_generated_nodes = sqlite3_column_int(stmt, 12);
+            stats->aidl_rust_generated_nodes = sqlite3_column_int(stmt, 13);
+            stats->binder_server_edges = sqlite3_column_int(stmt, 14);
+            stats->binder_client_edges = sqlite3_column_int(stmt, 15);
+            stats->binder_transaction_constants = sqlite3_column_int(stmt, 16);
+            stats->binder_on_transact_handlers = sqlite3_column_int(stmt, 17);
+            stats->binder_transact_calls = sqlite3_column_int(stmt, 18);
+            stats->binder_implementation_methods = sqlite3_column_int(stmt, 19);
+            stats->binder_services = sqlite3_column_int(stmt, 20);
+            stats->binder_service_registrations = sqlite3_column_int(stmt, 21);
+            stats->binder_service_lookups = sqlite3_column_int(stmt, 22);
+            stats->binder_service_waits = sqlite3_column_int(stmt, 23);
+            stats->binder_service_server_links = sqlite3_column_int(stmt, 24);
+            stats->binder_service_interface_links = sqlite3_column_int(stmt, 25);
+            stats->jni_static_edges = sqlite3_column_int(stmt, 26);
+            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 27);
             rc = 0;
         }
     } else {

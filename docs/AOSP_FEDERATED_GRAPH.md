@@ -537,6 +537,33 @@ without direct inheritance evidence remain unlinked. The protocol graph records
 transaction, and owner evidence. Refresh remains atomic and idempotent, including
 shared `onTransact` handlers used by multiple methods.
 
+## Generated Binder Backends
+
+P4 classifies indexed generated symbols by source extension: `.java` and `.kt`
+are Java, `.rs` is Rust, and common C/C++ source and header extensions are
+C++/NDK. Transaction constants, dispatch handlers, generated server methods,
+proxy methods, and concrete implementation methods are paired only when both
+endpoints have the same known backend. This prevents same-named Java, native,
+and Rust artifacts for one AIDL interface from creating cross-backend paths.
+
+Java nested `Stub` and `Stub.Proxy` type symbols now produce
+`AIDL_GENERATES_SERVER` and `AIDL_GENERATES_CLIENT` edges in addition to their
+generated methods. `Stub.Proxy` methods are classified only as clients, rather
+than also matching the enclosing `Stub` server convention.
+
+Rust generated flow recognizes `transactions::<method>` constants,
+`on_transact` dispatch, `Bn*`/`Bp*` methods, and concrete
+`impl <Interface> for <Service>` methods. Qualified source expressions such as
+`transactions::method` and `self.binder.transact(...)` are matched by identifier
+component. Their edge properties retain the Rust transaction spelling instead
+of translating it to the Java/C++ `TRANSACTION_<method>` convention.
+
+`aosp link` and `aosp_trace_protocol` publish separate
+`aidl_java_generated_nodes`, `aidl_cpp_ndk_generated_nodes`, and
+`aidl_rust_generated_nodes` counts. These totals include generated Binder types,
+methods, transaction constants, and dispatch handlers; concrete service
+implementations and ServiceManager operations are excluded.
+
 ## ServiceManager Paths
 
 P3 recognizes literal service names passed to common native, NDK, Java, and Kotlin
