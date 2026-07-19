@@ -605,10 +605,13 @@ kinds, Soong module mappings, dependencies, and unsupported-provider evidence ar
 stored without evaluating Starlark; only unique label and module mappings become
 module edges. External repositories, missing labels, configuration ambiguity, and
 duplicate Soong names remain coverage gaps. The protocol linker maps
-AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy`
-symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
-registration tables. Each protocol edge records its confidence and evidence;
-ambiguous name-only candidates are not linked.
+AIDL interfaces, parcelables, unions, enums, fields, values, and methods to
+generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy` symbols. Imports and custom
+type references resolve across manifest repositories; callback parameters,
+annotations, oneway semantics, and declared stability remain structured protocol
+evidence. The linker also resolves exported JNI names and parses `JNINativeMethod`
+dynamic registration tables. Each protocol edge records its confidence and
+evidence; ambiguous name-only candidates are not linked.
 
 `aosp modules --details` exposes bounded outgoing dependency records and file
 declarations for matching modules. Each record retains structured variant,
@@ -650,7 +653,7 @@ implementation, annotation, call, and usage relationships.
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
 | `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, bounded dependency/file details with variants and provenance, concrete coverage gaps, products, BoardConfig and partition ownership, and namespace/package boundaries. |
-| `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
+| `aosp_trace_protocol` | Query complete AIDL declarations and metadata plus Binder/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |

@@ -491,6 +491,28 @@ Bazel tables. CLI and MCP architecture coverage report artifacts, configured
 targets, dependencies, resolved counts, ambiguity, missing mappings, and coverage
 gaps.
 
+## Complete AIDL Declarations
+
+P1 parses AIDL interfaces, structured and forward parcelables, unions, enums,
+methods, fields, constants, and enum values. Declaration and member annotations
+are retained as arrays. `@VintfStability`, `@StableParcelable`, and
+`@JavaOnlyStableParcelable` produce explicit stability metadata, while interface
+and method-level `oneway` declarations produce the effective method state.
+
+Imports and custom return, parameter, and field types first become explicit
+reference nodes with `unresolved`, `not_found`, `resolved`, or `ambiguous` status
+and candidate counts. After all manifest repositories are scanned, a deterministic
+workspace pass resolves those references by exact qualified name. Resolved imports
+produce `AIDL_IMPORTS`; custom types produce `USES_TYPE`; interface-typed method
+parameters additionally produce `USES_CALLBACK`. Missing references remain
+queryable nodes and never produce speculative edges.
+
+The existing protocol node and edge `properties` columns store this metadata; P1
+does not require a new persistence schema. `aosp link`, `aosp protocols`, and
+`aosp_trace_protocol` report declaration totals, imports, callbacks, effective
+oneway methods, stable types, node properties, and edge properties. Protocol graph
+replacement remains transactional and independent of repository scan order.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

@@ -663,8 +663,9 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"workspace_root\"]}"},
 
     {"aosp_trace_protocol", "Trace AOSP protocol",
-     "Read Binder/AIDL/JNI protocol nodes and link coverage from an AOSP workspace. "
-     "Run the CLI aosp link command after shard indexing to refresh protocol evidence.",
+     "Read complete AIDL declarations, imports, annotations, callbacks, oneway/stability "
+     "metadata, and Binder/JNI link coverage from an AOSP workspace. Run the CLI aosp link "
+     "command after shard indexing to refresh protocol evidence.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Optional interface, method, class, or kind filter\"},"
@@ -8708,6 +8709,13 @@ static char *handle_aosp_trace_protocol(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "edges_total", stats.edge_count);
     yyjson_mut_obj_add_int(doc, root, "aidl_interfaces", stats.aidl_interfaces);
     yyjson_mut_obj_add_int(doc, root, "aidl_methods", stats.aidl_methods);
+    yyjson_mut_obj_add_int(doc, root, "aidl_parcelables", stats.aidl_parcelables);
+    yyjson_mut_obj_add_int(doc, root, "aidl_unions", stats.aidl_unions);
+    yyjson_mut_obj_add_int(doc, root, "aidl_enums", stats.aidl_enums);
+    yyjson_mut_obj_add_int(doc, root, "aidl_imports", stats.aidl_imports);
+    yyjson_mut_obj_add_int(doc, root, "aidl_callbacks", stats.aidl_callbacks);
+    yyjson_mut_obj_add_int(doc, root, "aidl_oneway_methods", stats.aidl_oneway_methods);
+    yyjson_mut_obj_add_int(doc, root, "aidl_stable_types", stats.aidl_stable_types);
     yyjson_mut_obj_add_int(doc, root, "binder_server_edges", stats.binder_server_edges);
     yyjson_mut_obj_add_int(doc, root, "binder_client_edges", stats.binder_client_edges);
     yyjson_mut_obj_add_int(doc, root, "jni_static_edges", stats.jni_static_edges);
@@ -8723,6 +8731,8 @@ static char *handle_aosp_trace_protocol(const char *args) {
         yyjson_mut_obj_add_strcpy(doc, item, "file", nodes[i].file_path);
         yyjson_mut_obj_add_int(doc, item, "outgoing_edges", nodes[i].outgoing_edges);
         yyjson_mut_obj_add_int(doc, item, "incoming_edges", nodes[i].incoming_edges);
+        yyjson_mut_obj_add_val(doc, item, "properties",
+                               aosp_copy_json(doc, nodes[i].properties, false));
         yyjson_mut_arr_add_val(items, item);
     }
     yyjson_mut_obj_add_val(doc, root, "nodes", items);
@@ -8735,6 +8745,8 @@ static char *handle_aosp_trace_protocol(const char *args) {
         yyjson_mut_obj_add_strcpy(doc, item, "type", edges[i].type);
         yyjson_mut_obj_add_real(doc, item, "confidence", edges[i].confidence);
         yyjson_mut_obj_add_strcpy(doc, item, "evidence", edges[i].evidence);
+        yyjson_mut_obj_add_val(doc, item, "properties",
+                               aosp_copy_json(doc, edges[i].properties, false));
         yyjson_mut_arr_add_val(edge_items, item);
     }
     yyjson_mut_obj_add_val(doc, root, "edges", edge_items);

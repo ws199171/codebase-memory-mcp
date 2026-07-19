@@ -5,6 +5,7 @@
 #include "foundation/sha256.h"
 
 #include <sqlite3.h>
+#include <yyjson/yyjson.h>
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -35,6 +36,8 @@ typedef enum {
     PG_RPAREN,
     PG_COMMA,
     PG_SEMI,
+    PG_AT,
+    PG_EQUAL,
     PG_OTHER,
 } pg_token_kind_t;
 
@@ -47,12 +50,45 @@ typedef struct {
     const char *source;
     size_t length;
     size_t pos;
+    size_t last_start;
+    size_t last_end;
 } pg_lexer_t;
 
 typedef struct {
+    char *name;
+    char *return_type;
+    pg_strings_t parameter_types;
+    pg_strings_t annotations;
+    bool oneway;
+} aidl_method_t;
+
+typedef struct {
+    aidl_method_t *items;
+    int count;
+    int cap;
+} aidl_methods_t;
+
+typedef struct {
+    char *name;
+    char *type;
+    pg_strings_t annotations;
+} aidl_member_t;
+
+typedef struct {
+    aidl_member_t *items;
+    int count;
+    int cap;
+} aidl_members_t;
+
+typedef struct {
     char *package_name;
-    char *interface_name;
-    pg_strings_t methods;
+    char *name;
+    char *kind;
+    pg_strings_t imports;
+    pg_strings_t annotations;
+    aidl_methods_t methods;
+    aidl_members_t members;
+    bool oneway;
 } aidl_decl_t;
 
 typedef struct {
@@ -120,6 +156,21 @@ static bool pg_strings_add(pg_strings_t *strings, const char *value) {
     return true;
 }
 
+static bool pg_strings_append(pg_strings_t *strings, const char *value) {
+    if (!strings || !value || !value[0]) return true;
+    if (strings->count == strings->cap) {
+        int new_cap = strings->cap ? strings->cap * 2 : 8;
+        char **items = realloc(strings->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        strings->items = items;
+        strings->cap = new_cap;
+    }
+    strings->items[strings->count] = strdup(value);
+    if (!strings->items[strings->count]) return false;
+    strings->count++;
+    return true;
+}
+
 static void pg_strings_free(pg_strings_t *strings) {
     if (!strings) return;
     for (int i = 0; i < strings->count; i++) free(strings->items[i]);
@@ -159,11 +210,14 @@ static void pg_skip(pg_lexer_t *lexer) {
 static pg_token_t pg_next(pg_lexer_t *lexer) {
     pg_skip(lexer);
     pg_token_t token = {0};
+    lexer->last_start = lexer->pos;
     if (lexer->pos >= lexer->length) {
         token.kind = PG_EOF;
+        lexer->last_end = lexer->pos;
         return token;
     }
     char c = lexer->source[lexer->pos++];
+    lexer->last_end = lexer->pos;
     switch (c) {
         case '{': token.kind = PG_LBRACE; return token;
         case '}': token.kind = PG_RBRACE; return token;
@@ -171,6 +225,8 @@ static pg_token_t pg_next(pg_lexer_t *lexer) {
         case ')': token.kind = PG_RPAREN; return token;
         case ',': token.kind = PG_COMMA; return token;
         case ';': token.kind = PG_SEMI; return token;
+        case '@': token.kind = PG_AT; return token;
+        case '=': token.kind = PG_EQUAL; return token;
         case '"': {
             token.kind = PG_STRING;
             size_t cap = 32;
@@ -196,6 +252,7 @@ static pg_token_t pg_next(pg_lexer_t *lexer) {
                 token.text[n++] = ch;
             }
             token.text[n] = '\0';
+            lexer->last_end = lexer->pos;
             return token;
         }
         default: break;
@@ -214,68 +271,348 @@ static pg_token_t pg_next(pg_lexer_t *lexer) {
             memcpy(token.text, lexer->source + start, length);
             token.text[length] = '\0';
         }
+        lexer->last_end = lexer->pos;
         return token;
     }
     token.kind = PG_OTHER;
     return token;
 }
 
+static void aidl_method_free(aidl_method_t *method) {
+    if (!method) return;
+    free(method->name);
+    free(method->return_type);
+    pg_strings_free(&method->parameter_types);
+    pg_strings_free(&method->annotations);
+    memset(method, 0, sizeof(*method));
+}
+
+static void aidl_member_free(aidl_member_t *member) {
+    if (!member) return;
+    free(member->name);
+    free(member->type);
+    pg_strings_free(&member->annotations);
+    memset(member, 0, sizeof(*member));
+}
+
+static bool aidl_methods_add(aidl_methods_t *methods, aidl_method_t *method) {
+    if (methods->count == methods->cap) {
+        int new_cap = methods->cap ? methods->cap * 2 : 8;
+        aidl_method_t *items = realloc(methods->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        methods->items = items;
+        methods->cap = new_cap;
+    }
+    methods->items[methods->count++] = *method;
+    memset(method, 0, sizeof(*method));
+    return true;
+}
+
+static bool aidl_members_add(aidl_members_t *members, aidl_member_t *member) {
+    if (members->count == members->cap) {
+        int new_cap = members->cap ? members->cap * 2 : 8;
+        aidl_member_t *items = realloc(members->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return false;
+        members->items = items;
+        members->cap = new_cap;
+    }
+    members->items[members->count++] = *member;
+    memset(member, 0, sizeof(*member));
+    return true;
+}
+
 static void aidl_decl_free(aidl_decl_t *decl) {
     if (!decl) return;
     free(decl->package_name);
-    free(decl->interface_name);
-    pg_strings_free(&decl->methods);
+    free(decl->name);
+    free(decl->kind);
+    pg_strings_free(&decl->imports);
+    pg_strings_free(&decl->annotations);
+    for (int i = 0; i < decl->methods.count; i++) aidl_method_free(&decl->methods.items[i]);
+    free(decl->methods.items);
+    for (int i = 0; i < decl->members.count; i++) aidl_member_free(&decl->members.items[i]);
+    free(decl->members.items);
     memset(decl, 0, sizeof(*decl));
+}
+
+static bool aidl_is_builtin_type(const char *value) {
+    static const char *const builtins[] = {
+        "void", "boolean", "byte", "char", "int", "long", "float", "double",
+        "String", "IBinder", "ParcelFileDescriptor", "ParcelableHolder", "List",
+        "Map", "CharSequence", "FileDescriptor", "in", "out", "inout", "oneway",
+        "const", "cpp_header", "ndk_header", "rust_type",
+    };
+    if (!value || !value[0]) return true;
+    for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
+        if (strcmp(value, builtins[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool aidl_process_parameter(pg_strings_t *identifiers, aidl_method_t *method) {
+    if (!identifiers || identifiers->count < 2) return true;
+    for (int i = 0; i + 1 < identifiers->count; i++) {
+        if (!aidl_is_builtin_type(identifiers->items[i]) &&
+            !pg_strings_add(&method->parameter_types, identifiers->items[i])) return false;
+    }
+    return true;
+}
+
+static bool aidl_parse_method(const char *source, size_t length, aidl_method_t *method) {
+    pg_lexer_t lexer = {.source = source, .length = length};
+    pg_strings_t before = {0};
+    pg_strings_t parameter = {0};
+    bool before_parameters = true;
+    bool annotation_name = false;
+    bool maybe_annotation_args = false;
+    int annotation_depth = 0;
+    int paren_depth = 0;
+    bool ok = true;
+    pg_token_t token;
+    while ((token = pg_next(&lexer)).kind != PG_EOF) {
+        if (annotation_depth > 0) {
+            if (token.kind == PG_LPAREN) annotation_depth++;
+            if (token.kind == PG_RPAREN) annotation_depth--;
+            pg_token_free(&token);
+            continue;
+        }
+        if (token.kind == PG_AT) {
+            annotation_name = true;
+            maybe_annotation_args = false;
+            pg_token_free(&token);
+            continue;
+        }
+        if (annotation_name && token.kind == PG_IDENT && token.text) {
+            if (before_parameters && !pg_strings_add(&method->annotations, token.text)) ok = false;
+            annotation_name = false;
+            maybe_annotation_args = true;
+            pg_token_free(&token);
+            if (!ok) break;
+            continue;
+        }
+        if (maybe_annotation_args) {
+            maybe_annotation_args = false;
+            if (token.kind == PG_LPAREN) {
+                annotation_depth = 1;
+                pg_token_free(&token);
+                continue;
+            }
+        }
+        if (before_parameters && token.kind == PG_IDENT && token.text) {
+            if (strcmp(token.text, "oneway") == 0) method->oneway = true;
+            if (!pg_strings_append(&before, token.text)) ok = false;
+        } else if (before_parameters && token.kind == PG_LPAREN) {
+            if (before.count < 2) {
+                ok = false;
+            } else {
+                method->name = strdup(before.items[before.count - 1]);
+                for (int i = before.count - 2; i >= 0 && !method->return_type; i--) {
+                    if (!aidl_is_builtin_type(before.items[i]) ||
+                        strcmp(before.items[i], "void") == 0 ||
+                        strcmp(before.items[i], "boolean") == 0 ||
+                        strcmp(before.items[i], "byte") == 0 ||
+                        strcmp(before.items[i], "char") == 0 ||
+                        strcmp(before.items[i], "int") == 0 ||
+                        strcmp(before.items[i], "long") == 0 ||
+                        strcmp(before.items[i], "float") == 0 ||
+                        strcmp(before.items[i], "double") == 0 ||
+                        strcmp(before.items[i], "String") == 0) {
+                        method->return_type = strdup(before.items[i]);
+                    }
+                }
+                ok = method->name && method->return_type;
+            }
+            before_parameters = false;
+            paren_depth = 1;
+        } else if (!before_parameters && token.kind == PG_LPAREN) {
+            paren_depth++;
+        } else if (!before_parameters && token.kind == PG_RPAREN) {
+            if (paren_depth == 1 && !aidl_process_parameter(&parameter, method)) ok = false;
+            pg_strings_free(&parameter);
+            paren_depth--;
+        } else if (!before_parameters && paren_depth == 1 && token.kind == PG_COMMA) {
+            if (!aidl_process_parameter(&parameter, method)) ok = false;
+            pg_strings_free(&parameter);
+        } else if (!before_parameters && paren_depth >= 1 && token.kind == PG_IDENT && token.text) {
+            if (!pg_strings_append(&parameter, token.text)) ok = false;
+        }
+        pg_token_free(&token);
+        if (!ok) break;
+    }
+    pg_token_free(&token);
+    pg_strings_free(&before);
+    pg_strings_free(&parameter);
+    if (!ok || !method->name) {
+        aidl_method_free(method);
+        return false;
+    }
+    return true;
+}
+
+static bool aidl_parse_member(const char *source, size_t length, bool enum_value,
+                              aidl_member_t *member) {
+    pg_lexer_t lexer = {.source = source, .length = length};
+    pg_strings_t identifiers = {0};
+    bool annotation_name = false;
+    bool maybe_annotation_args = false;
+    int annotation_depth = 0;
+    bool ok = true;
+    pg_token_t token;
+    while ((token = pg_next(&lexer)).kind != PG_EOF) {
+        if (annotation_depth > 0) {
+            if (token.kind == PG_LPAREN) annotation_depth++;
+            if (token.kind == PG_RPAREN) annotation_depth--;
+            pg_token_free(&token);
+            continue;
+        }
+        if (maybe_annotation_args) {
+            maybe_annotation_args = false;
+            if (token.kind == PG_LPAREN) {
+                annotation_depth = 1;
+                pg_token_free(&token);
+                continue;
+            }
+        }
+        if (token.kind == PG_EQUAL) {
+            pg_token_free(&token);
+            break;
+        }
+        if (token.kind == PG_AT) {
+            annotation_name = true;
+        } else if (annotation_name && token.kind == PG_IDENT && token.text) {
+            if (!pg_strings_add(&member->annotations, token.text)) ok = false;
+            annotation_name = false;
+            maybe_annotation_args = true;
+        } else if (token.kind == PG_IDENT && token.text) {
+            if (!pg_strings_append(&identifiers, token.text)) ok = false;
+        }
+        pg_token_free(&token);
+        if (!ok) break;
+    }
+    pg_token_free(&token);
+    if (ok && identifiers.count > 0) {
+        if (enum_value) {
+            member->name = strdup(identifiers.items[0]);
+            member->type = strdup("enum_value");
+        } else if (identifiers.count >= 2) {
+            member->name = strdup(identifiers.items[identifiers.count - 1]);
+            for (int i = identifiers.count - 2; i >= 0 && !member->type; i--) {
+                if (strcmp(identifiers.items[i], "const") != 0) {
+                    member->type = strdup(identifiers.items[i]);
+                }
+            }
+        }
+        ok = member->name && member->type;
+    } else {
+        ok = false;
+    }
+    pg_strings_free(&identifiers);
+    if (!ok) aidl_member_free(member);
+    return ok;
+}
+
+static bool aidl_parse_statement(aidl_decl_t *decl, const char *source, size_t length) {
+    while (length && isspace((unsigned char)*source)) {
+        source++;
+        length--;
+    }
+    while (length && isspace((unsigned char)source[length - 1])) length--;
+    if (!length) return true;
+    if (strcmp(decl->kind, "interface") == 0 && memchr(source, '(', length)) {
+        aidl_method_t method = {0};
+        if (!aidl_parse_method(source, length, &method)) return false;
+        if (!aidl_methods_add(&decl->methods, &method)) {
+            aidl_method_free(&method);
+            return false;
+        }
+        return true;
+    }
+    aidl_member_t member = {0};
+    if (!aidl_parse_member(source, length, strcmp(decl->kind, "enum") == 0, &member)) {
+        return false;
+    }
+    if (!aidl_members_add(&decl->members, &member)) {
+        aidl_member_free(&member);
+        return false;
+    }
+    return true;
+}
+
+static bool aidl_declaration_keyword(const char *text) {
+    return text && (strcmp(text, "interface") == 0 || strcmp(text, "parcelable") == 0 ||
+                    strcmp(text, "union") == 0 || strcmp(text, "enum") == 0);
 }
 
 static bool parse_aidl_protocol(const char *source, size_t length, aidl_decl_t *decl) {
     pg_lexer_t lexer = {.source = source, .length = length};
-    pg_token_t token = pg_next(&lexer);
-    bool in_interface = false;
+    bool annotation_name = false;
+    bool pending_oneway = false;
+    bool in_body = false;
     int brace_depth = 0;
-    char *last_ident = NULL;
-    while (token.kind != PG_EOF) {
-        if (!in_interface && token.kind == PG_IDENT && token.text &&
-            strcmp(token.text, "package") == 0) {
+    size_t statement_start = SIZE_MAX;
+    pg_token_t token;
+    while ((token = pg_next(&lexer)).kind != PG_EOF) {
+        size_t token_start = lexer.last_start;
+        if (!decl->kind && token.kind == PG_AT) {
+            annotation_name = true;
+        } else if (!decl->kind && annotation_name && token.kind == PG_IDENT && token.text) {
+            if (!pg_strings_add(&decl->annotations, token.text)) goto fail;
+            annotation_name = false;
+        } else if (!decl->kind && token.kind == PG_IDENT && token.text &&
+                   strcmp(token.text, "package") == 0) {
             pg_token_free(&token);
             token = pg_next(&lexer);
             if (token.kind == PG_IDENT && token.text) {
                 free(decl->package_name);
                 decl->package_name = strdup(token.text);
+                if (!decl->package_name) goto fail;
             }
-        } else if (!in_interface && token.kind == PG_IDENT && token.text &&
-                   strcmp(token.text, "interface") == 0) {
+        } else if (!decl->kind && token.kind == PG_IDENT && token.text &&
+                   strcmp(token.text, "import") == 0) {
             pg_token_free(&token);
             token = pg_next(&lexer);
-            if (token.kind == PG_IDENT && token.text) {
-                decl->interface_name = strdup(token.text);
-                in_interface = decl->interface_name != NULL;
-            }
-        } else if (in_interface && token.kind == PG_LBRACE) {
+            if (token.kind == PG_IDENT && token.text &&
+                !pg_strings_add(&decl->imports, token.text)) goto fail;
+        } else if (!decl->kind && token.kind == PG_IDENT && token.text &&
+                   strcmp(token.text, "oneway") == 0) {
+            pending_oneway = true;
+        } else if (!decl->kind && token.kind == PG_IDENT &&
+                   aidl_declaration_keyword(token.text)) {
+            decl->kind = strdup(token.text);
+            decl->oneway = pending_oneway;
+            pg_token_free(&token);
+            token = pg_next(&lexer);
+            if (token.kind == PG_IDENT && token.text) decl->name = strdup(token.text);
+            if (!decl->kind || !decl->name) goto fail;
+        } else if (decl->kind && token.kind == PG_LBRACE) {
             brace_depth++;
-        } else if (in_interface && token.kind == PG_RBRACE) {
-            if (--brace_depth <= 0) in_interface = false;
-        } else if (in_interface && brace_depth == 1 && token.kind == PG_IDENT && token.text) {
-            free(last_ident);
-            last_ident = strdup(token.text);
-        } else if (in_interface && brace_depth == 1 && token.kind == PG_LPAREN && last_ident) {
-            if (!pg_strings_add(&decl->methods, last_ident)) {
-                free(last_ident);
-                pg_token_free(&token);
-                return false;
+            in_body = true;
+        } else if (in_body && token.kind == PG_RBRACE) {
+            if (brace_depth == 1 && statement_start != SIZE_MAX &&
+                strcmp(decl->kind, "enum") == 0 &&
+                !aidl_parse_statement(decl, source + statement_start,
+                                      token_start - statement_start)) goto fail;
+            statement_start = SIZE_MAX;
+            if (--brace_depth == 0) in_body = false;
+        } else if (in_body && brace_depth == 1) {
+            if (statement_start == SIZE_MAX && token.kind != PG_SEMI && token.kind != PG_COMMA) {
+                statement_start = token_start;
             }
-            free(last_ident);
-            last_ident = NULL;
-        } else if (token.kind == PG_SEMI) {
-            free(last_ident);
-            last_ident = NULL;
+            bool boundary = token.kind == PG_SEMI ||
+                            (token.kind == PG_COMMA && strcmp(decl->kind, "enum") == 0);
+            if (boundary && statement_start != SIZE_MAX) {
+                if (!aidl_parse_statement(decl, source + statement_start,
+                                          token_start - statement_start)) goto fail;
+                statement_start = SIZE_MAX;
+            }
         }
         pg_token_free(&token);
-        token = pg_next(&lexer);
     }
-    free(last_ident);
     pg_token_free(&token);
     return true;
+fail:
+    pg_token_free(&token);
+    return false;
 }
 
 static void hash_id(const char *workspace_id, const char *kind, const char *qualified, char out[65]) {
@@ -296,9 +633,10 @@ static void hash_id(const char *workspace_id, const char *kind, const char *qual
     out[64] = '\0';
 }
 
-static int insert_protocol_node(link_ctx_t *ctx, const char *id, const char *repo_id,
-                                const char *kind, const char *name, const char *qualified_name,
-                                const char *file_path, const char *symbol_global_id) {
+static int insert_protocol_node_properties(link_ctx_t *ctx, const char *id, const char *repo_id,
+                                           const char *kind, const char *name,
+                                           const char *qualified_name, const char *file_path,
+                                           const char *symbol_global_id, const char *properties) {
     sqlite3_reset(ctx->insert_node);
     sqlite3_clear_bindings(ctx->insert_node);
     sqlite3_bind_text(ctx->insert_node, 1, id, -1, SQLITE_TRANSIENT);
@@ -313,11 +651,22 @@ static int insert_protocol_node(link_ctx_t *ctx, const char *id, const char *rep
     } else {
         sqlite3_bind_null(ctx->insert_node, 8);
     }
+    sqlite3_bind_text(ctx->insert_node, 9, properties ? properties : "{}", -1,
+                      SQLITE_TRANSIENT);
     return sqlite3_step(ctx->insert_node) == SQLITE_DONE ? 0 : -1;
 }
 
-static int insert_protocol_edge(link_ctx_t *ctx, const char *source_id, const char *target_id,
-                                const char *type, double confidence, const char *evidence) {
+static int insert_protocol_node(link_ctx_t *ctx, const char *id, const char *repo_id,
+                                const char *kind, const char *name, const char *qualified_name,
+                                const char *file_path, const char *symbol_global_id) {
+    return insert_protocol_node_properties(ctx, id, repo_id, kind, name, qualified_name,
+                                           file_path, symbol_global_id, "{}");
+}
+
+static int insert_protocol_edge_properties(link_ctx_t *ctx, const char *source_id,
+                                           const char *target_id, const char *type,
+                                           double confidence, const char *evidence,
+                                           const char *properties) {
     sqlite3_reset(ctx->insert_edge);
     sqlite3_clear_bindings(ctx->insert_edge);
     sqlite3_bind_text(ctx->insert_edge, 1, source_id, -1, SQLITE_TRANSIENT);
@@ -325,7 +674,15 @@ static int insert_protocol_edge(link_ctx_t *ctx, const char *source_id, const ch
     sqlite3_bind_text(ctx->insert_edge, 3, type, -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(ctx->insert_edge, 4, confidence);
     sqlite3_bind_text(ctx->insert_edge, 5, evidence, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ctx->insert_edge, 6, properties ? properties : "{}", -1,
+                      SQLITE_TRANSIENT);
     return sqlite3_step(ctx->insert_edge) == SQLITE_DONE ? 0 : -1;
+}
+
+static int insert_protocol_edge(link_ctx_t *ctx, const char *source_id, const char *target_id,
+                                const char *type, double confidence, const char *evidence) {
+    return insert_protocol_edge_properties(ctx, source_id, target_id, type, confidence,
+                                           evidence, "{}");
 }
 
 static bool contains_class_token(const char *qualified_name, const char *token) {
@@ -406,6 +763,146 @@ static int link_binder_method(link_ctx_t *ctx, const char *method_id, const char
     return 0;
 }
 
+static yyjson_mut_val *aidl_string_array(yyjson_mut_doc *doc, const pg_strings_t *values) {
+    yyjson_mut_val *array = yyjson_mut_arr(doc);
+    for (int i = 0; values && i < values->count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, array, values->items[i]);
+    }
+    return array;
+}
+
+static const char *aidl_stability(const pg_strings_t *annotations) {
+    for (int i = 0; annotations && i < annotations->count; i++) {
+        if (strcmp(annotations->items[i], "VintfStability") == 0) return "vintf";
+        if (strcmp(annotations->items[i], "StableParcelable") == 0 ||
+            strcmp(annotations->items[i], "JavaOnlyStableParcelable") == 0) {
+            return "stable_parcelable";
+        }
+    }
+    return "local";
+}
+
+static char *aidl_write_properties(yyjson_mut_doc *doc) {
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *aidl_decl_properties(const aidl_decl_t *decl) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "declaration_kind", decl->kind);
+    yyjson_mut_obj_add_strcpy(doc, root, "package",
+                             decl->package_name ? decl->package_name : "");
+    yyjson_mut_obj_add_bool(doc, root, "oneway", decl->oneway);
+    yyjson_mut_obj_add_strcpy(doc, root, "stability", aidl_stability(&decl->annotations));
+    yyjson_mut_obj_add_val(doc, root, "annotations",
+                           aidl_string_array(doc, &decl->annotations));
+    yyjson_mut_obj_add_val(doc, root, "imports", aidl_string_array(doc, &decl->imports));
+    return aidl_write_properties(doc);
+}
+
+static char *aidl_method_properties(const aidl_method_t *method, bool effective_oneway) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "return_type",
+                             method->return_type ? method->return_type : "void");
+    yyjson_mut_obj_add_bool(doc, root, "oneway", effective_oneway);
+    yyjson_mut_obj_add_val(doc, root, "annotations",
+                           aidl_string_array(doc, &method->annotations));
+    yyjson_mut_obj_add_val(doc, root, "parameter_types",
+                           aidl_string_array(doc, &method->parameter_types));
+    return aidl_write_properties(doc);
+}
+
+static char *aidl_member_properties(const aidl_member_t *member) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "type", member->type ? member->type : "");
+    yyjson_mut_obj_add_val(doc, root, "annotations",
+                           aidl_string_array(doc, &member->annotations));
+    return aidl_write_properties(doc);
+}
+
+static char *aidl_reference_properties(const char *target, const char *role) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "target_qualified_name", target);
+    yyjson_mut_obj_add_strcpy(doc, root, "role", role);
+    yyjson_mut_obj_add_strcpy(doc, root, "resolution", "unresolved");
+    yyjson_mut_obj_add_int(doc, root, "candidate_count", 0);
+    return aidl_write_properties(doc);
+}
+
+static char *aidl_qualified_type(const aidl_decl_t *decl, const char *type) {
+    if (!type || !type[0] || aidl_is_builtin_type(type)) return NULL;
+    if (strchr(type, '.')) return strdup(type);
+    for (int i = 0; i < decl->imports.count; i++) {
+        const char *leaf = strrchr(decl->imports.items[i], '.');
+        leaf = leaf ? leaf + 1 : decl->imports.items[i];
+        if (strcmp(leaf, type) == 0) return strdup(decl->imports.items[i]);
+    }
+    size_t size = strlen(type) + (decl->package_name ? strlen(decl->package_name) + 1 : 0) + 1;
+    char *qualified = malloc(size);
+    if (!qualified) return NULL;
+    if (decl->package_name && decl->package_name[0]) {
+        (void)snprintf(qualified, size, "%s.%s", decl->package_name, type);
+    } else {
+        (void)snprintf(qualified, size, "%s", type);
+    }
+    return qualified;
+}
+
+static int add_aidl_reference(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                              const aidl_decl_t *decl, const char *owner_id,
+                              const char *owner_qn, const char *type, const char *role,
+                              const char *rel_path) {
+    char *target = aidl_qualified_type(decl, type);
+    if (!target) return aidl_is_builtin_type(type) ? 0 : -1;
+    size_t qn_size = strlen(owner_qn) + strlen(role) + strlen(target) + 9;
+    char *reference_qn = malloc(qn_size);
+    char *properties = aidl_reference_properties(target, role);
+    if (!reference_qn || !properties) {
+        free(target);
+        free(reference_qn);
+        free(properties);
+        return -1;
+    }
+    (void)snprintf(reference_qn, qn_size, "%s::type:%s:%s", owner_qn, role, target);
+    char reference_id[65];
+    hash_id(ctx->workspace->workspace_id, "AIDL_TYPE_REFERENCE", reference_qn,
+            reference_id);
+    int rc = insert_protocol_node_properties(ctx, reference_id, repo->repo_id,
+                                             "AIDL_TYPE_REFERENCE", target, reference_qn,
+                                             rel_path, NULL, properties);
+    if (rc == 0) {
+        rc = insert_protocol_edge_properties(ctx, owner_id, reference_id,
+                                             "REFERENCES_TYPE", 1.0, "aidl_ast",
+                                             properties);
+    }
+    free(target);
+    free(reference_qn);
+    free(properties);
+    return rc;
+}
+
+static const char *aidl_protocol_kind(const char *kind) {
+    if (strcmp(kind, "interface") == 0) return "AIDL_INTERFACE";
+    if (strcmp(kind, "parcelable") == 0) return "AIDL_PARCELABLE";
+    if (strcmp(kind, "union") == 0) return "AIDL_UNION";
+    if (strcmp(kind, "enum") == 0) return "AIDL_ENUM";
+    return "AIDL_DECLARATION";
+}
+
 static int link_aidl_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_path,
                           const char *rel_path) {
     size_t length = 0;
@@ -418,64 +915,151 @@ static int link_aidl_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
         aidl_decl_free(&decl);
         return -1;
     }
-    if (!decl.interface_name) {
+    if (!decl.name || !decl.kind) {
         aidl_decl_free(&decl);
         return 0;
     }
-    size_t qn_len = strlen(decl.interface_name) +
+    size_t qn_len = strlen(decl.name) +
                     (decl.package_name ? strlen(decl.package_name) + 1 : 0) + 1;
-    char *interface_qn = malloc(qn_len);
-    if (!interface_qn) {
+    char *declaration_qn = malloc(qn_len);
+    if (!declaration_qn) {
         aidl_decl_free(&decl);
         return -1;
     }
     if (decl.package_name) {
-        (void)snprintf(interface_qn, qn_len, "%s.%s", decl.package_name, decl.interface_name);
+        (void)snprintf(declaration_qn, qn_len, "%s.%s", decl.package_name, decl.name);
     } else {
-        (void)snprintf(interface_qn, qn_len, "%s", decl.interface_name);
+        (void)snprintf(declaration_qn, qn_len, "%s", decl.name);
     }
-    char interface_id[65];
-    hash_id(ctx->workspace->workspace_id, "AIDL_INTERFACE", interface_qn, interface_id);
-    if (insert_protocol_node(ctx, interface_id, repo->repo_id, "AIDL_INTERFACE",
-                             decl.interface_name, interface_qn, rel_path, NULL) != 0) {
-        free(interface_qn);
+    const char *protocol_kind = aidl_protocol_kind(decl.kind);
+    char declaration_id[65];
+    hash_id(ctx->workspace->workspace_id, protocol_kind, declaration_qn, declaration_id);
+    char *declaration_properties = aidl_decl_properties(&decl);
+    if (!declaration_properties ||
+        insert_protocol_node_properties(ctx, declaration_id, repo->repo_id, protocol_kind,
+                                        decl.name, declaration_qn, rel_path, NULL,
+                                        declaration_properties) != 0) {
+        free(declaration_properties);
+        free(declaration_qn);
         aidl_decl_free(&decl);
         return -1;
     }
-    const char *stem = decl.interface_name[0] == 'I' && decl.interface_name[1]
-                           ? decl.interface_name + 1
-                           : decl.interface_name;
-    char candidate[512];
-    (void)snprintf(candidate, sizeof(candidate), "Bn%s", stem);
-    if (link_generated_type(ctx, interface_id, candidate, "BINDER_SERVER_TYPE",
-                            "AIDL_GENERATES_SERVER") != 0) goto fail;
-    (void)snprintf(candidate, sizeof(candidate), "Bp%s", stem);
-    if (link_generated_type(ctx, interface_id, candidate, "BINDER_CLIENT_TYPE",
-                            "AIDL_GENERATES_CLIENT") != 0) goto fail;
-    if (link_generated_type(ctx, interface_id, decl.interface_name, "BINDER_INTERFACE_TYPE",
-                            "AIDL_GENERATES_INTERFACE") != 0) goto fail;
+    free(declaration_properties);
+
+    for (int i = 0; i < decl.imports.count; i++) {
+        size_t import_qn_size = strlen(declaration_qn) + strlen(decl.imports.items[i]) + 10;
+        char *import_qn = malloc(import_qn_size);
+        char *properties = aidl_reference_properties(decl.imports.items[i], "import");
+        if (!import_qn || !properties) {
+            free(import_qn);
+            free(properties);
+            goto fail;
+        }
+        (void)snprintf(import_qn, import_qn_size, "%s::import:%s", declaration_qn,
+                       decl.imports.items[i]);
+        char import_id[65];
+        hash_id(ctx->workspace->workspace_id, "AIDL_IMPORT", import_qn, import_id);
+        int rc = insert_protocol_node_properties(ctx, import_id, repo->repo_id,
+                                                 "AIDL_IMPORT", decl.imports.items[i],
+                                                 import_qn, rel_path, NULL, properties);
+        if (rc == 0) {
+            rc = insert_protocol_edge_properties(ctx, declaration_id, import_id,
+                                                 "DECLARES_IMPORT", 1.0, "aidl_ast",
+                                                 properties);
+        }
+        free(import_qn);
+        free(properties);
+        if (rc != 0) goto fail;
+    }
+
+    const char *stem = decl.name[0] == 'I' && decl.name[1] ? decl.name + 1 : decl.name;
+    if (strcmp(decl.kind, "interface") == 0) {
+        char candidate[512];
+        (void)snprintf(candidate, sizeof(candidate), "Bn%s", stem);
+        if (link_generated_type(ctx, declaration_id, candidate, "BINDER_SERVER_TYPE",
+                                "AIDL_GENERATES_SERVER") != 0) goto fail;
+        (void)snprintf(candidate, sizeof(candidate), "Bp%s", stem);
+        if (link_generated_type(ctx, declaration_id, candidate, "BINDER_CLIENT_TYPE",
+                                "AIDL_GENERATES_CLIENT") != 0) goto fail;
+        if (link_generated_type(ctx, declaration_id, decl.name, "BINDER_INTERFACE_TYPE",
+                                "AIDL_GENERATES_INTERFACE") != 0) goto fail;
+    }
 
     for (int i = 0; i < decl.methods.count; i++) {
-        size_t method_qn_len = strlen(interface_qn) + strlen(decl.methods.items[i]) + 2;
+        aidl_method_t *method = &decl.methods.items[i];
+        size_t method_qn_len = strlen(declaration_qn) + strlen(method->name) + 2;
         char *method_qn = malloc(method_qn_len);
         if (!method_qn) goto fail;
-        (void)snprintf(method_qn, method_qn_len, "%s.%s", interface_qn, decl.methods.items[i]);
+        (void)snprintf(method_qn, method_qn_len, "%s.%s", declaration_qn, method->name);
         char method_id[65];
         hash_id(ctx->workspace->workspace_id, "AIDL_METHOD", method_qn, method_id);
-        int rc = insert_protocol_node(ctx, method_id, repo->repo_id, "AIDL_METHOD",
-                                      decl.methods.items[i], method_qn, rel_path, NULL);
-        if (rc == 0) rc = insert_protocol_edge(ctx, interface_id, method_id, "DECLARES_METHOD",
-                                               1.0, "aidl_ast");
-        if (rc == 0) rc = link_binder_method(ctx, method_id, decl.methods.items[i],
-                                             decl.interface_name, stem);
+        bool effective_oneway = decl.oneway || method->oneway;
+        char *properties = aidl_method_properties(method, effective_oneway);
+        int rc = properties
+            ? insert_protocol_node_properties(ctx, method_id, repo->repo_id, "AIDL_METHOD",
+                                              method->name, method_qn, rel_path, NULL, properties)
+            : -1;
+        if (rc == 0) {
+            rc = insert_protocol_edge_properties(ctx, declaration_id, method_id,
+                                                 "DECLARES_METHOD", 1.0, "aidl_ast",
+                                                 properties);
+        }
+        if (rc == 0 && strcmp(decl.kind, "interface") == 0) {
+            rc = link_binder_method(ctx, method_id, method->name, decl.name, stem);
+        }
+        if (rc == 0 && !aidl_is_builtin_type(method->return_type)) {
+            rc = add_aidl_reference(ctx, repo, &decl, method_id, method_qn,
+                                    method->return_type, "return", rel_path);
+        }
+        for (int p = 0; p < method->parameter_types.count && rc == 0; p++) {
+            rc = add_aidl_reference(ctx, repo, &decl, method_id, method_qn,
+                                    method->parameter_types.items[p], "parameter", rel_path);
+        }
+        free(properties);
         free(method_qn);
         if (rc != 0) goto fail;
     }
-    free(interface_qn);
+
+    for (int i = 0; i < decl.members.count; i++) {
+        aidl_member_t *member = &decl.members.items[i];
+        size_t member_qn_len = strlen(declaration_qn) + strlen(member->name) + 2;
+        char *member_qn = malloc(member_qn_len);
+        char *properties = aidl_member_properties(member);
+        if (!member_qn || !properties) {
+            free(member_qn);
+            free(properties);
+            goto fail;
+        }
+        (void)snprintf(member_qn, member_qn_len, "%s.%s", declaration_qn, member->name);
+        const char *member_kind = strcmp(decl.kind, "enum") == 0 ? "AIDL_ENUM_VALUE" :
+                                  strcmp(decl.kind, "interface") == 0 ? "AIDL_CONSTANT" :
+                                  "AIDL_FIELD";
+        const char *edge_type = strcmp(decl.kind, "enum") == 0 ? "DECLARES_ENUM_VALUE" :
+                                strcmp(decl.kind, "interface") == 0 ? "DECLARES_CONSTANT" :
+                                "DECLARES_FIELD";
+        char member_id[65];
+        hash_id(ctx->workspace->workspace_id, member_kind, member_qn, member_id);
+        int rc = insert_protocol_node_properties(ctx, member_id, repo->repo_id, member_kind,
+                                                 member->name, member_qn, rel_path, NULL,
+                                                 properties);
+        if (rc == 0) {
+            rc = insert_protocol_edge_properties(ctx, declaration_id, member_id, edge_type,
+                                                 1.0, "aidl_ast", properties);
+        }
+        if (rc == 0 && strcmp(decl.kind, "enum") != 0 &&
+            !aidl_is_builtin_type(member->type)) {
+            rc = add_aidl_reference(ctx, repo, &decl, member_id, member_qn, member->type,
+                                    "field", rel_path);
+        }
+        free(member_qn);
+        free(properties);
+        if (rc != 0) goto fail;
+    }
+    free(declaration_qn);
     aidl_decl_free(&decl);
     return 0;
 fail:
-    free(interface_qn);
+    free(declaration_qn);
     aidl_decl_free(&decl);
     return -1;
 }
@@ -728,6 +1312,85 @@ static int link_static_jni(link_ctx_t *ctx) {
     return rc;
 }
 
+static int resolve_aidl_references(link_ctx_t *ctx) {
+    const char *decl_kinds =
+        "('AIDL_INTERFACE','AIDL_PARCELABLE','AIDL_UNION','AIDL_ENUM')";
+    char sql[16384];
+    (void)snprintf(sql, sizeof(sql),
+        "UPDATE protocol_nodes SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=protocol_nodes.workspace_id "
+        "AND target.qualified_name=json_extract(protocol_nodes.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s),"
+        "'$.resolution',CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=protocol_nodes.workspace_id "
+        "AND target.qualified_name=json_extract(protocol_nodes.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s) WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) "
+        "WHERE workspace_id='%s' AND kind IN('AIDL_IMPORT','AIDL_TYPE_REFERENCE');"
+        "UPDATE protocol_edges SET properties=(SELECT ref.properties FROM protocol_nodes ref "
+        "WHERE ref.protocol_id=protocol_edges.target_id) WHERE type IN('DECLARES_IMPORT','REFERENCES_TYPE') "
+        "AND target_id IN(SELECT protocol_id FROM protocol_nodes WHERE workspace_id='%s' "
+        "AND kind IN('AIDL_IMPORT','AIDL_TYPE_REFERENCE'));"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'AIDL_IMPORTS',1.0,'aidl_import',"
+        "json_object('reference_node',ref.protocol_id,'target_qualified_name',target.qualified_name) "
+        "FROM protocol_nodes ref JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='DECLARES_IMPORT' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.qualified_name=json_extract(ref.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s WHERE ref.workspace_id='%s' AND ref.kind='AIDL_IMPORT' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT ref.protocol_id,target.protocol_id,'RESOLVES_TO',1.0,'aidl_import_resolution',"
+        "json_object('role','import') FROM protocol_nodes ref JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.qualified_name=json_extract(ref.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s WHERE ref.workspace_id='%s' AND ref.kind='AIDL_IMPORT' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT ref.protocol_id,target.protocol_id,'RESOLVES_TO',1.0,'aidl_type_resolution',"
+        "json_object('role',json_extract(ref.properties,'$.role')) FROM protocol_nodes ref "
+        "JOIN protocol_nodes target ON target.workspace_id=ref.workspace_id "
+        "AND target.qualified_name=json_extract(ref.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s WHERE ref.workspace_id='%s' AND ref.kind='AIDL_TYPE_REFERENCE' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'USES_TYPE',1.0,'aidl_type_reference',"
+        "json_object('reference_node',ref.protocol_id,'role',json_extract(ref.properties,'$.role')) "
+        "FROM protocol_nodes ref JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='REFERENCES_TYPE' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.qualified_name=json_extract(ref.properties,'$.target_qualified_name') "
+        "AND target.kind IN %s WHERE ref.workspace_id='%s' AND ref.kind='AIDL_TYPE_REFERENCE' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'USES_CALLBACK',1.0,'aidl_callback_parameter',"
+        "json_object('reference_node',ref.protocol_id,'role','parameter') "
+        "FROM protocol_nodes ref JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='REFERENCES_TYPE' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.qualified_name=json_extract(ref.properties,'$.target_qualified_name') "
+        "AND target.kind='AIDL_INTERFACE' WHERE ref.workspace_id='%s' "
+        "AND ref.kind='AIDL_TYPE_REFERENCE' AND json_extract(ref.properties,'$.role')='parameter' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';",
+        decl_kinds, decl_kinds, ctx->workspace->workspace_id,
+        ctx->workspace->workspace_id,
+        decl_kinds, ctx->workspace->workspace_id,
+        decl_kinds, ctx->workspace->workspace_id,
+        decl_kinds, ctx->workspace->workspace_id,
+        decl_kinds, ctx->workspace->workspace_id,
+        ctx->workspace->workspace_id);
+    char *sql_error = NULL;
+    int rc = sqlite3_exec(ctx->db, sql, NULL, NULL, &sql_error);
+    if (rc != SQLITE_OK) {
+        pg_error(ctx->err, ctx->err_size, "cannot resolve AIDL references",
+                 sql_error ? sql_error : sqlite3_errmsg(ctx->db));
+        sqlite3_free(sql_error);
+        return -1;
+    }
+    return 0;
+}
+
 int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
                             cbm_aosp_protocol_stats_t *stats, char *err, size_t err_size) {
     if (!workspace || !stats) return -1;
@@ -745,6 +1408,17 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1),"
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_INTERFACE'),"
         "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_METHOD'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_PARCELABLE'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_UNION'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_ENUM'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_IMPORT'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id "
+        "WHERE n.workspace_id=?1 AND e.type='USES_CALLBACK'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_METHOD' "
+        "AND json_extract(properties,'$.oneway')=1),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 "
+        "AND kind IN('AIDL_INTERFACE','AIDL_PARCELABLE','AIDL_UNION','AIDL_ENUM') "
+        "AND json_extract(properties,'$.stability')!='local'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_SERVER_IMPL'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type='BINDER_CLIENT_PROXY'),"
         "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.evidence='jni_exported_name'),"
@@ -758,10 +1432,17 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
             stats->edge_count = sqlite3_column_int(stmt, 1);
             stats->aidl_interfaces = sqlite3_column_int(stmt, 2);
             stats->aidl_methods = sqlite3_column_int(stmt, 3);
-            stats->binder_server_edges = sqlite3_column_int(stmt, 4);
-            stats->binder_client_edges = sqlite3_column_int(stmt, 5);
-            stats->jni_static_edges = sqlite3_column_int(stmt, 6);
-            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 7);
+            stats->aidl_parcelables = sqlite3_column_int(stmt, 4);
+            stats->aidl_unions = sqlite3_column_int(stmt, 5);
+            stats->aidl_enums = sqlite3_column_int(stmt, 6);
+            stats->aidl_imports = sqlite3_column_int(stmt, 7);
+            stats->aidl_callbacks = sqlite3_column_int(stmt, 8);
+            stats->aidl_oneway_methods = sqlite3_column_int(stmt, 9);
+            stats->aidl_stable_types = sqlite3_column_int(stmt, 10);
+            stats->binder_server_edges = sqlite3_column_int(stmt, 11);
+            stats->binder_client_edges = sqlite3_column_int(stmt, 12);
+            stats->jni_static_edges = sqlite3_column_int(stmt, 13);
+            stats->jni_dynamic_edges = sqlite3_column_int(stmt, 14);
             rc = 0;
         }
     } else {
@@ -805,10 +1486,10 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
     link_ctx_t ctx = {.db = db, .workspace = workspace, .err = err, .err_size = err_size};
     const char *node_sql =
         "INSERT OR REPLACE INTO protocol_nodes(protocol_id,workspace_id,repo_id,kind,name,"
-        "qualified_name,file_path,symbol_global_id,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}');";
+        "qualified_name,file_path,symbol_global_id,properties) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);";
     const char *edge_sql =
         "INSERT OR REPLACE INTO protocol_edges(source_id,target_id,type,confidence,evidence,properties)"
-        " VALUES(?1,?2,?3,?4,?5,'{}');";
+        " VALUES(?1,?2,?3,?4,?5,?6);";
     const char *find_sql =
         "SELECT global_id,repo_id,name,qualified_name,file_path,label FROM symbols "
         "WHERE workspace_id=?1 AND name=?2;";
@@ -821,6 +1502,7 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
             rc = scan_repo_tree(&ctx, &workspace->repos[i], workspace->repos[i].abs_path, "", 0);
         }
     }
+    if (rc == 0) rc = resolve_aidl_references(&ctx);
     if (rc == 0) rc = link_static_jni(&ctx);
     sqlite3_finalize(ctx.insert_node);
     sqlite3_finalize(ctx.insert_edge);
@@ -850,6 +1532,7 @@ void cbm_aosp_protocol_nodes_free(cbm_aosp_protocol_node_t *results, int count) 
         free(results[i].name);
         free(results[i].qualified_name);
         free(results[i].file_path);
+        free(results[i].properties);
     }
     free(results);
 }
@@ -876,7 +1559,7 @@ int cbm_aosp_search_protocols(const cbm_aosp_workspace_t *workspace, const char 
         return -1;
     }
     const char *sql =
-        "SELECT n.protocol_id,r.path,n.kind,n.name,n.qualified_name,n.file_path,"
+        "SELECT n.protocol_id,r.path,n.kind,n.name,n.qualified_name,n.file_path,n.properties,"
         "(SELECT count(*) FROM protocol_edges e WHERE e.source_id=n.protocol_id),"
         "(SELECT count(*) FROM protocol_edges e WHERE e.target_id=n.protocol_id) "
         "FROM protocol_nodes n JOIN repos r ON r.repo_id=n.repo_id WHERE n.workspace_id=?1 "
@@ -907,10 +1590,11 @@ int cbm_aosp_search_protocols(const cbm_aosp_workspace_t *workspace, const char 
         item->name = column_dup(stmt, 3);
         item->qualified_name = column_dup(stmt, 4);
         item->file_path = column_dup(stmt, 5);
-        item->outgoing_edges = sqlite3_column_int(stmt, 6);
-        item->incoming_edges = sqlite3_column_int(stmt, 7);
+        item->properties = column_dup(stmt, 6);
+        item->outgoing_edges = sqlite3_column_int(stmt, 7);
+        item->incoming_edges = sqlite3_column_int(stmt, 8);
         if (!item->protocol_id || !item->repo_path || !item->kind || !item->name ||
-            !item->qualified_name || !item->file_path) {
+            !item->qualified_name || !item->file_path || !item->properties) {
             cbm_aosp_protocol_nodes_free(items, n + 1);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
@@ -939,6 +1623,7 @@ void cbm_aosp_protocol_edges_free(cbm_aosp_protocol_edge_t *results, int count) 
         free(results[i].target_qualified_name);
         free(results[i].type);
         free(results[i].evidence);
+        free(results[i].properties);
     }
     free(results);
 }
@@ -960,7 +1645,7 @@ int cbm_aosp_search_protocol_edges(const cbm_aosp_workspace_t *workspace, const 
         return -1;
     }
     const char *sql =
-        "SELECT s.qualified_name,t.qualified_name,e.type,e.confidence,e.evidence "
+        "SELECT s.qualified_name,t.qualified_name,e.type,e.confidence,e.evidence,e.properties "
         "FROM protocol_edges e JOIN protocol_nodes s ON s.protocol_id=e.source_id "
         "JOIN protocol_nodes t ON t.protocol_id=e.target_id WHERE s.workspace_id=?1 "
         "AND (?2='' OR s.name LIKE '%'||?2||'%' OR s.qualified_name LIKE '%'||?2||'%' "
@@ -990,8 +1675,9 @@ int cbm_aosp_search_protocol_edges(const cbm_aosp_workspace_t *workspace, const 
         item->type = column_dup(stmt, 2);
         item->confidence = sqlite3_column_double(stmt, 3);
         item->evidence = column_dup(stmt, 4);
+        item->properties = column_dup(stmt, 5);
         if (!item->source_qualified_name || !item->target_qualified_name || !item->type ||
-            !item->evidence) {
+            !item->evidence || !item->properties) {
             cbm_aosp_protocol_edges_free(items, n + 1);
             sqlite3_finalize(stmt);
             sqlite3_close(db);

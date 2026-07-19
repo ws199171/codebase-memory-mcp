@@ -10,6 +10,13 @@ typedef struct {
     int edge_count;
     int aidl_interfaces;
     int aidl_methods;
+    int aidl_parcelables;
+    int aidl_unions;
+    int aidl_enums;
+    int aidl_imports;
+    int aidl_callbacks;
+    int aidl_oneway_methods;
+    int aidl_stable_types;
     int binder_server_edges;
     int binder_client_edges;
     int jni_static_edges;
@@ -23,6 +30,7 @@ typedef struct {
     char *name;
     char *qualified_name;
     char *file_path;
+    char *properties;
     int outgoing_edges;
     int incoming_edges;
 } cbm_aosp_protocol_node_t;
@@ -33,6 +41,7 @@ typedef struct {
     char *type;
     double confidence;
     char *evidence;
+    char *properties;
 } cbm_aosp_protocol_edge_t;
 
 int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,

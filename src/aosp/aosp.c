@@ -3708,8 +3708,12 @@ int cbm_cmd_aosp(int argc, char **argv) {
             exit_code = 1;
         } else {
             printf("AOSP protocol graph complete\n");
-            printf("  AIDL: %d interfaces, %d methods\n",
-                   stats.aidl_interfaces, stats.aidl_methods);
+            printf("  AIDL: %d interfaces, %d methods, %d parcelables, %d unions, "
+                   "%d enums\n", stats.aidl_interfaces, stats.aidl_methods,
+                   stats.aidl_parcelables, stats.aidl_unions, stats.aidl_enums);
+            printf("  AIDL metadata: %d imports, %d callbacks, %d oneway methods, "
+                   "%d stable types\n", stats.aidl_imports, stats.aidl_callbacks,
+                   stats.aidl_oneway_methods, stats.aidl_stable_types);
             printf("  Binder: %d server, %d client edges\n",
                    stats.binder_server_edges, stats.binder_client_edges);
             printf("  JNI: %d static, %d dynamic edges\n",
@@ -3740,9 +3744,10 @@ int cbm_cmd_aosp(int argc, char **argv) {
             exit_code = 1;
         } else {
             for (int i = 0; i < count; i++) {
-                printf("%s\t%s\t%s\t%s\tout:%d\tin:%d\n", nodes[i].repo_path,
+                printf("%s\t%s\t%s\t%s\tout:%d\tin:%d\t%s\n", nodes[i].repo_path,
                        nodes[i].kind, nodes[i].qualified_name, nodes[i].file_path,
-                       nodes[i].outgoing_edges, nodes[i].incoming_edges);
+                       nodes[i].outgoing_edges, nodes[i].incoming_edges,
+                       nodes[i].properties);
             }
             printf("%d protocol node%s\n", count, count == 1 ? "" : "s");
         }

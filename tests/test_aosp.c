@@ -589,6 +589,65 @@ static int create_build_file_links_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_complete_aidl_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_aidl_p1_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "api/android/test") != 0 ||
+        make_dir(root, "callbacks/com/acme") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"platform/api\" path=\"api\"/>"
+            "<project name=\"vendor/callbacks\" path=\"callbacks\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "callbacks/com/acme/ICallback.aidl",
+            "package com.acme;\n"
+            "@VintfStability\n"
+            "oneway interface ICallback {\n"
+            "  void onEvent(int event);\n"
+            "}\n") != 0 ||
+        write_relative(root, "api/android/test/Result.aidl",
+            "package android.test;\n"
+            "@JavaOnlyStableParcelable\n"
+            "parcelable Result {\n"
+            "  @nullable String message;\n"
+            "  int code;\n"
+            "  int mode = DEFAULT_MODE;\n"
+            "  @FieldTag(value=1) int tagged;\n"
+            "}\n") != 0 ||
+        write_relative(root, "api/android/test/Payload.aidl",
+            "package android.test;\n"
+            "union Payload {\n"
+            "  int number;\n"
+            "  Result result;\n"
+            "}\n") != 0 ||
+        write_relative(root, "api/android/test/Status.aidl",
+            "package android.test;\n"
+            "@Backing(type=\"int\")\n"
+            "enum Status { UNKNOWN = 0, READY = 1, }\n") != 0 ||
+        write_relative(root, "api/android/test/IService.aidl",
+            "package android.test;\n"
+            "import com.acme.ICallback;\n"
+            "import android.test.Result;\n"
+            "import android.test.Missing;\n"
+            "@VintfStability\n"
+            "interface IService {\n"
+            "  @EnforcePermission(\"android.permission.TEST\")\n"
+            "  oneway void registerCallback(in ICallback callback);\n"
+            "  Result fetch(in Status status);\n"
+            "}\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3225,6 +3284,154 @@ TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance) {
     PASS();
 }
 
+TEST(aosp_protocol_graph_models_complete_aidl_declarations) {
+    char *root = NULL;
+    ASSERT_EQ(create_complete_aidl_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_protocol_stats_t stats;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.aidl_interfaces, 2);
+    ASSERT_EQ(stats.aidl_methods, 3);
+    ASSERT_EQ(stats.aidl_parcelables, 1);
+    ASSERT_EQ(stats.aidl_unions, 1);
+    ASSERT_EQ(stats.aidl_enums, 1);
+    ASSERT_EQ(stats.aidl_imports, 3);
+    ASSERT_EQ(stats.aidl_callbacks, 1);
+    ASSERT_EQ(stats.aidl_oneway_methods, 2);
+    ASSERT_EQ(stats.aidl_stable_types, 3);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(item,',') FROM (SELECT name||':'||"
+        "json_extract(properties,'$.resolution') AS item FROM protocol_nodes "
+        "WHERE workspace_id=?1 AND kind='AIDL_IMPORT' ORDER BY name);",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "android.test.Missing:not_found,android.test.Result:resolved,"
+                  "com.acme.ICallback:resolved");
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(item,',') FROM (SELECT t.name||':'||"
+        "json_extract(e.properties,'$.resolution') AS item FROM protocol_edges e "
+        "JOIN protocol_nodes t ON t.protocol_id=e.target_id "
+        "WHERE t.workspace_id=?1 AND e.type='DECLARES_IMPORT' ORDER BY t.name);",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "android.test.Missing:not_found,android.test.Result:resolved,"
+                  "com.acme.ICallback:resolved");
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes s "
+        "ON s.protocol_id=e.source_id WHERE s.workspace_id=?1 "
+        "AND s.kind='AIDL_IMPORT' AND e.type='RESOLVES_TO';", -1, &stmt, NULL),
+        SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT json_extract(properties,'$.oneway'),"
+        "json_extract(properties,'$.annotations[0]') FROM protocol_nodes "
+        "WHERE workspace_id=?1 AND kind='AIDL_METHOD' AND name='registerCallback';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_TRUE(sqlite3_column_int(stmt, 0));
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "EnforcePermission");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT s.qualified_name||'->'||t.qualified_name FROM protocol_edges e "
+        "JOIN protocol_nodes s ON s.protocol_id=e.source_id "
+        "JOIN protocol_nodes t ON t.protocol_id=e.target_id "
+        "WHERE s.workspace_id=?1 AND e.type='USES_CALLBACK';", -1, &stmt, NULL),
+        SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "android.test.IService.registerCallback->com.acme.ICallback");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='AIDL_FIELD';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 6);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 "
+        "AND kind='AIDL_FIELD' AND name='mode';", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT json_extract(properties,'$.annotations[0]') FROM protocol_nodes "
+        "WHERE workspace_id=?1 AND kind='AIDL_FIELD' AND name='tagged';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "FieldTag");
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 "
+        "AND kind='AIDL_ENUM_VALUE';", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    cbm_aosp_protocol_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_aosp_search_protocols(&workspace, "IService", 50, &nodes, &count,
+                                        err, sizeof(err)), 0);
+    ASSERT_TRUE(count >= 3);
+    bool found_stability = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(nodes[i].kind, "AIDL_INTERFACE") == 0 &&
+            strstr(nodes[i].properties, "\"stability\":\"vintf\"")) {
+            found_stability = true;
+        }
+    }
+    ASSERT_TRUE(found_stability);
+    cbm_aosp_protocol_nodes_free(nodes, count);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+        "{\"workspace_root\":\"%s\",\"query\":\"IService\",\"limit\":50}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_trace_protocol", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"aidl_parcelables\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"aidl_callbacks\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"aidl_oneway_methods\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"stability\":\"vintf\""));
+    ASSERT_NOT_NULL(strstr(response, "USES_CALLBACK"));
+    free(response);
+
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.aidl_interfaces, 2);
+    ASSERT_EQ(stats.aidl_imports, 3);
+    ASSERT_EQ(stats.aidl_callbacks, 1);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -4356,6 +4563,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_imports_bazel_mixed_build_metadata);
     RUN_TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols);
     RUN_TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance);
+    RUN_TEST(aosp_protocol_graph_models_complete_aidl_declarations);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
