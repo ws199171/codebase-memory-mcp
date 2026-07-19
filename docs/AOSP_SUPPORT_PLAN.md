@@ -40,9 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `P5` - decode JNI overload/signature encodings and common
-  registration helpers.
-- Next task: `P6` - model HIDL and HwBinder interfaces, clients, and services.
+- Current task: `P6` - model HIDL and HwBinder interfaces, clients, and services.
+- Next task: `P7` - parse VINTF manifests and compatibility matrices and link HAL
+  instances.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -128,7 +128,14 @@ complete:
     totals, 32 AOSP tests, 159 MCP tests, production `-Werror` build, and real-index
     CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
     verification completion.
-- Worktree baseline: P4 generated-Binder-backend checkpoint `df3e41e` on
+  - `P5` JNI escaped names, nested classes, long-name descriptors, static and
+    dynamic overload resolution, JVM overload node identities, raw Java signature
+    fallback, common registration helpers, ambiguity/mismatch rejection, and
+    idempotent refresh; 33 AOSP tests, 222 pipeline tests, 94 Java LSP tests, 78
+    Kotlin LSP tests, 159 MCP tests, production `-Werror` build, and real-index
+    CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
+    verification completion.
+- Worktree baseline: P5 JNI-overload checkpoint `f654561` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -234,7 +241,7 @@ unevaluated constructs must be counted and returned as coverage gaps.
   calls, and implementation methods.
 - [x] `P3` Link ServiceManager registration, lookup, wait, client, and server paths.
 - [x] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
-- [ ] `P5` Decode JNI overload/signature encodings and common registration helpers.
+- [x] `P5` Decode JNI overload/signature encodings and common registration helpers.
 - [ ] `P6` Model HIDL and HwBinder interfaces, clients, and services.
 - [ ] `P7` Parse VINTF manifests and compatibility matrices and link HAL instances.
 - [ ] `P8` Parse `init.rc` services and connect binaries, interfaces, and startup
@@ -338,3 +345,4 @@ unaccepted critical coverage gap.
 | `P2` | `841f5b7` | Source-backed Binder transaction constants, shared `onTransact` dispatch, proxy transact calls, direct implementation inheritance, omitted-symbol fallback, same-name negative coverage, idempotent refresh, 30 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
 | `P3` | `b47d0a7` | Literal C++/NDK/Java ServiceManager registration, lookup, check, and wait calls; deterministic cross-repository services; enclosing client/server callers; unique implementation/interface links; missing, ambiguous, dynamic-name, and idempotent refresh coverage; 31 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
 | `P4` | `df3e41e` | Java nested `Stub`/`Proxy` types, C++/NDK and Rust `Bn`/`Bp` methods, Rust transaction/dispatch/trait-implementation flow, strict backend pairing, per-backend partial-symbol fallback and coverage totals, no-cross-backend and idempotent golden coverage, 32 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
+| `P5` | `f654561` | JNI `_1`/`_2`/`_3`/`_0xxxx` escapes, nested classes, long-name JVM descriptors, overload-preserving JVM method nodes, structured and raw-signature exact matching, static/dynamic overload links, common registration-helper evidence, ambiguity/mismatch rejection, idempotent refresh, 33 AOSP tests, 222 pipeline tests, 94 Java LSP tests, 78 Kotlin LSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
