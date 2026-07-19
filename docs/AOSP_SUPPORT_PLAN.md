@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `B9` - link build modules to source files, generated files, and
-  definition symbols.
-- Next task: `B10` - expose dependency edges, variants, unresolved expressions,
+- Current task: `B10` - expose dependency edges, variants, unresolved expressions,
   and provenance through CLI and MCP queries.
+- Next task: `P1` - support complete AIDL declarations, imports, annotations,
+  callbacks, and stability metadata.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -95,7 +95,13 @@ complete:
     ambiguity/missing/external/unsupported evidence, and schema v12 Bazel tables;
     26 AOSP tests, 159 MCP tests, production `-Werror` build, and CLI/MCP smoke
     pass; Linux ASan/UBSan execution remains required before verification completion.
-- Worktree baseline: B8 Bazel mixed-build metadata checkpoint `888813e` on
+  - `B9` module definition/source/tool file resolution, normalized filegroup paths,
+    stable generated-output identities and consumer links, exact definition-symbol
+    links, explicit missing/unindexed/ambiguous/invalid states, atomic stale-link
+    cleanup, and schema v13 link tables; 27 AOSP tests, 159 MCP tests, production
+    `-Werror` build, and CLI/MCP smoke pass; Linux ASan/UBSan execution remains
+    required before verification completion.
+- Worktree baseline: B9 build-file and symbol-link checkpoint `9ff3fe4` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -299,3 +305,4 @@ unaccepted critical coverage gap.
 | `B6` | `5e72c53` | Common Make variables, deterministic conditions, includes, user macros and functions, semantic module classes, schema v10 coverage gaps, 24 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B7` | `5c45fd7` | Product Makefiles/fragments, inheritance states and provenance, product package resolution, BoardConfig/device/vendor/partition ownership, schema v11 product tables, 25 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B8` | `888813e` | Versioned Bazel mixed-build artifacts, configured labels/transitions, unique Soong-module mapping, cross-repository dependency projection, ambiguity/missing/external/unsupported evidence, schema v12 Bazel tables, 26 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B9` | `9ff3fe4` | Module-to-file resolution with filegroup path normalization, stable generated outputs and consumer links, exact definition-symbol links, explicit coverage states, atomic stale-link cleanup, schema v13 link tables, 27 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
