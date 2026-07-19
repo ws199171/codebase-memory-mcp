@@ -587,9 +587,13 @@ missing targets remain queryable as unresolved declarations instead of being
 silently linked. Filegroups and genrules retain declared source, tool, and output
 files separately from module references. Generated-source/header and tool edges
 remain traversable, while tagged references such as `:generator{.header}` retain
-their original spelling and output tag. Android.mk extraction evaluates common
-variable assignment and expansion, deterministic conditions, relative include
-fragments, user macros, and semantic `BUILD_*` module classes. Unknown
+their original spelling and output tag. Module definition, source, and tool paths
+are linked to indexed `File` nodes and exact in-file definitions. Generated
+outputs receive stable identities and consumer links when the producer output or
+tag is unique; missing files, unindexed repositories, ambiguous `File` nodes, and
+unsupported output tags remain explicit coverage states. Android.mk extraction
+evaluates common variable assignment and expansion, deterministic conditions,
+relative include fragments, user macros, and semantic `BUILD_*` module classes. Unknown
 product/target conditions and unsupported Make functions are counted and returned
 as coverage gaps instead of selecting a branch speculatively. Product Makefiles,
 `PRODUCT_PACKAGES`, inheritance, BoardConfig evidence, device/vendor ownership,

@@ -696,6 +696,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(10,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(11,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(12,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(13,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -721,6 +722,32 @@ static const char *AOSP_SCHEMA =
     " source_id TEXT NOT NULL,path TEXT NOT NULL,role TEXT NOT NULL,properties TEXT DEFAULT '{}',"
     " PRIMARY KEY(source_id,path,role));"
     "CREATE INDEX IF NOT EXISTS idx_aosp_module_files_role ON module_files(role);"
+    "CREATE TABLE IF NOT EXISTS build_generated_files("
+    " generated_id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,"
+    " producer_id TEXT NOT NULL,declared_path TEXT NOT NULL,workspace_path TEXT NOT NULL,"
+    " properties TEXT NOT NULL DEFAULT '{}',UNIQUE(producer_id,declared_path));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_generated_producer "
+    "ON build_generated_files(producer_id);"
+    "CREATE TABLE IF NOT EXISTS module_file_links("
+    " source_id TEXT NOT NULL,declared_path TEXT NOT NULL,role TEXT NOT NULL,"
+    " workspace_path TEXT NOT NULL,target_repo_id TEXT NOT NULL,file_global_id TEXT,"
+    " generated_id TEXT,status TEXT NOT NULL,properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(source_id,declared_path,role));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_module_file_links_file "
+    "ON module_file_links(file_global_id);"
+    "CREATE TABLE IF NOT EXISTS module_generated_links("
+    " source_id TEXT NOT NULL,target_module_id TEXT NOT NULL,dependency_type TEXT NOT NULL,"
+    " output_tag TEXT NOT NULL DEFAULT '',generated_id TEXT,status TEXT NOT NULL,"
+    " properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(source_id,target_module_id,dependency_type,output_tag));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_module_generated_target "
+    "ON module_generated_links(generated_id);"
+    "CREATE TABLE IF NOT EXISTS module_symbol_links("
+    " source_id TEXT NOT NULL,file_global_id TEXT NOT NULL,symbol_global_id TEXT NOT NULL,"
+    " link_type TEXT NOT NULL,properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(source_id,symbol_global_id,link_type));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_module_symbols_symbol "
+    "ON module_symbol_links(symbol_global_id);"
     "CREATE TABLE IF NOT EXISTS build_make_files("
     " workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,file_path TEXT NOT NULL,"
     " includes TEXT NOT NULL DEFAULT '[]',condition_count INTEGER NOT NULL DEFAULT 0,"
@@ -3588,6 +3615,17 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.bazel_target_resolved_count, stats.bazel_dependency_count,
                    stats.bazel_dependency_resolved_count, stats.bazel_ambiguous_count,
                    stats.bazel_missing_count, stats.bazel_coverage_gap_count);
+            printf("  file links: %d (%d resolved, %d unresolved; %d ambiguous, "
+                   "%d missing, %d unindexed), %d definition symbols\n",
+                   stats.file_link_count, stats.file_link_resolved_count,
+                   stats.file_link_unresolved_count, stats.file_link_ambiguous_count,
+                   stats.file_link_missing_count, stats.file_link_unindexed_count,
+                   stats.definition_symbol_link_count);
+            printf("  generated files: %d outputs, %d consumer links "
+                   "(%d resolved, %d unresolved)\n",
+                   stats.generated_file_count, stats.generated_link_count,
+                   stats.generated_link_resolved_count,
+                   stats.generated_link_unresolved_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

@@ -3,6 +3,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/sha256.h"
 
 #include <sqlite3.h>
@@ -4241,6 +4242,498 @@ static char *product_package_properties_json(const product_package_decl_t *packa
     return json;
 }
 
+static char *normalize_module_file_path(const char *module_file, const char *filegroup_path,
+                                        const char *declared_path, bool definition) {
+    if (!module_file || !declared_path || !declared_path[0] ||
+        declared_path[0] == '/' || declared_path[0] == '\\' ||
+        (isalpha((unsigned char)declared_path[0]) && declared_path[1] == ':') ||
+        strstr(declared_path, "$(") || strstr(declared_path, "${") ||
+        (!definition && filegroup_path && filegroup_path[0] &&
+         (filegroup_path[0] == '/' || filegroup_path[0] == '\\' ||
+          (isalpha((unsigned char)filegroup_path[0]) && filegroup_path[1] == ':') ||
+          strstr(filegroup_path, "$(") || strstr(filegroup_path, "${")))) {
+        return NULL;
+    }
+    const char *slash = strrchr(module_file, '/');
+    size_t dir_length = definition ? 0 : (slash ? (size_t)(slash - module_file) : 0);
+    size_t size = strlen(declared_path) + dir_length +
+                  (filegroup_path ? strlen(filegroup_path) : 0) + 3;
+    char *joined = malloc(size);
+    if (!joined) return NULL;
+    if (definition) {
+        (void)snprintf(joined, size, "%s", declared_path);
+    } else if (dir_length && filegroup_path && filegroup_path[0]) {
+        (void)snprintf(joined, size, "%.*s/%s/%s", (int)dir_length, module_file,
+                       filegroup_path, declared_path);
+    } else if (dir_length) {
+        (void)snprintf(joined, size, "%.*s/%s", (int)dir_length, module_file,
+                       declared_path);
+    } else if (filegroup_path && filegroup_path[0]) {
+        (void)snprintf(joined, size, "%s/%s", filegroup_path, declared_path);
+    } else {
+        (void)snprintf(joined, size, "%s", declared_path);
+    }
+    for (char *p = joined; *p; p++) if (*p == '\\') *p = '/';
+    str_vec_t parts = {0};
+    char *save = NULL;
+    bool valid = true;
+    for (char *part = strtok_r(joined, "/", &save); part;
+         part = strtok_r(NULL, "/", &save)) {
+        if (strcmp(part, ".") == 0 || !part[0]) continue;
+        if (strcmp(part, "..") == 0) {
+            if (parts.count == 0) {
+                valid = false;
+                break;
+            }
+            free(parts.items[--parts.count]);
+            parts.items[parts.count] = NULL;
+        } else if (!str_vec_add(&parts, part)) {
+            valid = false;
+            break;
+        }
+    }
+    free(joined);
+    if (!valid || parts.count == 0) {
+        str_vec_free(&parts);
+        return NULL;
+    }
+    size = 1;
+    for (int i = 0; i < parts.count; i++) size += strlen(parts.items[i]) + 1;
+    char *normalized = malloc(size);
+    if (normalized) {
+        normalized[0] = '\0';
+        for (int i = 0; i < parts.count; i++) {
+            if (i) (void)strcat(normalized, "/");
+            (void)strcat(normalized, parts.items[i]);
+        }
+    }
+    str_vec_free(&parts);
+    return normalized;
+}
+
+static void generated_file_id(const char *workspace_id, const char *module_id,
+                              const char *path, char out[65]) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&ctx);
+    cbm_sha256_update(&ctx, workspace_id, strlen(workspace_id));
+    cbm_sha256_update(&ctx, "\0generated\0", 11);
+    cbm_sha256_update(&ctx, module_id, strlen(module_id));
+    cbm_sha256_update(&ctx, "\0", 1);
+    cbm_sha256_update(&ctx, path, strlen(path));
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
+}
+
+static char *file_link_properties_json(const char *repo_file_path, int candidates,
+                                       bool physical_exists, int symbol_count,
+                                       const char *declaration_properties) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "repo_file_path", repo_file_path ? repo_file_path : "");
+    yyjson_mut_obj_add_int(doc, root, "candidate_count", candidates);
+    yyjson_mut_obj_add_bool(doc, root, "physical_exists", physical_exists);
+    yyjson_mut_obj_add_int(doc, root, "definition_symbol_count", symbol_count);
+    if (declaration_properties && declaration_properties[0]) {
+        yyjson_doc *source_doc = yyjson_read(declaration_properties,
+                                             strlen(declaration_properties), 0);
+        yyjson_val *source_root = source_doc ? yyjson_doc_get_root(source_doc) : NULL;
+        if (source_root) {
+            yyjson_mut_val *copied = yyjson_val_mut_copy(doc, source_root);
+            if (copied) yyjson_mut_obj_add_val(doc, root, "declaration", copied);
+        }
+        yyjson_doc_free(source_doc);
+    }
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static bool path_has_suffix(const char *path, const char *suffix) {
+    size_t path_length = path ? strlen(path) : 0;
+    size_t suffix_length = suffix ? strlen(suffix) : 0;
+    return suffix_length <= path_length &&
+           strcmp(path + path_length - suffix_length, suffix) == 0;
+}
+
+static int link_build_files(sqlite3 *db, const cbm_aosp_workspace_t *workspace,
+                            char *err, size_t err_size) {
+    sqlite3_stmt *clear = NULL;
+    sqlite3_stmt *files = NULL;
+    sqlite3_stmt *modules = NULL;
+    sqlite3_stmt *file_candidates = NULL;
+    sqlite3_stmt *symbol_candidates = NULL;
+    sqlite3_stmt *insert_file_link = NULL;
+    sqlite3_stmt *insert_generated = NULL;
+    sqlite3_stmt *insert_symbol = NULL;
+    sqlite3_stmt *dependencies = NULL;
+    sqlite3_stmt *generated_candidates = NULL;
+    sqlite3_stmt *insert_generated_link = NULL;
+    int rc = -1;
+    const char *clear_sql[] = {
+        "DELETE FROM module_symbol_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM module_generated_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM module_file_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM build_generated_files WHERE workspace_id=?1;",
+    };
+    for (size_t i = 0; i < sizeof(clear_sql) / sizeof(clear_sql[0]); i++) {
+        if (sqlite3_prepare_v2(db, clear_sql[i], -1, &clear, NULL) != SQLITE_OK) goto done;
+        sqlite3_bind_text(clear, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(clear) != SQLITE_DONE) goto done;
+        sqlite3_finalize(clear);
+        clear = NULL;
+    }
+    const char *module_sql =
+        "SELECT m.module_id,m.repo_id,m.file_path,m.module_type,m.properties,m.name,"
+        "r.path,r.abs_path,r.status FROM modules m JOIN repos r ON r.repo_id=m.repo_id "
+        "WHERE m.workspace_id=?1;";
+    const char *files_sql =
+        "SELECT m.module_id,m.repo_id,m.file_path,m.module_type,m.properties,m.name,"
+        "f.path,f.role,f.properties,r.path,r.abs_path,r.status "
+        "FROM module_files f JOIN modules m ON m.module_id=f.source_id "
+        "JOIN repos r ON r.repo_id=m.repo_id WHERE m.workspace_id=?1;";
+    if (sqlite3_prepare_v2(db, module_sql, -1, &modules, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, files_sql, -1, &files, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "SELECT global_id FROM symbols WHERE workspace_id=?1 AND repo_id=?2 "
+            "AND file_path=?3 AND label='File';", -1, &file_candidates, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "SELECT global_id FROM symbols WHERE workspace_id=?1 AND repo_id=?2 "
+            "AND file_path=?3 AND label!='File' AND (?4='' OR name=?4);",
+            -1, &symbol_candidates, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO module_file_links(source_id,declared_path,role,"
+            "workspace_path,target_repo_id,file_global_id,generated_id,status,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1,
+            &insert_file_link, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_generated_files(generated_id,workspace_id,repo_id,"
+            "producer_id,declared_path,workspace_path,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_generated, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO module_symbol_links(source_id,file_global_id,"
+            "symbol_global_id,link_type,properties) VALUES(?1,?2,?3,?4,'{}');",
+            -1, &insert_symbol, NULL) != SQLITE_OK) goto done;
+
+    sqlite3_bind_text(modules, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(files, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    for (int pass = 0; pass < 2; pass++) {
+        sqlite3_stmt *rows = pass == 0 ? modules : files;
+        int rows_step = SQLITE_OK;
+        while ((rows_step = sqlite3_step(rows)) == SQLITE_ROW) {
+            const char *module_id_value = (const char *)sqlite3_column_text(rows, 0);
+            const char *repo_id = (const char *)sqlite3_column_text(rows, 1);
+            const char *module_file = (const char *)sqlite3_column_text(rows, 2);
+            const char *module_type = (const char *)sqlite3_column_text(rows, 3);
+            const char *module_properties = (const char *)sqlite3_column_text(rows, 4);
+            const char *module_name = (const char *)sqlite3_column_text(rows, 5);
+            const char *declared = pass == 0 ? module_file :
+                                   (const char *)sqlite3_column_text(rows, 6);
+            const char *role = pass == 0 ? "DEFINITION" :
+                               (const char *)sqlite3_column_text(rows, 7);
+            const char *declaration_properties = pass == 0 ? "{}" :
+                (const char *)sqlite3_column_text(rows, 8);
+            int offset = pass == 0 ? 6 : 9;
+            const char *repo_path = (const char *)sqlite3_column_text(rows, offset);
+            const char *repo_abs = (const char *)sqlite3_column_text(rows, offset + 1);
+            const char *repo_status = (const char *)sqlite3_column_text(rows, offset + 2);
+            const char *filegroup_path = NULL;
+            yyjson_doc *properties_doc = NULL;
+            if (pass != 0 && module_type && strcmp(module_type, "filegroup") == 0 &&
+                role && strcmp(role, "SOURCE") == 0 && module_properties) {
+                properties_doc = yyjson_read(module_properties, strlen(module_properties), 0);
+                yyjson_val *value = properties_doc
+                    ? yyjson_obj_get(yyjson_doc_get_root(properties_doc), "filegroup_path") : NULL;
+                if (value && yyjson_is_str(value)) filegroup_path = yyjson_get_str(value);
+            }
+            char *repo_file = normalize_module_file_path(module_file, filegroup_path,
+                                                         declared, pass == 0);
+            char *workspace_path = repo_file
+                ? workspace_file_path(&(cbm_aosp_repo_t){.path = (char *)repo_path}, repo_file)
+                : strdup("");
+            yyjson_doc_free(properties_doc);
+            if (!workspace_path) {
+                free(repo_file);
+                goto done;
+            }
+            const char *status = "invalid_path";
+            char *file_global_id = NULL;
+            char generated_id[65] = {0};
+            int candidate_count = 0;
+            int symbol_count = 0;
+            bool physical_exists = false;
+            if (repo_file) {
+                size_t abs_size = strlen(repo_abs ? repo_abs : "") + strlen(repo_file) + 2;
+                char *absolute = malloc(abs_size);
+                if (!absolute) {
+                    free(repo_file);
+                    free(workspace_path);
+                    goto done;
+                }
+                (void)snprintf(absolute, abs_size, "%s/%s", repo_abs ? repo_abs : "", repo_file);
+                physical_exists = cbm_file_exists(absolute);
+                free(absolute);
+                if (strcmp(role, "OUTPUT") == 0) {
+                    generated_file_id(workspace->workspace_id, module_id_value, repo_file,
+                                      generated_id);
+                    status = "generated";
+                    sqlite3_reset(insert_generated);
+                    sqlite3_clear_bindings(insert_generated);
+                    sqlite3_bind_text(insert_generated, 1, generated_id, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 2, workspace->workspace_id,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 3, repo_id, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 4, module_id_value, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 5, declared, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 6, workspace_path, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_generated, 7,
+                                      declaration_properties ? declaration_properties : "{}",
+                                      -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(insert_generated) != SQLITE_DONE) {
+                        free(repo_file);
+                        free(workspace_path);
+                        goto done;
+                    }
+                } else if (!physical_exists) {
+                    status = "file_not_found";
+                } else if (!repo_status || strcmp(repo_status, "indexed") != 0) {
+                    status = "repository_unindexed";
+                } else {
+                    sqlite3_reset(file_candidates);
+                    sqlite3_clear_bindings(file_candidates);
+                    sqlite3_bind_text(file_candidates, 1, workspace->workspace_id,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(file_candidates, 2, repo_id, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(file_candidates, 3, repo_file, -1, SQLITE_TRANSIENT);
+                    int candidate_step = SQLITE_OK;
+                    while ((candidate_step = sqlite3_step(file_candidates)) == SQLITE_ROW) {
+                        if (candidate_count == 0) {
+                            const char *id = (const char *)sqlite3_column_text(file_candidates, 0);
+                            file_global_id = strdup(id ? id : "");
+                            if (!file_global_id) {
+                                free(repo_file);
+                                free(workspace_path);
+                                goto done;
+                            }
+                        }
+                        candidate_count++;
+                    }
+                    if (candidate_step != SQLITE_DONE) {
+                        free(file_global_id);
+                        free(repo_file);
+                        free(workspace_path);
+                        goto done;
+                    }
+                    status = candidate_count == 1 ? "resolved" :
+                             (candidate_count > 1 ? "ambiguous" : "symbol_not_found");
+                    if (candidate_count != 1) {
+                        free(file_global_id);
+                        file_global_id = NULL;
+                    } else {
+                        sqlite3_reset(symbol_candidates);
+                        sqlite3_clear_bindings(symbol_candidates);
+                        sqlite3_bind_text(symbol_candidates, 1, workspace->workspace_id,
+                                          -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_text(symbol_candidates, 2, repo_id, -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_text(symbol_candidates, 3, repo_file, -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_text(symbol_candidates, 4,
+                            strcmp(role, "DEFINITION") == 0 ? module_name : "",
+                            -1, SQLITE_TRANSIENT);
+                        int symbol_step = SQLITE_OK;
+                        while ((symbol_step = sqlite3_step(symbol_candidates)) == SQLITE_ROW) {
+                            const char *symbol_id =
+                                (const char *)sqlite3_column_text(symbol_candidates, 0);
+                            sqlite3_reset(insert_symbol);
+                            sqlite3_clear_bindings(insert_symbol);
+                            sqlite3_bind_text(insert_symbol, 1, module_id_value,
+                                              -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_text(insert_symbol, 2, file_global_id,
+                                              -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_text(insert_symbol, 3, symbol_id, -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_text(insert_symbol, 4,
+                                strcmp(role, "DEFINITION") == 0
+                                    ? "BUILD_DEFINITION" : "SOURCE_DEFINITION",
+                                -1, SQLITE_TRANSIENT);
+                            if (sqlite3_step(insert_symbol) != SQLITE_DONE) {
+                                free(file_global_id);
+                                free(repo_file);
+                                free(workspace_path);
+                                goto done;
+                            }
+                            symbol_count++;
+                        }
+                        if (symbol_step != SQLITE_DONE) {
+                            free(file_global_id);
+                            free(repo_file);
+                            free(workspace_path);
+                            goto done;
+                        }
+                    }
+                }
+            }
+            char *link_properties = file_link_properties_json(
+                repo_file, candidate_count, physical_exists, symbol_count,
+                declaration_properties ? declaration_properties : "{}");
+            if (!link_properties) {
+                free(file_global_id);
+                free(repo_file);
+                free(workspace_path);
+                goto done;
+            }
+            sqlite3_reset(insert_file_link);
+            sqlite3_clear_bindings(insert_file_link);
+            sqlite3_bind_text(insert_file_link, 1, module_id_value, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_file_link, 2, declared, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_file_link, 3, role, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_file_link, 4, workspace_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_file_link, 5, repo_id, -1, SQLITE_TRANSIENT);
+            if (file_global_id) sqlite3_bind_text(insert_file_link, 6, file_global_id,
+                                                  -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_null(insert_file_link, 6);
+            if (generated_id[0]) sqlite3_bind_text(insert_file_link, 7, generated_id,
+                                                   -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_null(insert_file_link, 7);
+            sqlite3_bind_text(insert_file_link, 8, status, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_file_link, 9, link_properties, -1, SQLITE_TRANSIENT);
+            int step = sqlite3_step(insert_file_link);
+            free(link_properties);
+            free(file_global_id);
+            free(repo_file);
+            free(workspace_path);
+            if (step != SQLITE_DONE) goto done;
+        }
+        if (rows_step != SQLITE_DONE) goto done;
+    }
+
+    if (sqlite3_prepare_v2(db,
+            "SELECT d.source_id,d.target_id,d.type,d.properties FROM module_dependencies d "
+            "WHERE d.resolved=1 AND EXISTS(SELECT 1 FROM build_generated_files g "
+            "WHERE g.producer_id=d.target_id) AND d.source_id IN "
+            "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+            -1, &dependencies, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "SELECT generated_id,declared_path FROM build_generated_files "
+            "WHERE producer_id=?1;", -1, &generated_candidates, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO module_generated_links(source_id,target_module_id,"
+            "dependency_type,output_tag,generated_id,status,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1,
+            &insert_generated_link, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(dependencies, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    int dependency_step = SQLITE_OK;
+    while ((dependency_step = sqlite3_step(dependencies)) == SQLITE_ROW) {
+        const char *source_id = (const char *)sqlite3_column_text(dependencies, 0);
+        const char *target_id = (const char *)sqlite3_column_text(dependencies, 1);
+        const char *dependency_type = (const char *)sqlite3_column_text(dependencies, 2);
+        const char *properties = (const char *)sqlite3_column_text(dependencies, 3);
+        yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+        yyjson_val *tags = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "output_tags") : NULL;
+        size_t tag_count = tags && yyjson_is_arr(tags) ? yyjson_arr_size(tags) : 0;
+        for (size_t tag_index = 0; tag_index < (tag_count ? tag_count : 1); tag_index++) {
+            yyjson_val *tag_value = tag_count ? yyjson_arr_get(tags, tag_index) : NULL;
+            const char *tag = tag_value && yyjson_is_str(tag_value) ? yyjson_get_str(tag_value) : "";
+            sqlite3_reset(generated_candidates);
+            sqlite3_clear_bindings(generated_candidates);
+            sqlite3_bind_text(generated_candidates, 1, target_id, -1, SQLITE_TRANSIENT);
+            int candidate_count = 0;
+            char *generated_id_value = NULL;
+            int generated_step = SQLITE_OK;
+            while ((generated_step = sqlite3_step(generated_candidates)) == SQLITE_ROW) {
+                const char *candidate_path =
+                    (const char *)sqlite3_column_text(generated_candidates, 1);
+                bool matches = !tag[0] || (tag[0] == '.' && path_has_suffix(candidate_path, tag)) ||
+                               strcmp(candidate_path ? candidate_path : "", tag) == 0;
+                if (!matches) continue;
+                if (candidate_count == 0) {
+                    const char *id =
+                        (const char *)sqlite3_column_text(generated_candidates, 0);
+                    generated_id_value = strdup(id ? id : "");
+                    if (!generated_id_value) {
+                        yyjson_doc_free(doc);
+                        goto done;
+                    }
+                }
+                candidate_count++;
+            }
+            if (generated_step != SQLITE_DONE) {
+                free(generated_id_value);
+                yyjson_doc_free(doc);
+                goto done;
+            }
+            const char *status = candidate_count == 1 ? "resolved" :
+                                 (candidate_count > 1 ? "ambiguous" : "output_not_found");
+            if (candidate_count != 1) {
+                free(generated_id_value);
+                generated_id_value = NULL;
+            }
+            yyjson_mut_doc *prop_doc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *prop_root = prop_doc ? yyjson_mut_obj(prop_doc) : NULL;
+            if (!prop_doc || !prop_root) {
+                yyjson_mut_doc_free(prop_doc);
+                free(generated_id_value);
+                yyjson_doc_free(doc);
+                goto done;
+            }
+            yyjson_mut_doc_set_root(prop_doc, prop_root);
+            yyjson_mut_obj_add_int(prop_doc, prop_root, "candidate_count", candidate_count);
+            size_t json_length = 0;
+            char *link_properties = yyjson_mut_write(prop_doc, 0, &json_length);
+            yyjson_mut_doc_free(prop_doc);
+            if (!link_properties) {
+                free(generated_id_value);
+                yyjson_doc_free(doc);
+                goto done;
+            }
+            sqlite3_reset(insert_generated_link);
+            sqlite3_clear_bindings(insert_generated_link);
+            sqlite3_bind_text(insert_generated_link, 1, source_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_generated_link, 2, target_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_generated_link, 3, dependency_type, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_generated_link, 4, tag, -1, SQLITE_TRANSIENT);
+            if (generated_id_value) sqlite3_bind_text(insert_generated_link, 5,
+                                                       generated_id_value, -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_null(insert_generated_link, 5);
+            sqlite3_bind_text(insert_generated_link, 6, status, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_generated_link, 7, link_properties, -1, SQLITE_TRANSIENT);
+            int step = sqlite3_step(insert_generated_link);
+            free(link_properties);
+            free(generated_id_value);
+            if (step != SQLITE_DONE) {
+                yyjson_doc_free(doc);
+                goto done;
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+    if (dependency_step != SQLITE_DONE) goto done;
+    rc = 0;
+done:
+    if (rc != 0) bg_error(err, err_size, "cannot link AOSP build files", sqlite3_errmsg(db));
+    sqlite3_finalize(clear);
+    sqlite3_finalize(files);
+    sqlite3_finalize(modules);
+    sqlite3_finalize(file_candidates);
+    sqlite3_finalize(symbol_candidates);
+    sqlite3_finalize(insert_file_link);
+    sqlite3_finalize(insert_generated);
+    sqlite3_finalize(insert_symbol);
+    sqlite3_finalize(dependencies);
+    sqlite3_finalize(generated_candidates);
+    sqlite3_finalize(insert_generated_link);
+    return rc;
+}
+
 static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t *contexts,
                                int context_count, char *err, size_t err_size) {
     char path[BG_PATH_MAX];
@@ -4278,6 +4771,23 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_step(reset) != SQLITE_DONE) goto fail;
     sqlite3_finalize(reset);
     reset = NULL;
+    const char *build_link_reset_sql[] = {
+        "DELETE FROM module_symbol_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM module_generated_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM module_file_links WHERE source_id IN "
+        "(SELECT module_id FROM modules WHERE workspace_id=?1);",
+        "DELETE FROM build_generated_files WHERE workspace_id=?1;",
+    };
+    for (size_t i = 0; i < sizeof(build_link_reset_sql) / sizeof(build_link_reset_sql[0]); i++) {
+        if (sqlite3_prepare_v2(db, build_link_reset_sql[i], -1, &stmt, NULL) != SQLITE_OK)
+            goto fail;
+        sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
     if (sqlite3_prepare_v2(db,
             "DELETE FROM module_files WHERE source_id IN "
             "(SELECT module_id FROM modules WHERE workspace_id=?1);", -1, &stmt, NULL) != SQLITE_OK)
@@ -4813,6 +5323,7 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (link_build_files(db, workspace, err, err_size) != 0) goto fail;
     if (sqlite3_exec(db, "COMMIT;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
     sqlite3_close(db);
     return 0;
@@ -4933,7 +5444,28 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "((SELECT coalesce(sum(json_array_length(coverage_gaps)),0) FROM build_bazel_artifacts WHERE workspace_id=?1) + "
         " (SELECT coalesce(sum(json_array_length(properties,'$.coverage_gaps')),0) FROM build_bazel_targets WHERE workspace_id=?1) + "
         " (SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1 AND status!='resolved') + "
-        " (SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status!='resolved'));";
+        " (SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status!='resolved')) ,"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1),"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status IN('resolved','generated')) ,"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status NOT IN('resolved','generated')) ,"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status='ambiguous'),"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status IN('file_not_found','symbol_not_found','invalid_path')) ,"
+        "(SELECT count(*) FROM module_file_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status='repository_unindexed'),"
+        "(SELECT count(*) FROM build_generated_files WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM module_generated_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1),"
+        "(SELECT count(*) FROM module_generated_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status='resolved'),"
+        "(SELECT count(*) FROM module_generated_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1 AND l.status!='resolved'),"
+        "(SELECT count(*) FROM module_symbol_links l JOIN modules m ON m.module_id=l.source_id "
+        "WHERE m.workspace_id=?1);";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -4985,6 +5517,17 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->bazel_ambiguous_count = sqlite3_column_int(stmt, 41);
             stats->bazel_missing_count = sqlite3_column_int(stmt, 42);
             stats->bazel_coverage_gap_count = sqlite3_column_int(stmt, 43);
+            stats->file_link_count = sqlite3_column_int(stmt, 44);
+            stats->file_link_resolved_count = sqlite3_column_int(stmt, 45);
+            stats->file_link_unresolved_count = sqlite3_column_int(stmt, 46);
+            stats->file_link_ambiguous_count = sqlite3_column_int(stmt, 47);
+            stats->file_link_missing_count = sqlite3_column_int(stmt, 48);
+            stats->file_link_unindexed_count = sqlite3_column_int(stmt, 49);
+            stats->generated_file_count = sqlite3_column_int(stmt, 50);
+            stats->generated_link_count = sqlite3_column_int(stmt, 51);
+            stats->generated_link_resolved_count = sqlite3_column_int(stmt, 52);
+            stats->generated_link_unresolved_count = sqlite3_column_int(stmt, 53);
+            stats->definition_symbol_link_count = sqlite3_column_int(stmt, 54);
             rc = 0;
         }
     }

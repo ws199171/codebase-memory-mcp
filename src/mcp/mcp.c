@@ -8524,6 +8524,25 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "bazel_missing", stats.bazel_missing_count);
     yyjson_mut_obj_add_int(doc, root, "bazel_coverage_gaps",
                            stats.bazel_coverage_gap_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links", stats.file_link_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links_resolved",
+                           stats.file_link_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links_unresolved",
+                           stats.file_link_unresolved_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links_ambiguous",
+                           stats.file_link_ambiguous_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links_missing", stats.file_link_missing_count);
+    yyjson_mut_obj_add_int(doc, root, "file_links_unindexed",
+                           stats.file_link_unindexed_count);
+    yyjson_mut_obj_add_int(doc, root, "generated_files", stats.generated_file_count);
+    yyjson_mut_obj_add_int(doc, root, "generated_file_links",
+                           stats.generated_link_count);
+    yyjson_mut_obj_add_int(doc, root, "generated_file_links_resolved",
+                           stats.generated_link_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "generated_file_links_unresolved",
+                           stats.generated_link_unresolved_count);
+    yyjson_mut_obj_add_int(doc, root, "definition_symbol_links",
+                           stats.definition_symbol_link_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

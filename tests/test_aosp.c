@@ -544,6 +544,51 @@ static int create_bazel_mixed_build_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_build_file_links_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_file_links_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "app/src") != 0 ||
+        make_dir(root, "vendor") != 0 || make_dir(root, "unindexed") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"platform/app\" path=\"app\"/>"
+            "<project name=\"vendor/generated\" path=\"vendor\"/>"
+            "<project name=\"platform/unindexed\" path=\"unindexed\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "app/Android.bp",
+            "filegroup { name: \"linked_files\", path: \"src\", srcs: [\"a.cpp\"] }\n"
+            "filegroup { name: \"invalid_path_group\", path: \"$(escaped)\", srcs: [\"a.cpp\"] }\n"
+            "genrule { name: \"local_gen\", out: [\"gen.cpp\", \"gen.h\"] }\n"
+            "cc_binary {\n"
+            "  name: \"linked_consumer\",\n"
+            "  srcs: [\"main.cpp\", \"missing.cpp\", \"../../escape.cpp\", "
+            "\":local_gen{.cpp}\"],\n"
+            "  generated_headers: [\":local_gen{.header}\"],\n"
+            "  generated_sources: [\"vendor_gen\"],\n"
+            "  tool_files: [\"ambiguous.py\"],\n"
+            "}\n") != 0 ||
+        write_relative(root, "app/main.cpp", "int linked_main(void) { return 1; }\n") != 0 ||
+        write_relative(root, "app/src/a.cpp", "int linked_a(void) { return 2; }\n") != 0 ||
+        write_relative(root, "app/ambiguous.py", "def tool(): return 1\n") != 0 ||
+        write_relative(root, "vendor/Android.bp",
+            "genrule { name: \"vendor_gen\", out: [\"vendor.out\"] }\n") != 0 ||
+        write_relative(root, "unindexed/Android.bp",
+            "cc_library { name: \"unindexed_lib\", srcs: [\"unindexed.cpp\"] }\n") != 0 ||
+        write_relative(root, "unindexed/unindexed.cpp",
+            "int unindexed_symbol(void) { return 3; }\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2891,6 +2936,197 @@ TEST(aosp_build_graph_imports_bazel_mixed_build_metadata) {
     PASS();
 }
 
+static int catalog_build_file_link_repo(const cbm_aosp_workspace_t *workspace,
+                                        const cbm_aosp_repo_t *repo,
+                                        const char *db_path, bool vendor) {
+    sqlite3 *shard = NULL;
+    if (sqlite3_open(db_path, &shard) != SQLITE_OK) return -1;
+    const char *schema =
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+        "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);";
+    const char *app_nodes =
+        "INSERT INTO nodes VALUES"
+        "(1,'Android.bp','app.Android.bp','File','Android.bp',1,10,'{}'),"
+        "(2,'linked_files','build.linked_files','Module','Android.bp',1,1,'{}'),"
+        "(3,'local_gen','build.local_gen','Module','Android.bp',2,2,'{}'),"
+        "(4,'linked_consumer','build.linked_consumer','Module','Android.bp',3,9,'{}'),"
+        "(5,'main.cpp','app.main.cpp','File','main.cpp',1,1,'{}'),"
+        "(6,'linked_main','app.linked_main','Function','main.cpp',1,1,'{}'),"
+        "(7,'a.cpp','app.src.a.cpp','File','src/a.cpp',1,1,'{}'),"
+        "(8,'linked_a','app.linked_a','Function','src/a.cpp',1,1,'{}'),"
+        "(9,'ambiguous.py','app.ambiguous.one','File','ambiguous.py',1,1,'{}'),"
+        "(10,'ambiguous.py','app.ambiguous.two','File','ambiguous.py',1,1,'{}');";
+    const char *vendor_nodes =
+        "INSERT INTO nodes VALUES"
+        "(1,'Android.bp','vendor.Android.bp','File','Android.bp',1,1,'{}'),"
+        "(2,'vendor_gen','build.vendor_gen','Module','Android.bp',1,1,'{}');";
+    int rc = sqlite3_exec(shard, schema, NULL, NULL, NULL) == SQLITE_OK &&
+             sqlite3_exec(shard, vendor ? vendor_nodes : app_nodes,
+                          NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_close(shard);
+    if (rc != 0) return rc;
+    char err[512] = {0};
+    if (cbm_aosp_catalog_repo_db(workspace, repo, db_path, err, sizeof(err)) != 0) return -1;
+    return mark_repo_indexed(workspace, repo->repo_id, db_path);
+}
+
+TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols) {
+    char *root = NULL;
+    ASSERT_EQ(create_build_file_links_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    int cataloged = 0;
+    for (int i = 0; i < workspace.repo_count; i++) {
+        bool is_app = strcmp(workspace.repos[i].path, "app") == 0;
+        bool is_vendor = strcmp(workspace.repos[i].path, "vendor") == 0;
+        if (!is_app && !is_vendor) continue;
+        char shard_path[4096];
+        (void)snprintf(shard_path, sizeof(shard_path),
+                       "%s/b9-shard-%d.db", root, cataloged++);
+        ASSERT_EQ(catalog_build_file_link_repo(&workspace, &workspace.repos[i],
+                                               shard_path, is_vendor), 0);
+    }
+    ASSERT_EQ(cataloged, 2);
+
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.module_count, 6);
+    ASSERT_EQ(stats.file_link_count, 16);
+    ASSERT_EQ(stats.file_link_resolved_count, 10);
+    ASSERT_EQ(stats.file_link_unresolved_count, 6);
+    ASSERT_EQ(stats.file_link_ambiguous_count, 1);
+    ASSERT_EQ(stats.file_link_missing_count, 3);
+    ASSERT_EQ(stats.file_link_unindexed_count, 2);
+    ASSERT_EQ(stats.generated_file_count, 3);
+    ASSERT_EQ(stats.generated_link_count, 3);
+    ASSERT_EQ(stats.generated_link_resolved_count, 2);
+    ASSERT_EQ(stats.generated_link_unresolved_count, 1);
+    ASSERT_EQ(stats.definition_symbol_link_count, 6);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT workspace_path,status,json_extract(properties,'$.definition_symbol_count') "
+        "FROM module_file_links WHERE source_id=(SELECT module_id FROM modules "
+        "WHERE workspace_id=?1 AND name='linked_files') AND role='SOURCE';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "app/src/a.cpp");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "resolved");
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), 1);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT workspace_path,status FROM module_file_links WHERE source_id="
+        "(SELECT module_id FROM modules WHERE workspace_id=?1 "
+        "AND name='invalid_path_group') AND role='SOURCE';", -1, &stmt, NULL),
+        SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "invalid_path");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(declared_path||':'||role||':'||status,',') FROM ("
+        "SELECT declared_path,role,status FROM module_file_links WHERE source_id="
+        "(SELECT module_id FROM modules WHERE workspace_id=?1 AND name='linked_consumer') "
+        "ORDER BY role,declared_path);", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "Android.bp:DEFINITION:resolved,"
+                  "../../escape.cpp:SOURCE:invalid_path,main.cpp:SOURCE:resolved,"
+                  "missing.cpp:SOURCE:file_not_found,"
+                  "ambiguous.py:TOOL_FILE:ambiguous");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(output_tag||':'||status,',') FROM ("
+        "SELECT output_tag,status FROM module_generated_links WHERE source_id="
+        "(SELECT module_id FROM modules WHERE workspace_id=?1 AND name='linked_consumer') "
+        "ORDER BY output_tag);", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  ":resolved,.cpp:resolved,.header:output_not_found");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT r.path,g.workspace_path FROM module_generated_links l "
+        "JOIN build_generated_files g ON g.generated_id=l.generated_id "
+        "JOIN repos r ON r.repo_id=g.repo_id WHERE l.source_id="
+        "(SELECT module_id FROM modules WHERE workspace_id=?1 AND name='linked_consumer') "
+        "AND l.output_tag='';", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "vendor");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "vendor/vendor.out");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(s.name||':'||l.link_type,',') FROM module_symbol_links l "
+        "JOIN symbols s ON s.global_id=l.symbol_global_id WHERE l.source_id="
+        "(SELECT module_id FROM modules WHERE workspace_id=?1 AND name='linked_consumer') "
+        "ORDER BY s.name;", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "linked_consumer:BUILD_DEFINITION,linked_main:SOURCE_DEFINITION");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM schema_versions WHERE version=13;", -1, &stmt, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.file_link_count, 16);
+    ASSERT_EQ(stats.definition_symbol_link_count, 6);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"linked\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"file_links\":16"));
+    ASSERT_NOT_NULL(strstr(response, "\"file_links_resolved\":10"));
+    ASSERT_NOT_NULL(strstr(response, "\"generated_files\":3"));
+    ASSERT_NOT_NULL(strstr(response, "\"generated_file_links_resolved\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"definition_symbol_links\":6"));
+    free(response);
+
+    ASSERT_EQ(write_relative(root, "unindexed/Android.bp", "// module removed\n"), 0);
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.module_count, 5);
+    ASSERT_EQ(stats.file_link_count, 14);
+    ASSERT_EQ(stats.file_link_unindexed_count, 0);
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM module_file_links l "
+        "LEFT JOIN modules m ON m.module_id=l.source_id WHERE m.module_id IS NULL;",
+        -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -4020,6 +4256,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_evaluates_common_android_make_semantics);
     RUN_TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership);
     RUN_TEST(aosp_build_graph_imports_bazel_mixed_build_metadata);
+    RUN_TEST(aosp_build_graph_links_files_generated_outputs_and_definition_symbols);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

@@ -50,6 +50,17 @@ typedef struct {
     int bazel_ambiguous_count;
     int bazel_missing_count;
     int bazel_coverage_gap_count;
+    int file_link_count;
+    int file_link_resolved_count;
+    int file_link_unresolved_count;
+    int file_link_ambiguous_count;
+    int file_link_missing_count;
+    int file_link_unindexed_count;
+    int generated_file_count;
+    int generated_link_count;
+    int generated_link_resolved_count;
+    int generated_link_unresolved_count;
+    int definition_symbol_link_count;
     int blueprint_files;
     int make_files;
     int product_make_files;

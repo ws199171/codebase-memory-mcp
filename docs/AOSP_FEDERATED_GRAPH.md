@@ -326,8 +326,41 @@ Literal file declarations and tagged dependencies inherited through defaults kee
 the same variant and inheritance provenance as other build relationships.
 
 Master schema v9 adds `module_files`, keyed by module, declared path, and role.
-This table records build declarations only; linking those declarations to indexed
-source and generated `File` nodes remains a later build-graph task.
+This table remains the declaration layer; schema v13 adds the resolved links
+described below without changing the original evidence.
+
+## Build Files, Outputs, And Definitions
+
+B9 resolves module definition files and literal `SOURCE` and `TOOL_FILE`
+declarations against the Master symbol catalog. Declared paths are relative to
+the module's build-file directory; a filegroup's `path` is applied before its
+source paths. `.` and `..` components are normalized lexically, but a path that
+escapes its manifest project, is absolute, or retains a Make expression is
+rejected as `invalid_path`.
+
+A physical path links to a catalog `File` only when the repository is indexed and
+there is exactly one `File` row with the same repository-relative path. The
+stored states distinguish `resolved`, `file_not_found`, `repository_unindexed`,
+`symbol_not_found`, `ambiguous`, and `invalid_path`. Each resolved source/tool
+file links the module to all definition symbols cataloged in that exact file.
+Build-file symbols are narrower: the symbol must also have the module's exact
+Soong-visible name, preventing unrelated declarations in the same `Android.bp` or
+`Android.mk` from being attached to the module.
+
+Every `OUTPUT` declaration receives a stable generated-file ID scoped by the
+workspace, producer module, and normalized output path. A resolved module
+dependency can link to one of those outputs. An empty output tag requires the
+producer to have one output; a dot-prefixed tag matches an exact path suffix, and
+other tags match the declared output path. Zero or multiple matches remain
+`output_not_found` or `ambiguous`. This applies across manifest repositories once
+the producer module dependency itself has resolved.
+
+Master schema v13 adds `module_file_links`, `build_generated_files`,
+`module_generated_links`, and `module_symbol_links`. Link refresh is part of the
+same transaction that replaces the module graph, including cleanup for modules
+removed by the current scan. CLI and MCP architecture coverage report physical
+file resolution, missing/unindexed/ambiguous states, generated-output consumer
+links, and definition-symbol links.
 
 ## Android Make Evaluation
 
