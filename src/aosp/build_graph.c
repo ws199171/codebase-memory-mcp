@@ -152,6 +152,47 @@ typedef struct {
 } board_config_vec_t;
 
 typedef struct {
+    char *label;
+    char *configuration;
+    char *type;
+    char *transition;
+    char *status;
+    char *source_module_id;
+    char *target_module_id;
+    int candidate_count;
+} bazel_dependency_decl_t;
+
+typedef struct {
+    char *label;
+    char *configuration;
+    char *kind;
+    char *module_name;
+    char *module_id;
+    char *status;
+    int candidate_count;
+    bazel_dependency_decl_t *dependencies;
+    int dependency_count;
+    int dependency_cap;
+    str_vec_t coverage_gaps;
+} bazel_target_decl_t;
+
+typedef struct {
+    char *file_path;
+    int format_version;
+    char *configuration;
+    bazel_target_decl_t *targets;
+    int target_count;
+    int target_cap;
+    str_vec_t coverage_gaps;
+} bazel_artifact_decl_t;
+
+typedef struct {
+    bazel_artifact_decl_t *items;
+    int count;
+    int cap;
+} bazel_artifact_vec_t;
+
+typedef struct {
     char *name;
     char *type;
     char *file_path;
@@ -238,6 +279,7 @@ typedef struct {
     make_file_vec_t make_files;
     product_vec_t products;
     board_config_vec_t board_configs;
+    bazel_artifact_vec_t bazel_artifacts;
     cbm_aosp_build_stats_t stats;
     char *err;
     size_t err_size;
@@ -466,6 +508,309 @@ static void board_config_vec_free(board_config_vec_t *vec) {
     for (int i = 0; i < vec->count; i++) board_config_free(&vec->items[i]);
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
+}
+
+static void bazel_dependency_free(bazel_dependency_decl_t *dependency) {
+    if (!dependency) return;
+    free(dependency->label);
+    free(dependency->configuration);
+    free(dependency->type);
+    free(dependency->transition);
+    free(dependency->status);
+    free(dependency->source_module_id);
+    free(dependency->target_module_id);
+    memset(dependency, 0, sizeof(*dependency));
+}
+
+static void bazel_target_free(bazel_target_decl_t *target) {
+    if (!target) return;
+    free(target->label);
+    free(target->configuration);
+    free(target->kind);
+    free(target->module_name);
+    free(target->module_id);
+    free(target->status);
+    for (int i = 0; i < target->dependency_count; i++) {
+        bazel_dependency_free(&target->dependencies[i]);
+    }
+    free(target->dependencies);
+    str_vec_free(&target->coverage_gaps);
+    memset(target, 0, sizeof(*target));
+}
+
+static void bazel_artifact_vec_free(bazel_artifact_vec_t *vec) {
+    if (!vec) return;
+    for (int i = 0; i < vec->count; i++) {
+        bazel_artifact_decl_t *artifact = &vec->items[i];
+        free(artifact->file_path);
+        free(artifact->configuration);
+        for (int t = 0; t < artifact->target_count; t++) {
+            bazel_target_free(&artifact->targets[t]);
+        }
+        free(artifact->targets);
+        str_vec_free(&artifact->coverage_gaps);
+    }
+    free(vec->items);
+    memset(vec, 0, sizeof(*vec));
+}
+
+static char *canonical_bazel_label(const char *label, const char *source_label) {
+    if (!label || !label[0] || strstr(label, "..") || strpbrk(label, " \t\r\n")) return NULL;
+    char *expanded = NULL;
+    if (label[0] == ':' && source_label && strncmp(source_label, "//", 2) == 0) {
+        const char *colon = strchr(source_label + 2, ':');
+        if (!colon) return NULL;
+        size_t package_length = (size_t)(colon - source_label);
+        size_t size = package_length + strlen(label) + 1;
+        expanded = malloc(size);
+        if (!expanded) return NULL;
+        (void)snprintf(expanded, size, "%.*s%s", (int)package_length, source_label, label);
+        label = expanded;
+    }
+    if (strncmp(label, "//", 2) != 0 && label[0] != '@') {
+        free(expanded);
+        return NULL;
+    }
+    const char *workspace_label = label[0] == '@' ? strstr(label, "//") : label;
+    if (!workspace_label || !workspace_label[2]) {
+        free(expanded);
+        return NULL;
+    }
+    if (strchr(workspace_label + 2, ':')) {
+        char *result = strdup(label);
+        free(expanded);
+        return result;
+    }
+    const char *package = workspace_label + 2;
+    const char *leaf = strrchr(package, '/');
+    leaf = leaf ? leaf + 1 : package;
+    if (!leaf[0]) {
+        free(expanded);
+        return NULL;
+    }
+    size_t size = strlen(label) + strlen(leaf) + 2;
+    char *result = malloc(size);
+    if (result) (void)snprintf(result, size, "%s:%s", label, leaf);
+    free(expanded);
+    return result;
+}
+
+static bazel_artifact_decl_t *bazel_artifact_vec_add(bazel_artifact_vec_t *vec,
+                                                      const char *file_path) {
+    if (vec->count == vec->cap) {
+        int new_cap = vec->cap ? vec->cap * 2 : 4;
+        bazel_artifact_decl_t *items =
+            realloc(vec->items, (size_t)new_cap * sizeof(*items));
+        if (!items) return NULL;
+        vec->items = items;
+        vec->cap = new_cap;
+    }
+    bazel_artifact_decl_t *artifact = &vec->items[vec->count];
+    memset(artifact, 0, sizeof(*artifact));
+    artifact->file_path = strdup(file_path);
+    if (!artifact->file_path) return NULL;
+    vec->count++;
+    return artifact;
+}
+
+static bazel_target_decl_t *bazel_artifact_add_target(bazel_artifact_decl_t *artifact) {
+    if (artifact->target_count == artifact->target_cap) {
+        int new_cap = artifact->target_cap ? artifact->target_cap * 2 : 16;
+        bazel_target_decl_t *targets =
+            realloc(artifact->targets, (size_t)new_cap * sizeof(*targets));
+        if (!targets) return NULL;
+        artifact->targets = targets;
+        artifact->target_cap = new_cap;
+    }
+    bazel_target_decl_t *target = &artifact->targets[artifact->target_count++];
+    memset(target, 0, sizeof(*target));
+    return target;
+}
+
+static bazel_dependency_decl_t *bazel_target_add_dependency(bazel_target_decl_t *target) {
+    if (target->dependency_count == target->dependency_cap) {
+        int new_cap = target->dependency_cap ? target->dependency_cap * 2 : 8;
+        bazel_dependency_decl_t *dependencies =
+            realloc(target->dependencies, (size_t)new_cap * sizeof(*dependencies));
+        if (!dependencies) return NULL;
+        target->dependencies = dependencies;
+        target->dependency_cap = new_cap;
+    }
+    bazel_dependency_decl_t *dependency = &target->dependencies[target->dependency_count++];
+    memset(dependency, 0, sizeof(*dependency));
+    return dependency;
+}
+
+static const char *json_optional_string(yyjson_val *object, const char *key,
+                                        const char *fallback) {
+    yyjson_val *value = yyjson_obj_get(object, key);
+    return value && yyjson_is_str(value) ? yyjson_get_str(value) : fallback;
+}
+
+static bool add_json_string_gaps(str_vec_t *gaps, yyjson_val *values) {
+    if (!values) return true;
+    if (!yyjson_is_arr(values)) return str_vec_add(gaps, "invalid_unsupported_metadata");
+    size_t index, max;
+    yyjson_val *value;
+    yyjson_arr_foreach(values, index, max, value) {
+        if (yyjson_is_str(value)) {
+            if (!str_vec_add(gaps, yyjson_get_str(value))) return false;
+        } else if (!str_vec_add(gaps, "invalid_unsupported_metadata_entry")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_bazel_metadata(scan_ctx_t *ctx, const char *source, size_t length,
+                                 const char *file_path) {
+    yyjson_doc *doc = yyjson_read(source, length, 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *schema = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "schema") : NULL;
+    yyjson_val *version = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "version") : NULL;
+    yyjson_val *targets = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "targets") : NULL;
+    if (!root || !yyjson_is_obj(root) || !schema || !yyjson_is_str(schema) ||
+        strcmp(yyjson_get_str(schema), "aosp_mixed_build_metadata") != 0 ||
+        !version || !yyjson_is_int(version) || !targets || !yyjson_is_arr(targets)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    bazel_artifact_decl_t *artifact = bazel_artifact_vec_add(&ctx->bazel_artifacts, file_path);
+    if (!artifact) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    artifact->format_version = (int)yyjson_get_int(version);
+    artifact->configuration = strdup(json_optional_string(root, "configuration", ""));
+    if (!artifact->configuration ||
+        !add_json_string_gaps(&artifact->coverage_gaps, yyjson_obj_get(root, "unsupported"))) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (artifact->format_version != 1) {
+        char gap[64];
+        (void)snprintf(gap, sizeof(gap), "unsupported_format_version:%d",
+                       artifact->format_version);
+        bool ok = str_vec_add(&artifact->coverage_gaps, gap);
+        yyjson_doc_free(doc);
+        return ok;
+    }
+    size_t target_index, target_max;
+    yyjson_val *target_value;
+    yyjson_arr_foreach(targets, target_index, target_max, target_value) {
+        yyjson_val *label_value = yyjson_is_obj(target_value)
+                                      ? yyjson_obj_get(target_value, "label") : NULL;
+        yyjson_val *module_value = yyjson_is_obj(target_value)
+                                       ? yyjson_obj_get(target_value, "module_name") : NULL;
+        if (!label_value || !yyjson_is_str(label_value) ||
+            !module_value || !yyjson_is_str(module_value) ||
+            !yyjson_get_str(module_value)[0]) {
+            char gap[64];
+            (void)snprintf(gap, sizeof(gap), "invalid_target:%llu",
+                           (unsigned long long)target_index);
+            if (!str_vec_add(&artifact->coverage_gaps, gap)) {
+                yyjson_doc_free(doc);
+                return false;
+            }
+            continue;
+        }
+        char *label = canonical_bazel_label(yyjson_get_str(label_value), NULL);
+        if (!label) {
+            char gap[96];
+            (void)snprintf(gap, sizeof(gap), "invalid_target_label:%llu",
+                           (unsigned long long)target_index);
+            if (!str_vec_add(&artifact->coverage_gaps, gap)) {
+                yyjson_doc_free(doc);
+                return false;
+            }
+            continue;
+        }
+        const char *configuration = json_optional_string(
+            target_value, "configuration", artifact->configuration);
+        bool duplicate = false;
+        for (int i = 0; i < artifact->target_count; i++) {
+            if (strcmp(artifact->targets[i].label, label) == 0 &&
+                strcmp(artifact->targets[i].configuration, configuration) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            size_t size = strlen(label) + strlen(configuration) + 32;
+            char *gap = malloc(size);
+            if (gap) (void)snprintf(gap, size, "duplicate_target:%s[%s]", label, configuration);
+            bool ok = gap && str_vec_add(&artifact->coverage_gaps, gap);
+            free(gap);
+            free(label);
+            if (!ok) {
+                yyjson_doc_free(doc);
+                return false;
+            }
+            continue;
+        }
+        bazel_target_decl_t *target = bazel_artifact_add_target(artifact);
+        if (!target) {
+            free(label);
+            yyjson_doc_free(doc);
+            return false;
+        }
+        target->label = label;
+        target->configuration = strdup(configuration);
+        target->kind = strdup(json_optional_string(target_value, "kind", "unknown"));
+        target->module_name = strdup(yyjson_get_str(module_value));
+        if (!target->configuration || !target->kind || !target->module_name ||
+            !add_json_string_gaps(&target->coverage_gaps,
+                                  yyjson_obj_get(target_value, "unsupported"))) {
+            yyjson_doc_free(doc);
+            return false;
+        }
+        yyjson_val *dependencies = yyjson_obj_get(target_value, "dependencies");
+        if (!dependencies) continue;
+        if (!yyjson_is_arr(dependencies)) {
+            if (!str_vec_add(&target->coverage_gaps, "invalid_dependencies")) {
+                yyjson_doc_free(doc);
+                return false;
+            }
+            continue;
+        }
+        size_t dep_index, dep_max;
+        yyjson_val *dep_value;
+        yyjson_arr_foreach(dependencies, dep_index, dep_max, dep_value) {
+            const char *dep_label = yyjson_is_str(dep_value) ? yyjson_get_str(dep_value) :
+                (yyjson_is_obj(dep_value) ? json_optional_string(dep_value, "label", NULL) : NULL);
+            char *normalized = canonical_bazel_label(dep_label, target->label);
+            if (!normalized) {
+                char gap[64];
+                (void)snprintf(gap, sizeof(gap), "invalid_dependency:%llu",
+                               (unsigned long long)dep_index);
+                if (!str_vec_add(&target->coverage_gaps, gap)) {
+                    yyjson_doc_free(doc);
+                    return false;
+                }
+                continue;
+            }
+            bazel_dependency_decl_t *dependency = bazel_target_add_dependency(target);
+            if (!dependency) {
+                free(normalized);
+                yyjson_doc_free(doc);
+                return false;
+            }
+            dependency->label = normalized;
+            dependency->configuration = strdup(yyjson_is_obj(dep_value)
+                ? json_optional_string(dep_value, "configuration", "") : "");
+            dependency->type = strdup(yyjson_is_obj(dep_value)
+                ? json_optional_string(dep_value, "type", "BAZEL_DEPENDENCY")
+                : "BAZEL_DEPENDENCY");
+            dependency->transition = strdup(yyjson_is_obj(dep_value)
+                ? json_optional_string(dep_value, "transition", "") : "");
+            if (!dependency->configuration || !dependency->type || !dependency->transition) {
+                yyjson_doc_free(doc);
+                return false;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return true;
 }
 
 static bp_var_t *bp_var_find(const bp_var_vec_t *vars, const char *name) {
@@ -3432,6 +3777,137 @@ static bool resolve_product_packages(scan_ctx_t *contexts, int context_count,
     return true;
 }
 
+static int collect_modules_by_name(const module_index_t *index, const char *name,
+                                   module_index_item_t **first) {
+    int count = 0;
+    *first = NULL;
+    for (int i = 0; i < index->count; i++) {
+        if (strcmp(index->items[i].name, name) == 0) {
+            if (count == 0) *first = &index->items[i];
+            count++;
+        }
+    }
+    return count;
+}
+
+static int collect_bazel_targets(scan_ctx_t *contexts, int context_count,
+                                 const char *label, const char *configuration,
+                                 scan_ctx_t **first_ctx, bazel_target_decl_t **first_target) {
+    int count = 0;
+    *first_ctx = NULL;
+    *first_target = NULL;
+    for (int c = 0; c < context_count; c++) {
+        for (int a = 0; a < contexts[c].bazel_artifacts.count; a++) {
+            bazel_artifact_decl_t *artifact = &contexts[c].bazel_artifacts.items[a];
+            for (int t = 0; t < artifact->target_count; t++) {
+                bazel_target_decl_t *target = &artifact->targets[t];
+                if (strcmp(target->label, label) != 0 ||
+                    (configuration && configuration[0] &&
+                     strcmp(target->configuration, configuration) != 0)) {
+                    continue;
+                }
+                if (count == 0) {
+                    *first_ctx = &contexts[c];
+                    *first_target = target;
+                }
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+static bool set_bazel_status(char **target, const char *status) {
+    free(*target);
+    *target = strdup(status);
+    return *target != NULL;
+}
+
+static bool resolve_bazel_metadata(scan_ctx_t *contexts, int context_count,
+                                   const module_index_t *index) {
+    for (int c = 0; c < context_count; c++) {
+        for (int a = 0; a < contexts[c].bazel_artifacts.count; a++) {
+            bazel_artifact_decl_t *artifact = &contexts[c].bazel_artifacts.items[a];
+            for (int t = 0; t < artifact->target_count; t++) {
+                bazel_target_decl_t *target = &artifact->targets[t];
+                if (target->label[0] == '@') {
+                    target->candidate_count = 0;
+                    if (!set_bazel_status(&target->status, "external_repository") ||
+                        !str_vec_add_unique(&target->coverage_gaps,
+                                            "external_repository_target")) {
+                        return false;
+                    }
+                    continue;
+                }
+                module_index_item_t *module = NULL;
+                target->candidate_count = collect_modules_by_name(index, target->module_name,
+                                                                   &module);
+                const char *status = target->candidate_count == 1 ? "resolved" :
+                    (target->candidate_count > 1 ? "module_ambiguous" : "module_not_found");
+                if (!set_bazel_status(&target->status, status)) return false;
+                if (target->candidate_count == 1) {
+                    char id[65];
+                    module_id(module->ctx->repo, module->module, id);
+                    target->module_id = strdup(id);
+                    if (!target->module_id) return false;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < context_count; c++) {
+        for (int a = 0; a < contexts[c].bazel_artifacts.count; a++) {
+            bazel_artifact_decl_t *artifact = &contexts[c].bazel_artifacts.items[a];
+            for (int t = 0; t < artifact->target_count; t++) {
+                bazel_target_decl_t *source = &artifact->targets[t];
+                for (int d = 0; d < source->dependency_count; d++) {
+                    bazel_dependency_decl_t *dependency = &source->dependencies[d];
+                    dependency->source_module_id = source->module_id
+                        ? strdup(source->module_id) : NULL;
+                    if (source->module_id && !dependency->source_module_id) return false;
+                    if (dependency->label[0] == '@') {
+                        if (!set_bazel_status(&dependency->status, "external_repository") ||
+                            !str_vec_add_unique(&source->coverage_gaps,
+                                                "external_repository_dependency")) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (!source->module_id) {
+                        const char *status = source->candidate_count > 1
+                            ? "source_module_ambiguous" : "source_module_not_found";
+                        if (!set_bazel_status(&dependency->status, status)) return false;
+                        continue;
+                    }
+                    const char *configuration = dependency->configuration[0]
+                        ? dependency->configuration : source->configuration;
+                    scan_ctx_t *target_ctx = NULL;
+                    bazel_target_decl_t *target = NULL;
+                    dependency->candidate_count = collect_bazel_targets(
+                        contexts, context_count, dependency->label, configuration,
+                        &target_ctx, &target);
+                    (void)target_ctx;
+                    if (dependency->candidate_count == 0) {
+                        if (!set_bazel_status(&dependency->status, "label_not_found")) return false;
+                    } else if (dependency->candidate_count > 1) {
+                        if (!set_bazel_status(&dependency->status, "label_ambiguous")) return false;
+                    } else if (!target->module_id) {
+                        const char *status = target->candidate_count > 1
+                            ? "target_module_ambiguous" : "target_module_not_found";
+                        if (!set_bazel_status(&dependency->status, status)) return false;
+                    } else {
+                        dependency->target_module_id = strdup(target->module_id);
+                        if (!dependency->target_module_id ||
+                            !set_bazel_status(&dependency->status, "resolved")) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, int depth) {
     if (depth > BG_MAX_WALK_DEPTH) {
         bg_error(ctx->err, ctx->err_size, "AOSP build scan depth exceeded", rel_dir);
@@ -3460,7 +3936,8 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
         bool is_any_mk = name_len > 3 && strcmp(entry->name + name_len - 3, ".mk") == 0;
         bool is_board = is_any_mk && strncmp(entry->name, "BoardConfig", 11) == 0;
         bool is_aidl = name_len > 5 && strcmp(entry->name + name_len - 5, ".aidl") == 0;
-        if (!is_bp && !is_any_mk && !is_aidl) continue;
+        bool is_bazel_metadata = strcmp(entry->name, "aosp_bazel_mixed_build.json") == 0;
+        if (!is_bp && !is_any_mk && !is_aidl && !is_bazel_metadata) continue;
         size_t length = 0;
         char *source = bg_read_file(abs_path, &length);
         if (!source) {
@@ -3476,7 +3953,10 @@ static int scan_tree(scan_ctx_t *ctx, const char *abs_dir, const char *rel_dir, 
             continue;
         }
         bool ok;
-        if (is_bp) {
+        if (is_bazel_metadata) {
+            ctx->stats.bazel_metadata_files++;
+            ok = parse_bazel_metadata(ctx, source, length, rel_path);
+        } else if (is_bp) {
             ctx->stats.blueprint_files++;
             ok = parse_blueprint(ctx, source, length, rel_path);
         } else if (is_mk) {
@@ -3673,6 +4153,45 @@ static char *string_array_json(const str_vec_t *values) {
     return json;
 }
 
+static char *bazel_target_properties_json(const bazel_target_decl_t *target) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_int(doc, object, "candidate_count", target->candidate_count);
+    yyjson_mut_val *gaps = yyjson_mut_arr(doc);
+    for (int i = 0; i < target->coverage_gaps.count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, gaps, target->coverage_gaps.items[i]);
+    }
+    yyjson_mut_obj_add_val(doc, object, "coverage_gaps", gaps);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *bazel_dependency_properties_json(const bazel_target_decl_t *source,
+                                              const bazel_dependency_decl_t *dependency) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_strcpy(doc, object, "origin", "bazel_mixed_build");
+    yyjson_mut_obj_add_strcpy(doc, object, "source_label", source->label);
+    yyjson_mut_obj_add_strcpy(doc, object, "source_configuration", source->configuration);
+    yyjson_mut_obj_add_strcpy(doc, object, "target_label", dependency->label);
+    yyjson_mut_obj_add_strcpy(doc, object, "target_configuration",
+                             dependency->configuration);
+    yyjson_mut_obj_add_strcpy(doc, object, "transition", dependency->transition);
+    yyjson_mut_obj_add_strcpy(doc, object, "resolution",
+                             dependency->status ? dependency->status : "label_not_found");
+    yyjson_mut_obj_add_int(doc, object, "candidate_count", dependency->candidate_count);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
 static char *name_value_object_json(const name_value_t *values, int count) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) return NULL;
@@ -3746,6 +4265,9 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_stmt *insert_product_inherit = NULL;
     sqlite3_stmt *insert_product_package = NULL;
     sqlite3_stmt *insert_board = NULL;
+    sqlite3_stmt *insert_bazel_artifact = NULL;
+    sqlite3_stmt *insert_bazel_target = NULL;
+    sqlite3_stmt *insert_bazel_dependency = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &sql_err) != SQLITE_OK) goto fail;
     const char *reset_sql =
         "DELETE FROM module_edges WHERE source_id IN "
@@ -3793,6 +4315,25 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     if (sqlite3_prepare_v2(db,
             "DELETE FROM build_packages WHERE workspace_id=?1;", -1, &stmt, NULL) != SQLITE_OK)
         goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM build_bazel_dependencies WHERE workspace_id=?1;",
+            -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM build_bazel_targets WHERE workspace_id=?1;",
+                           -1, &stmt, NULL) != SQLITE_OK) goto fail;
+    sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM build_bazel_artifacts WHERE workspace_id=?1;",
+                           -1, &stmt, NULL) != SQLITE_OK) goto fail;
     sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_DONE) goto fail;
     sqlite3_finalize(stmt);
@@ -3867,7 +4408,148 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
             "workspace_id,repo_id,file_path,workspace_path,device_owner,vendor_owner,variables,partitions) "
             "VALUES(?1,?2,?3,?4,?5,?6,?7,?8);", -1, &insert_board, NULL) != SQLITE_OK)
         goto fail_insert;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_bazel_artifacts("
+            "workspace_id,repo_id,file_path,format_version,configuration,target_count,coverage_gaps) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &insert_bazel_artifact, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_bazel_targets("
+            "workspace_id,repo_id,artifact_path,label,configuration,kind,module_name,module_id,status,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);", -1,
+            &insert_bazel_target, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO build_bazel_dependencies("
+            "workspace_id,source_repo_id,artifact_path,source_label,source_configuration,"
+            "target_label,target_configuration,dependency_type,transition,source_module_id,"
+            "target_module_id,status,properties) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);", -1,
+            &insert_bazel_dependency, NULL) != SQLITE_OK)
+        goto fail_insert;
     for (int c = 0; c < context_count; c++) {
+        for (int a = 0; a < contexts[c].bazel_artifacts.count; a++) {
+            bazel_artifact_decl_t *artifact = &contexts[c].bazel_artifacts.items[a];
+            char *artifact_gaps = string_array_json(&artifact->coverage_gaps);
+            if (!artifact_gaps) goto fail_insert;
+            sqlite3_reset(insert_bazel_artifact);
+            sqlite3_clear_bindings(insert_bazel_artifact);
+            sqlite3_bind_text(insert_bazel_artifact, 1, workspace->workspace_id,
+                              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_bazel_artifact, 2, contexts[c].repo->repo_id,
+                              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(insert_bazel_artifact, 3, artifact->file_path,
+                              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(insert_bazel_artifact, 4, artifact->format_version);
+            sqlite3_bind_text(insert_bazel_artifact, 5, artifact->configuration,
+                              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(insert_bazel_artifact, 6, artifact->target_count);
+            sqlite3_bind_text(insert_bazel_artifact, 7, artifact_gaps,
+                              -1, SQLITE_TRANSIENT);
+            int artifact_step = sqlite3_step(insert_bazel_artifact);
+            free(artifact_gaps);
+            if (artifact_step != SQLITE_DONE) goto fail_insert;
+            for (int t = 0; t < artifact->target_count; t++) {
+                bazel_target_decl_t *target = &artifact->targets[t];
+                char *target_properties = bazel_target_properties_json(target);
+                if (!target_properties) goto fail_insert;
+                sqlite3_reset(insert_bazel_target);
+                sqlite3_clear_bindings(insert_bazel_target);
+                sqlite3_bind_text(insert_bazel_target, 1, workspace->workspace_id,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 2, contexts[c].repo->repo_id,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 3, artifact->file_path,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 4, target->label,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 5, target->configuration,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 6, target->kind,
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 7, target->module_name,
+                                  -1, SQLITE_TRANSIENT);
+                if (target->module_id) {
+                    sqlite3_bind_text(insert_bazel_target, 8, target->module_id,
+                                      -1, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_null(insert_bazel_target, 8);
+                }
+                sqlite3_bind_text(insert_bazel_target, 9,
+                                  target->status ? target->status : "module_not_found",
+                                  -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(insert_bazel_target, 10, target_properties,
+                                  -1, SQLITE_TRANSIENT);
+                int target_step = sqlite3_step(insert_bazel_target);
+                free(target_properties);
+                if (target_step != SQLITE_DONE) goto fail_insert;
+                for (int d = 0; d < target->dependency_count; d++) {
+                    bazel_dependency_decl_t *dependency = &target->dependencies[d];
+                    char *dependency_properties =
+                        bazel_dependency_properties_json(target, dependency);
+                    if (!dependency_properties) goto fail_insert;
+                    sqlite3_reset(insert_bazel_dependency);
+                    sqlite3_clear_bindings(insert_bazel_dependency);
+                    sqlite3_bind_text(insert_bazel_dependency, 1, workspace->workspace_id,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 2, contexts[c].repo->repo_id,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 3, artifact->file_path,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 4, target->label,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 5, target->configuration,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 6, dependency->label,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 7, dependency->configuration,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 8, dependency->type,
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 9, dependency->transition,
+                                      -1, SQLITE_TRANSIENT);
+                    if (dependency->source_module_id) {
+                        sqlite3_bind_text(insert_bazel_dependency, 10,
+                                          dependency->source_module_id, -1, SQLITE_TRANSIENT);
+                    } else {
+                        sqlite3_bind_null(insert_bazel_dependency, 10);
+                    }
+                    if (dependency->target_module_id) {
+                        sqlite3_bind_text(insert_bazel_dependency, 11,
+                                          dependency->target_module_id, -1, SQLITE_TRANSIENT);
+                    } else {
+                        sqlite3_bind_null(insert_bazel_dependency, 11);
+                    }
+                    sqlite3_bind_text(insert_bazel_dependency, 12,
+                                      dependency->status ? dependency->status : "label_not_found",
+                                      -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(insert_bazel_dependency, 13, dependency_properties,
+                                      -1, SQLITE_TRANSIENT);
+                    int dependency_step = sqlite3_step(insert_bazel_dependency);
+                    if (dependency_step == SQLITE_DONE && dependency->source_module_id) {
+                        sqlite3_reset(insert_dep);
+                        sqlite3_clear_bindings(insert_dep);
+                        sqlite3_bind_text(insert_dep, 1, dependency->source_module_id,
+                                          -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_text(insert_dep, 2, dependency->label,
+                                          -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_text(insert_dep, 3, dependency->type,
+                                          -1, SQLITE_TRANSIENT);
+                        if (dependency->target_module_id) {
+                            sqlite3_bind_text(insert_dep, 4, dependency->target_module_id,
+                                              -1, SQLITE_TRANSIENT);
+                        } else {
+                            sqlite3_bind_null(insert_dep, 4);
+                        }
+                        sqlite3_bind_int(insert_dep, 5,
+                                         dependency->target_module_id != NULL);
+                        sqlite3_bind_text(insert_dep, 6, dependency_properties,
+                                          -1, SQLITE_TRANSIENT);
+                        dependency_step = sqlite3_step(insert_dep);
+                    }
+                    free(dependency_properties);
+                    if (dependency_step != SQLITE_DONE) goto fail_insert;
+                }
+            }
+        }
         for (int i = 0; i < contexts[c].make_files.count; i++) {
             make_file_decl_t *decl = &contexts[c].make_files.items[i];
             char *includes = string_array_json(&decl->includes);
@@ -4105,6 +4787,9 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     sqlite3_finalize(insert_product_inherit);
     sqlite3_finalize(insert_product_package);
     sqlite3_finalize(insert_board);
+    sqlite3_finalize(insert_bazel_artifact);
+    sqlite3_finalize(insert_bazel_target);
+    sqlite3_finalize(insert_bazel_dependency);
     insert_module = NULL;
     insert_dep = NULL;
     insert_file = NULL;
@@ -4115,6 +4800,9 @@ static int persist_build_graph(const cbm_aosp_workspace_t *workspace, scan_ctx_t
     insert_product_inherit = NULL;
     insert_product_package = NULL;
     insert_board = NULL;
+    insert_bazel_artifact = NULL;
+    insert_bazel_target = NULL;
+    insert_bazel_dependency = NULL;
 
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO module_edges(source_id,target_id,type,properties) "
@@ -4140,6 +4828,9 @@ fail_insert:
     sqlite3_finalize(insert_product_inherit);
     sqlite3_finalize(insert_product_package);
     sqlite3_finalize(insert_board);
+    sqlite3_finalize(insert_bazel_artifact);
+    sqlite3_finalize(insert_bazel_target);
+    sqlite3_finalize(insert_bazel_dependency);
 fail:
     sqlite3_finalize(reset);
     sqlite3_finalize(stmt);
@@ -4229,7 +4920,20 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
         "SELECT j.value AS value FROM build_products p,json_each(p.partitions) j "
         "WHERE p.workspace_id=?1 AND p.kind='product' UNION ALL "
         "SELECT j.value AS value FROM build_board_configs b,json_each(b.partitions) j "
-        "WHERE b.workspace_id=?1));";
+        "WHERE b.workspace_id=?1)),"
+        "(SELECT count(*) FROM build_bazel_artifacts WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1 AND status='resolved'),"
+        "(SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1),"
+        "(SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status='resolved'),"
+        "((SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1 AND status LIKE '%ambiguous') + "
+        " (SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status LIKE '%ambiguous')) ,"
+        "((SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1 AND status LIKE '%not_found') + "
+        " (SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status LIKE '%not_found')) ,"
+        "((SELECT coalesce(sum(json_array_length(coverage_gaps)),0) FROM build_bazel_artifacts WHERE workspace_id=?1) + "
+        " (SELECT coalesce(sum(json_array_length(properties,'$.coverage_gaps')),0) FROM build_bazel_targets WHERE workspace_id=?1) + "
+        " (SELECT count(*) FROM build_bazel_targets WHERE workspace_id=?1 AND status!='resolved') + "
+        " (SELECT count(*) FROM build_bazel_dependencies WHERE workspace_id=?1 AND status!='resolved'));";
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -4273,6 +4977,14 @@ int cbm_aosp_build_stats(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_s
             stats->product_package_unresolved_count = sqlite3_column_int(stmt, 33);
             stats->board_config_count = sqlite3_column_int(stmt, 34);
             stats->product_partition_count = sqlite3_column_int(stmt, 35);
+            stats->bazel_artifact_count = sqlite3_column_int(stmt, 36);
+            stats->bazel_target_count = sqlite3_column_int(stmt, 37);
+            stats->bazel_target_resolved_count = sqlite3_column_int(stmt, 38);
+            stats->bazel_dependency_count = sqlite3_column_int(stmt, 39);
+            stats->bazel_dependency_resolved_count = sqlite3_column_int(stmt, 40);
+            stats->bazel_ambiguous_count = sqlite3_column_int(stmt, 41);
+            stats->bazel_missing_count = sqlite3_column_int(stmt, 42);
+            stats->bazel_coverage_gap_count = sqlite3_column_int(stmt, 43);
             rc = 0;
         }
     }
@@ -4301,6 +5013,7 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
             file_stats.make_files += contexts[i].stats.make_files;
             file_stats.product_make_files += contexts[i].stats.product_make_files;
             file_stats.board_config_files += contexts[i].stats.board_config_files;
+            file_stats.bazel_metadata_files += contexts[i].stats.bazel_metadata_files;
             file_stats.aidl_files += contexts[i].stats.aidl_files;
         }
     }
@@ -4330,6 +5043,12 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         bg_error(err, err_size, "cannot resolve AOSP product packages", "out of memory");
         rc = -1;
     }
+    if (rc == 0 &&
+        !resolve_bazel_metadata(contexts, workspace->repo_count, &module_index)) {
+        bg_error(err, err_size, "cannot resolve AOSP Bazel mixed-build metadata",
+                 "out of memory");
+        rc = -1;
+    }
     if (rc == 0) rc = persist_build_graph(workspace, contexts, workspace->repo_count, err, err_size);
     if (rc == 0) {
         rc = cbm_aosp_build_stats(workspace, stats, err, err_size);
@@ -4337,6 +5056,7 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         stats->make_files = file_stats.make_files;
         stats->product_make_files = file_stats.product_make_files;
         stats->board_config_files = file_stats.board_config_files;
+        stats->bazel_metadata_files = file_stats.bazel_metadata_files;
         stats->aidl_files = file_stats.aidl_files;
     }
     for (int i = 0; i < workspace->repo_count; i++) {
@@ -4346,6 +5066,7 @@ int cbm_aosp_build_scan(const cbm_aosp_workspace_t *workspace, cbm_aosp_build_st
         make_file_vec_free(&contexts[i].make_files);
         product_vec_free(&contexts[i].products);
         board_config_vec_free(&contexts[i].board_configs);
+        bazel_artifact_vec_free(&contexts[i].bazel_artifacts);
     }
     free(module_index.items);
     free(contexts);

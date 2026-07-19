@@ -594,7 +594,12 @@ product/target conditions and unsupported Make functions are counted and returne
 as coverage gaps instead of selecting a branch speculatively. Product Makefiles,
 `PRODUCT_PACKAGES`, inheritance, BoardConfig evidence, device/vendor ownership,
 and explicit partition ownership are retained in the workspace build graph. The
-protocol linker maps
+scanner also imports versioned `aosp_bazel_mixed_build.json` artifacts exported
+from supported Bazel mixed-build tooling. Configured labels, transitions, target
+kinds, Soong module mappings, dependencies, and unsupported-provider evidence are
+stored without evaluating Starlark; only unique label and module mappings become
+module edges. External repositories, missing labels, configuration ambiguity, and
+duplicate Soong names remain coverage gaps. The protocol linker maps
 AIDL interfaces and methods to generated Binder `Bn`/`Bp` and Java `Stub`/`Proxy`
 symbols, resolves exported JNI names, and parses `JNINativeMethod` dynamic
 registration tables. Each protocol edge records its confidence and evidence;
@@ -631,7 +636,7 @@ implementation, annotation, call, and usage relationships.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
-| `aosp_get_architecture` | Query AOSP Soong/Make/AIDL modules, products, BoardConfig and partition ownership, generated-file declarations, namespace/package boundaries, and dependency coverage. |
+| `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, products, BoardConfig and partition ownership, generated-file declarations, namespace/package boundaries, and dependency coverage. |
 | `aosp_trace_protocol` | Query Binder/AIDL/JNI protocol nodes and link coverage across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |

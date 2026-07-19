@@ -695,6 +695,7 @@ static const char *AOSP_SCHEMA =
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(9,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(10,strftime('%s','now'));"
     "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(11,strftime('%s','now'));"
+    "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(12,strftime('%s','now'));"
     "CREATE TABLE IF NOT EXISTS workspaces("
     " id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL, updated_at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS repos("
@@ -758,6 +759,29 @@ static const char *AOSP_SCHEMA =
     " workspace_path TEXT NOT NULL,device_owner TEXT NOT NULL DEFAULT '',"
     " vendor_owner TEXT NOT NULL DEFAULT '',variables TEXT NOT NULL DEFAULT '{}',"
     " partitions TEXT NOT NULL DEFAULT '[]',PRIMARY KEY(workspace_id,repo_id,file_path));"
+    "CREATE TABLE IF NOT EXISTS build_bazel_artifacts("
+    " workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,file_path TEXT NOT NULL,"
+    " format_version INTEGER NOT NULL,configuration TEXT NOT NULL DEFAULT '',"
+    " target_count INTEGER NOT NULL DEFAULT 0,coverage_gaps TEXT NOT NULL DEFAULT '[]',"
+    " PRIMARY KEY(workspace_id,repo_id,file_path));"
+    "CREATE TABLE IF NOT EXISTS build_bazel_targets("
+    " workspace_id TEXT NOT NULL,repo_id TEXT NOT NULL,artifact_path TEXT NOT NULL,"
+    " label TEXT NOT NULL,configuration TEXT NOT NULL DEFAULT '',kind TEXT NOT NULL DEFAULT '',"
+    " module_name TEXT NOT NULL,module_id TEXT,status TEXT NOT NULL,properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(workspace_id,repo_id,artifact_path,label,configuration));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_bazel_targets_label "
+    "ON build_bazel_targets(workspace_id,label,configuration);"
+    "CREATE TABLE IF NOT EXISTS build_bazel_dependencies("
+    " workspace_id TEXT NOT NULL,source_repo_id TEXT NOT NULL,artifact_path TEXT NOT NULL,"
+    " source_label TEXT NOT NULL,source_configuration TEXT NOT NULL DEFAULT '',"
+    " target_label TEXT NOT NULL,target_configuration TEXT NOT NULL DEFAULT '',"
+    " dependency_type TEXT NOT NULL,transition TEXT NOT NULL DEFAULT '',"
+    " source_module_id TEXT,target_module_id TEXT,"
+    " status TEXT NOT NULL,properties TEXT NOT NULL DEFAULT '{}',"
+    " PRIMARY KEY(workspace_id,source_repo_id,artifact_path,source_label,"
+    " source_configuration,target_label,target_configuration,dependency_type,transition));"
+    "CREATE INDEX IF NOT EXISTS idx_aosp_bazel_deps_target "
+    "ON build_bazel_dependencies(workspace_id,target_label,target_configuration);"
     "CREATE TABLE IF NOT EXISTS symbols("
     " id INTEGER PRIMARY KEY, global_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
     " local_node_id INTEGER, name TEXT NOT NULL, qualified_name TEXT NOT NULL, label TEXT NOT NULL,"
@@ -3518,9 +3542,9 @@ int cbm_cmd_aosp(int argc, char **argv) {
         } else {
             printf("AOSP build graph complete\n");
             printf("  files: %d Android.bp, %d Android.mk, %d product Makefiles, "
-                   "%d BoardConfigs, %d AIDL\n",
+                   "%d BoardConfigs, %d Bazel metadata, %d AIDL\n",
                    stats.blueprint_files, stats.make_files, stats.product_make_files,
-                   stats.board_config_files, stats.aidl_files);
+                   stats.board_config_files, stats.bazel_metadata_files, stats.aidl_files);
             printf("  modules: %d\n  dependencies: %d (%d resolved, %d unresolved)\n",
                    stats.module_count, stats.dependency_count, stats.resolved_count,
                    stats.unresolved_count);
@@ -3558,6 +3582,12 @@ int cbm_cmd_aosp(int argc, char **argv) {
                    stats.product_package_count, stats.product_package_resolved_count,
                    stats.product_package_unresolved_count, stats.board_config_count,
                    stats.product_partition_count);
+            printf("  Bazel mixed builds: %d artifacts, %d targets (%d resolved), "
+                   "%d dependencies (%d resolved), %d ambiguous, %d missing, %d coverage gaps\n",
+                   stats.bazel_artifact_count, stats.bazel_target_count,
+                   stats.bazel_target_resolved_count, stats.bazel_dependency_count,
+                   stats.bazel_dependency_resolved_count, stats.bazel_ambiguous_count,
+                   stats.bazel_missing_count, stats.bazel_coverage_gap_count);
         }
     } else if (strcmp(action, "modules") == 0) {
         cbm_aosp_module_t *modules = NULL;

@@ -480,6 +480,70 @@ static int create_product_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_bazel_mixed_build_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_bazel_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root) return -1;
+    char *root = strdup(temp_root);
+    if (!root) return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "app") != 0 ||
+        make_dir(root, "vendor/lib") != 0 || make_dir(root, "vendor/dup1") != 0 ||
+        make_dir(root, "vendor/dup2") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+            "<manifest>"
+            "<project name=\"platform/app\" path=\"app\"/>"
+            "<project name=\"vendor/lib\" path=\"vendor/lib\"/>"
+            "<project name=\"vendor/dup1\" path=\"vendor/dup1\"/>"
+            "<project name=\"vendor/dup2\" path=\"vendor/dup2\"/>"
+            "</manifest>") != 0 ||
+        write_relative(root, "app/Android.bp",
+            "cc_binary { name: \"app_bin\" }\n"
+            "cc_library { name: \"local_dep\" }\n") != 0 ||
+        write_relative(root, "vendor/lib/Android.bp",
+            "cc_library { name: \"libshared\" }\n"
+            "cc_library { name: \"libvariant_arm\" }\n"
+            "cc_library { name: \"libvariant_x86\" }\n") != 0 ||
+        write_relative(root, "vendor/dup1/Android.bp",
+            "cc_library { name: \"libduplicate\" }\n") != 0 ||
+        write_relative(root, "vendor/dup2/Android.bp",
+            "cc_library { name: \"libduplicate\" }\n") != 0 ||
+        write_relative(root, "app/aosp_bazel_mixed_build.json",
+            "{"
+            "\"schema\":\"aosp_mixed_build_metadata\",\"version\":1,"
+            "\"unsupported\":[\"select_provider:FeatureFlagInfo\"],"
+            "\"targets\":["
+            "{\"label\":\"//app:app\",\"module_name\":\"app_bin\","
+            "\"kind\":\"cc_binary\",\"unsupported\":[\"provider:AndroidIdeInfo\"],"
+            "\"dependencies\":["
+            "{\"label\":\"//vendor/lib:shared\",\"configuration\":\"android_arm64\","
+            "\"type\":\"BAZEL_LINK\",\"transition\":\"target\"},"
+            "\"//vendor/lib:variant\",\"//missing:target\","
+            "\"@rules_cc//cc:toolchain\",\"//app:duplicate\","
+            "\"//app:unmapped\",\":local\"]},"
+            "{\"label\":\"//app:local\",\"module_name\":\"local_dep\",\"kind\":\"cc_library\"},"
+            "{\"label\":\"//app:duplicate\",\"module_name\":\"libduplicate\"},"
+            "{\"label\":\"//app:unmapped\",\"module_name\":\"missing_module\"}"
+            "]}") != 0 ||
+        write_relative(root, "vendor/lib/aosp_bazel_mixed_build.json",
+            "{"
+            "\"schema\":\"aosp_mixed_build_metadata\",\"version\":1,\"targets\":["
+            "{\"label\":\"//vendor/lib:shared\",\"configuration\":\"android_arm64\","
+            "\"module_name\":\"libshared\",\"kind\":\"cc_library\"},"
+            "{\"label\":\"//vendor/lib:variant\",\"configuration\":\"android_arm64\","
+            "\"module_name\":\"libvariant_arm\"},"
+            "{\"label\":\"//vendor/lib:variant\",\"configuration\":\"android_x86_64\","
+            "\"module_name\":\"libvariant_x86\"}"
+            "]}") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -2708,6 +2772,125 @@ TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership) {
     PASS();
 }
 
+TEST(aosp_build_graph_imports_bazel_mixed_build_metadata) {
+    char *root = NULL;
+    ASSERT_EQ(create_bazel_mixed_build_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    cbm_aosp_build_stats_t stats;
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.bazel_metadata_files, 2);
+    ASSERT_EQ(stats.bazel_artifact_count, 2);
+    ASSERT_EQ(stats.bazel_target_count, 7);
+    ASSERT_EQ(stats.bazel_target_resolved_count, 5);
+    ASSERT_EQ(stats.bazel_dependency_count, 7);
+    ASSERT_EQ(stats.bazel_dependency_resolved_count, 2);
+    ASSERT_EQ(stats.bazel_ambiguous_count, 3);
+    ASSERT_EQ(stats.bazel_missing_count, 3);
+    ASSERT_EQ(stats.bazel_coverage_gap_count, 10);
+    ASSERT_EQ(stats.dependency_count, 7);
+    ASSERT_EQ(stats.resolved_count, 2);
+    ASSERT_EQ(stats.unresolved_count, 5);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT group_concat(target_label||':'||status,',') FROM ("
+        "SELECT target_label,status FROM build_bazel_dependencies WHERE workspace_id=?1 "
+        "ORDER BY target_label);", -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "//app:duplicate:target_module_ambiguous,"
+                  "//app:local:resolved,"
+                  "//app:unmapped:target_module_not_found,"
+                  "//missing:target:label_not_found,"
+                  "//vendor/lib:shared:resolved,"
+                  "//vendor/lib:variant:label_ambiguous,"
+                  "@rules_cc//cc:toolchain:external_repository");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT sr.path,tr.path,d.dependency_type,d.transition "
+        "FROM build_bazel_dependencies d "
+        "JOIN modules sm ON sm.module_id=d.source_module_id "
+        "JOIN modules tm ON tm.module_id=d.target_module_id "
+        "JOIN repos sr ON sr.repo_id=sm.repo_id JOIN repos tr ON tr.repo_id=tm.repo_id "
+        "WHERE d.workspace_id=?1 AND d.target_label='//vendor/lib:shared';",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "app");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "vendor/lib");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "BAZEL_LINK");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "target");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM module_edges e JOIN modules m ON m.module_id=e.source_id "
+        "WHERE m.workspace_id=?1 AND e.type IN('BAZEL_LINK','BAZEL_DEPENDENCY');",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT json_extract(coverage_gaps,'$[0]') FROM build_bazel_artifacts "
+        "WHERE workspace_id=?1 AND repo_id=(SELECT repo_id FROM repos WHERE path='app');",
+        -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "select_provider:FeatureFlagInfo");
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(master,
+        "SELECT count(*) FROM schema_versions WHERE version=12;", -1, &stmt, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.bazel_target_count, 7);
+    ASSERT_EQ(stats.bazel_dependency_count, 7);
+
+    ASSERT_EQ(make_dir(root, "app/bad") , 0);
+    ASSERT_EQ(write_relative(root, "app/bad/aosp_bazel_mixed_build.json",
+                             "{\"schema\":\"wrong\",\"version\":1,\"targets\":[]}"), 0);
+    err[0] = '\0';
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), -1);
+    ASSERT_NOT_NULL(strstr(err, "cannot parse AOSP build file"));
+    char bad_path[4096];
+    (void)snprintf(bad_path, sizeof(bad_path),
+                   "%s/app/bad/aosp_bazel_mixed_build.json", root);
+    ASSERT_EQ(remove(bad_path), 0);
+    ASSERT_EQ(cbm_aosp_build_scan(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.bazel_dependency_count, 7);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"app_bin\"}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"bazel_artifacts\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"bazel_targets\":7"));
+    ASSERT_NOT_NULL(strstr(response, "\"bazel_dependencies_resolved\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\"bazel_coverage_gaps\":10"));
+    free(response);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 TEST(aosp_protocol_graph_links_binder_and_jni_evidence) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -3836,6 +4019,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_build_graph_models_filegroups_genrules_and_output_tags);
     RUN_TEST(aosp_build_graph_evaluates_common_android_make_semantics);
     RUN_TEST(aosp_build_graph_models_products_board_configs_and_partition_ownership);
+    RUN_TEST(aosp_build_graph_imports_bazel_mixed_build_metadata);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);

@@ -381,6 +381,66 @@ Master schema v11 adds `build_products`, `build_product_inheritance`,
 coverage report product, inheritance, package-resolution, BoardConfig, and
 partition totals from these tables.
 
+## Bazel Mixed-Build Metadata
+
+B8 imports generated metadata rather than parsing or evaluating Starlark. A
+manifest project may contain one or more files named
+`aosp_bazel_mixed_build.json`; each file must use the versioned schema below.
+Labels are canonicalized to `//package:target`, including package-relative
+dependency labels. The external producer is responsible for exporting configured
+targets from the Soong/Bazel mixed build.
+
+```json
+{
+  "schema": "aosp_mixed_build_metadata",
+  "version": 1,
+  "configuration": "android_arm64",
+  "unsupported": ["select_provider:CustomInfo"],
+  "targets": [
+    {
+      "label": "//frameworks/base:libservices",
+      "configuration": "android_arm64",
+      "kind": "cc_library",
+      "module_name": "libservices",
+      "dependencies": [
+        "//system/core:libbase",
+        {
+          "label": "//external/zlib:zlib",
+          "configuration": "android_arm64",
+          "type": "BAZEL_LINK",
+          "transition": "target"
+        }
+      ],
+      "unsupported": ["provider:AndroidIdeInfo"]
+    }
+  ]
+}
+```
+
+`schema`, `version`, and the `targets` array are required. Every supported target
+requires `label` and `module_name`; `configuration`, `kind`, `dependencies`, and
+`unsupported` are optional. A dependency may be a label string or an object with
+`label` plus optional `configuration`, `type`, and `transition`. Version 1 does
+not interpret providers, `select`, toolchains, aspects, or configuration
+transitions. Producers list any such omitted semantics in `unsupported`, and the
+importer returns those entries as coverage gaps.
+
+Target-to-module mapping succeeds only when `module_name` identifies one module
+in the federated workspace. Dependency mapping then requires one configured Bazel
+target for the normalized label and one resolved target module. Cross-manifest
+project edges are allowed after both boundaries resolve. Duplicate module names,
+missing labels or modules, multiple matching configurations, external repository
+labels, unsupported format versions, and producer-declared omissions remain
+stored with explicit statuses. A malformed artifact fails the scan before the
+last committed build graph is replaced.
+
+Master schema v12 adds `build_bazel_artifacts`, `build_bazel_targets`, and
+`build_bazel_dependencies`. Resolved dependencies are also projected into
+`module_dependencies` and `module_edges`; unresolved evidence remains in the
+Bazel tables. CLI and MCP architecture coverage report artifacts, configured
+targets, dependencies, resolved counts, ambiguity, missing mappings, and coverage
+gaps.
+
 ## Schema Compatibility
 
 Master schema v4 introduces the structured edge identity and status fields. On

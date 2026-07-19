@@ -42,10 +42,19 @@ typedef struct {
     int product_package_unresolved_count;
     int board_config_count;
     int product_partition_count;
+    int bazel_artifact_count;
+    int bazel_target_count;
+    int bazel_target_resolved_count;
+    int bazel_dependency_count;
+    int bazel_dependency_resolved_count;
+    int bazel_ambiguous_count;
+    int bazel_missing_count;
+    int bazel_coverage_gap_count;
     int blueprint_files;
     int make_files;
     int product_make_files;
     int board_config_files;
+    int bazel_metadata_files;
     int aidl_files;
 } cbm_aosp_build_stats_t;
 

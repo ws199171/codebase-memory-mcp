@@ -8512,6 +8512,18 @@ static char *handle_aosp_get_architecture(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "board_configs", stats.board_config_count);
     yyjson_mut_obj_add_int(doc, root, "product_partitions",
                            stats.product_partition_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_artifacts", stats.bazel_artifact_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_targets", stats.bazel_target_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_targets_resolved",
+                           stats.bazel_target_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_dependencies",
+                           stats.bazel_dependency_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_dependencies_resolved",
+                           stats.bazel_dependency_resolved_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_ambiguous", stats.bazel_ambiguous_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_missing", stats.bazel_missing_count);
+    yyjson_mut_obj_add_int(doc, root, "bazel_coverage_gaps",
+                           stats.bazel_coverage_gap_count);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
