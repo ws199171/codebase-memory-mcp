@@ -40,10 +40,9 @@ complete:
 
 ## Current Queue
 
-- Current task: `P4` - cover Java, C++/NDK, and Rust AIDL generated naming
-  conventions.
-- Next task: `P5` - decode JNI overload/signature encodings and common
+- Current task: `P5` - decode JNI overload/signature encodings and common
   registration helpers.
+- Next task: `P6` - model HIDL and HwBinder interfaces, clients, and services.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -123,7 +122,13 @@ complete:
     name, C++/NDK/Java, and idempotent refresh coverage; 31 AOSP tests, 159 MCP
     tests, production `-Werror` build, and real-index CLI/MCP smoke pass; Linux
     ASan/UBSan execution remains required before verification completion.
-- Worktree baseline: P3 ServiceManager-path checkpoint `b47d0a7` on
+  - `P4` Java `Stub`/`Proxy`, C++/NDK and Rust `Bn`/`Bp`, Rust
+    `transactions::<method>`, `on_transact`, and trait implementations;
+    backend-isolated flow edges, per-backend partial-symbol fallback and coverage
+    totals, 32 AOSP tests, 159 MCP tests, production `-Werror` build, and real-index
+    CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
+    verification completion.
+- Worktree baseline: P4 generated-Binder-backend checkpoint `df3e41e` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -228,7 +233,7 @@ unevaluated constructs must be counted and returned as coverage gaps.
 - [x] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
   calls, and implementation methods.
 - [x] `P3` Link ServiceManager registration, lookup, wait, client, and server paths.
-- [ ] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
+- [x] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
 - [ ] `P5` Decode JNI overload/signature encodings and common registration helpers.
 - [ ] `P6` Model HIDL and HwBinder interfaces, clients, and services.
 - [ ] `P7` Parse VINTF manifests and compatibility matrices and link HAL instances.
@@ -332,3 +337,4 @@ unaccepted critical coverage gap.
 | `P1` | `45a045c` | Complete AIDL declarations, imports, annotations, parcelables, unions, enums, callbacks, effective oneway and stability metadata, explicit resolved/ambiguous/not-found reference evidence, 29 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `P2` | `841f5b7` | Source-backed Binder transaction constants, shared `onTransact` dispatch, proxy transact calls, direct implementation inheritance, omitted-symbol fallback, same-name negative coverage, idempotent refresh, 30 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
 | `P3` | `b47d0a7` | Literal C++/NDK/Java ServiceManager registration, lookup, check, and wait calls; deterministic cross-repository services; enclosing client/server callers; unique implementation/interface links; missing, ambiguous, dynamic-name, and idempotent refresh coverage; 31 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
+| `P4` | `df3e41e` | Java nested `Stub`/`Proxy` types, C++/NDK and Rust `Bn`/`Bp` methods, Rust transaction/dispatch/trait-implementation flow, strict backend pairing, per-backend partial-symbol fallback and coverage totals, no-cross-backend and idempotent golden coverage, 32 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
