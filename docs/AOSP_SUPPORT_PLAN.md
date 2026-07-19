@@ -40,10 +40,10 @@ complete:
 
 ## Current Queue
 
-- Current task: `B8` - import supported Bazel mixed-build module and dependency
-  metadata.
-- Next task: `B9` - link build modules to source files, generated files, and
+- Current task: `B9` - link build modules to source files, generated files, and
   definition symbols.
+- Next task: `B10` - expose dependency edges, variants, unresolved expressions,
+  and provenance through CLI and MCP queries.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -90,7 +90,12 @@ complete:
     tables; 25 AOSP tests, 159 MCP tests, production `-Werror` build, and
     production CLI/MCP smoke pass; Linux ASan/UBSan execution remains required
     before verification completion.
-- Worktree baseline: B7 product build semantics checkpoint `5c45fd7` on
+  - `B8` versioned Bazel mixed-build artifacts, configured labels and transitions,
+    unique Soong-module mapping, cross-repository dependency projection,
+    ambiguity/missing/external/unsupported evidence, and schema v12 Bazel tables;
+    26 AOSP tests, 159 MCP tests, production `-Werror` build, and CLI/MCP smoke
+    pass; Linux ASan/UBSan execution remains required before verification completion.
+- Worktree baseline: B8 Bazel mixed-build metadata checkpoint `888813e` on
   `codex/aosp-federated-graph`.
 
 ## Verified Baseline
@@ -293,3 +298,4 @@ unaccepted critical coverage gap.
 | `B5` | `b83a195` | Filegroup/genrule declarations, literal file separation, generated/tool edges, tagged references, defaults file provenance, schema v9 `module_files`, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B6` | `5e72c53` | Common Make variables, deterministic conditions, includes, user macros and functions, semantic module classes, schema v10 coverage gaps, 24 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
 | `B7` | `5c45fd7` | Product Makefiles/fragments, inheritance states and provenance, product package resolution, BoardConfig/device/vendor/partition ownership, schema v11 product tables, 25 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
+| `B8` | `888813e` | Versioned Bazel mixed-build artifacts, configured labels/transitions, unique Soong-module mapping, cross-repository dependency projection, ambiguity/missing/external/unsupported evidence, schema v12 Bazel tables, 26 AOSP tests, 159 MCP tests, production `-Werror` build and CLI/MCP smoke; Linux sanitizers deferred |
