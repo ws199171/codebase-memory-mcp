@@ -1,0 +1,16 @@
+<manifest version="1.0" type="device">
+  <hal format="hidl">
+    <name>android.hardware.foo</name>
+    <transport>hwbinder</transport>
+    <version>1.0</version>
+    <interface>
+      <name>IFoo</name>
+      <instance>default</instance>
+    </interface>
+  </hal>
+  <hal format="aidl">
+    <name>android.hardware.foo</name>
+    <version>1</version>
+    <fqname>IControl/default</fqname>
+  </hal>
+</manifest>

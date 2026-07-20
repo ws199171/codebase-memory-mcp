@@ -129,6 +129,7 @@ typedef enum {
 static int link_binder_flow(link_ctx_t *ctx, const char *method_id, const char *method,
                             const char *interface_name, const char *stem);
 static bool contains_class_token(const char *qualified_name, const char *token);
+static char *pg_call_owner(const char *source, const char *call);
 static void hash_id(const char *workspace_id, const char *kind, const char *qualified,
                     char out[65]);
 
@@ -2297,6 +2298,17 @@ static int parse_service_manager_calls(link_ctx_t *ctx, const cbm_aosp_repo_t *r
             pg_token_free(&token);
             continue;
         }
+        char *call_owner = pg_call_owner(source, source + call_offset);
+        const char *owner_leaf = call_owner ? strrchr(call_owner, ':') : NULL;
+        owner_leaf = owner_leaf ? owner_leaf + 1 : call_owner;
+        const char *owner_dot = owner_leaf ? strrchr(owner_leaf, '.') : NULL;
+        owner_leaf = owner_dot ? owner_dot + 1 : owner_leaf;
+        bool hidl_api = owner_leaf && owner_leaf[0] == 'I' && isupper((unsigned char)owner_leaf[1]);
+        free(call_owner);
+        if (hidl_api) {
+            pg_token_free(&token);
+            continue;
+        }
         pg_token_free(&token);
         token = pg_next(&lexer);
         if (token.kind != PG_LPAREN) {
@@ -2338,6 +2350,711 @@ static int parse_service_manager_calls(link_ctx_t *ctx, const cbm_aosp_repo_t *r
     return rc;
 }
 
+static char *pg_span_trim_dup(const char *begin, const char *end) {
+    while (begin < end && isspace((unsigned char)*begin))
+        begin++;
+    while (end > begin && isspace((unsigned char)end[-1]))
+        end--;
+    size_t length = (size_t)(end - begin);
+    char *copy = malloc(length + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, begin, length);
+    copy[length] = '\0';
+    return copy;
+}
+
+static char *pg_structured_properties(const char *protocol, const char *role, const char *target,
+                                      const char *instance, const char *status,
+                                      const char *detail) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc)
+        return NULL;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "protocol", protocol ? protocol : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "role", role ? role : "");
+    if (target)
+        yyjson_mut_obj_add_strcpy(doc, root, "target", target);
+    if (instance)
+        yyjson_mut_obj_add_strcpy(doc, root, "instance", instance);
+    yyjson_mut_obj_add_strcpy(doc, root, "resolution", status ? status : "unresolved");
+    yyjson_mut_obj_add_int(doc, root, "candidate_count", 0);
+    if (detail)
+        yyjson_mut_obj_add_strcpy(doc, root, "detail", detail);
+    return aidl_write_properties(doc);
+}
+
+static const char *pg_find_identifier_end(const char *value) {
+    while (*value && (isalnum((unsigned char)*value) || *value == '_' || *value == '.' ||
+                      *value == ':' || *value == '@' || *value == '-'))
+        value++;
+    return value;
+}
+
+static char *pg_keyword_value(const char *source, const char *keyword, char terminator) {
+    const char *hit = strstr(source, keyword);
+    if (!hit)
+        return NULL;
+    hit += strlen(keyword);
+    while (*hit && isspace((unsigned char)*hit))
+        hit++;
+    const char *end = terminator ? strchr(hit, terminator) : pg_find_identifier_end(hit);
+    if (!end)
+        return NULL;
+    return pg_span_trim_dup(hit, end);
+}
+
+static int link_hidl_generated_types(link_ctx_t *ctx, const char *interface_id,
+                                     const char *interface_name) {
+    const char *stem =
+        interface_name[0] == 'I' && interface_name[1] ? interface_name + 1 : interface_name;
+    char candidate[512];
+    (void)snprintf(candidate, sizeof(candidate), "BnHw%s", stem);
+    if (link_generated_type(ctx, interface_id, candidate, "HWBINDER_SERVER_TYPE",
+                            "HIDL_GENERATES_SERVER") != 0)
+        return -1;
+    (void)snprintf(candidate, sizeof(candidate), "BpHw%s", stem);
+    if (link_generated_type(ctx, interface_id, candidate, "HWBINDER_CLIENT_TYPE",
+                            "HIDL_GENERATES_CLIENT") != 0)
+        return -1;
+    (void)snprintf(candidate, sizeof(candidate), "IHw%s", stem);
+    return link_generated_type(ctx, interface_id, candidate, "HWBINDER_INTERFACE_TYPE",
+                               "HIDL_GENERATES_INTERFACE");
+}
+
+static int link_hidl_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_path,
+                          const char *rel_path) {
+    size_t length = 0;
+    char *source = pg_read_file(abs_path, &length);
+    if (!source)
+        return -1;
+    char *package = pg_keyword_value(source, "package", ';');
+    const char *interface_kw = strstr(source, "interface");
+    if (!package || !interface_kw) {
+        free(package);
+        free(source);
+        return 0;
+    }
+    interface_kw += strlen("interface");
+    while (*interface_kw && isspace((unsigned char)*interface_kw))
+        interface_kw++;
+    const char *name_end = pg_find_identifier_end(interface_kw);
+    char *name = pg_span_trim_dup(interface_kw, name_end);
+    if (!name || !name[0]) {
+        free(name);
+        free(package);
+        free(source);
+        return -1;
+    }
+    size_t qn_size = strlen(package) + strlen(name) + 3;
+    char *qualified = malloc(qn_size);
+    if (!qualified) {
+        free(name);
+        free(package);
+        free(source);
+        return -1;
+    }
+    (void)snprintf(qualified, qn_size, "%s::%s", package, name);
+    char interface_id[65];
+    hash_id(ctx->workspace->workspace_id, "HIDL_INTERFACE", qualified, interface_id);
+    char *properties =
+        pg_structured_properties("hidl", "interface", qualified, NULL, "resolved", package);
+    int rc = properties ? insert_protocol_node_properties(ctx, interface_id, repo->repo_id,
+                                                          "HIDL_INTERFACE", name, qualified,
+                                                          rel_path, NULL, properties)
+                        : -1;
+    free(properties);
+    if (rc == 0)
+        rc = link_hidl_generated_types(ctx, interface_id, name);
+
+    const char *body = strchr(name_end, '{');
+    const char *body_end = body ? strrchr(body, '}') : NULL;
+    const char *cursor = body ? body + 1 : NULL;
+    while (rc == 0 && cursor && body_end && cursor < body_end) {
+        const char *semi = memchr(cursor, ';', (size_t)(body_end - cursor));
+        if (!semi)
+            break;
+        const char *lp = memchr(cursor, '(', (size_t)(semi - cursor));
+        if (lp) {
+            const char *method_end = lp;
+            while (method_end > cursor && isspace((unsigned char)method_end[-1]))
+                method_end--;
+            const char *method_begin = method_end;
+            while (method_begin > cursor &&
+                   (isalnum((unsigned char)method_begin[-1]) || method_begin[-1] == '_')) {
+                method_begin--;
+            }
+            char *method = pg_span_trim_dup(method_begin, method_end);
+            if (method && method[0]) {
+                size_t method_qn_size = strlen(qualified) + strlen(method) + 3;
+                char *method_qn = malloc(method_qn_size);
+                if (!method_qn) {
+                    free(method);
+                    rc = -1;
+                    break;
+                }
+                (void)snprintf(method_qn, method_qn_size, "%s.%s", qualified, method);
+                char method_id[65];
+                hash_id(ctx->workspace->workspace_id, "HIDL_METHOD", method_qn, method_id);
+                bool oneway = strstr(cursor, "oneway") && strstr(cursor, "oneway") < lp;
+                char *method_props = pg_structured_properties(
+                    "hidl", oneway ? "async_method" : "method", method_qn, NULL, "resolved",
+                    oneway ? "oneway" : "request_response");
+                rc = method_props
+                         ? insert_protocol_node_properties(ctx, method_id, repo->repo_id,
+                                                           "HIDL_METHOD", method, method_qn,
+                                                           rel_path, NULL, method_props)
+                         : -1;
+                if (rc == 0) {
+                    rc = insert_protocol_edge_properties(ctx, interface_id, method_id,
+                                                         "DECLARES_METHOD", 1.0, "hidl_ast",
+                                                         method_props);
+                }
+                if (rc == 0 && oneway) {
+                    rc = insert_protocol_edge_properties(ctx, interface_id, method_id,
+                                                         "HWBINDER_ASYNC_CALL", 1.0, "hidl_oneway",
+                                                         method_props);
+                }
+                free(method_props);
+                free(method_qn);
+            }
+            free(method);
+        }
+        cursor = semi + 1;
+    }
+    free(qualified);
+    free(name);
+    free(package);
+    free(source);
+    return rc;
+}
+
+static char *pg_call_literal(const char *call) {
+    const char *lp = strchr(call, '(');
+    if (!lp)
+        return NULL;
+    const char *quote = strchr(lp, '"');
+    const char *rp = strchr(lp, ')');
+    if (!quote || (rp && quote > rp))
+        return strdup("default");
+    const char *end = quote + 1;
+    while (*end && *end != '"')
+        end++;
+    return *end == '"' ? pg_span_trim_dup(quote + 1, end) : NULL;
+}
+
+static char *pg_call_owner(const char *source, const char *call) {
+    const char *scope = call;
+    while (scope > source && isspace((unsigned char)scope[-1]))
+        scope--;
+    const char *end = NULL;
+    if (scope - source >= 2 && scope[-1] == ':' && scope[-2] == ':') {
+        end = scope - 2;
+    } else if (scope > source && scope[-1] == '.') {
+        end = scope - 1;
+    } else {
+        return NULL;
+    }
+    const char *begin = end;
+    while (begin > source && (isalnum((unsigned char)begin[-1]) || begin[-1] == '_' ||
+                              begin[-1] == '.' || begin[-1] == ':' || begin[-1] == '@'))
+        begin--;
+    return pg_span_trim_dup(begin, end);
+}
+
+static int parse_hidl_operations(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *rel_path,
+                                 const char *source) {
+    const char *apis[] = {"getService", "tryGetService", "registerAsService"};
+    for (int api_index = 0; api_index < 3; api_index++) {
+        const char *cursor = source;
+        while ((cursor = strstr(cursor, apis[api_index])) != NULL) {
+            char *owner = pg_call_owner(source, cursor);
+            const char *owner_leaf = owner ? strrchr(owner, ':') : NULL;
+            owner_leaf = owner_leaf ? owner_leaf + 1 : owner;
+            const char *owner_dot = owner_leaf ? strrchr(owner_leaf, '.') : NULL;
+            owner_leaf = owner_dot ? owner_dot + 1 : owner_leaf;
+            if (!owner_leaf || owner_leaf[0] != 'I' || !isupper((unsigned char)owner_leaf[1])) {
+                free(owner);
+                cursor += strlen(apis[api_index]);
+                continue;
+            }
+            char *instance = pg_call_literal(cursor);
+            if (!instance)
+                instance = strdup("default");
+            int line = service_source_line(source, (size_t)(cursor - source));
+            const char *kind = api_index == 2 ? "HIDL_SERVICE_REGISTRATION" : "HIDL_CLIENT_LOOKUP";
+            const char *role = api_index == 2 ? "service" : "client";
+            size_t qn_size =
+                strlen(rel_path) + strlen(apis[api_index]) + (instance ? strlen(instance) : 0) + 48;
+            char *qn = malloc(qn_size);
+            char *properties = pg_structured_properties("hidl", role, owner, instance, "unresolved",
+                                                        apis[api_index]);
+            if (!qn || !properties) {
+                free(qn);
+                free(properties);
+                free(owner);
+                free(instance);
+                return -1;
+            }
+            (void)snprintf(qn, qn_size, "%s:%d:%s:%s", rel_path, line, apis[api_index],
+                           instance ? instance : "default");
+            char id[65];
+            hash_id(ctx->workspace->workspace_id, kind, qn, id);
+            int rc = insert_protocol_node_properties(ctx, id, repo->repo_id, kind, apis[api_index],
+                                                     qn, rel_path, NULL, properties);
+            free(qn);
+            free(properties);
+            free(owner);
+            free(instance);
+            if (rc != 0)
+                return -1;
+            cursor += strlen(apis[api_index]);
+        }
+    }
+    return 0;
+}
+
+static char *pg_xml_tag_value(const char *begin, const char *end, const char *tag) {
+    char open[128];
+    char close[128];
+    (void)snprintf(open, sizeof(open), "<%s", tag);
+    (void)snprintf(close, sizeof(close), "</%s>", tag);
+    const char *start = strstr(begin, open);
+    if (!start || start >= end)
+        return NULL;
+    start = strchr(start, '>');
+    if (!start || start >= end)
+        return NULL;
+    start++;
+    const char *finish = strstr(start, close);
+    if (!finish || finish > end)
+        return NULL;
+    return pg_span_trim_dup(start, finish);
+}
+
+static bool pg_xml_attr_true(const char *begin, const char *end, const char *attribute) {
+    const char *hit = strstr(begin, attribute);
+    return hit && hit < end &&
+           (strstr(hit, "=\"true\"") == hit + strlen(attribute) ||
+            strstr(hit, "='true'") == hit + strlen(attribute));
+}
+
+static char *pg_xml_attr_value(const char *begin, const char *end, const char *attribute) {
+    const char *hit = strstr(begin, attribute);
+    if (!hit || hit >= end)
+        return NULL;
+    hit += strlen(attribute);
+    while (hit < end && isspace((unsigned char)*hit))
+        hit++;
+    if (hit >= end || *hit != '=')
+        return NULL;
+    hit++;
+    while (hit < end && isspace((unsigned char)*hit))
+        hit++;
+    if (hit >= end || (*hit != '"' && *hit != '\''))
+        return NULL;
+    char quote = *hit++;
+    const char *finish = hit;
+    while (finish < end && *finish != quote)
+        finish++;
+    return finish < end ? pg_span_trim_dup(hit, finish) : NULL;
+}
+
+static int insert_vintf_entry(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *root_id,
+                              const char *rel_path, bool matrix, const char *name,
+                              const char *version, const char *interface_name, const char *instance,
+                              const char *format, const char *transport, bool optional) {
+    if (!name || !interface_name)
+        return 0;
+    const char *actual_version = version && version[0] ? version : "unspecified";
+    const char *actual_instance = instance && instance[0] ? instance : "default";
+    bool aidl = format && strcmp(format, "aidl") == 0;
+    size_t qn_size = strlen(name) + strlen(actual_version) + strlen(interface_name) +
+                     strlen(actual_instance) + 10;
+    char *qn = malloc(qn_size);
+    if (!qn)
+        return -1;
+    if (aidl) {
+        (void)snprintf(qn, qn_size, "%s.%s/%s", name, interface_name, actual_instance);
+    } else {
+        (void)snprintf(qn, qn_size, "%s@%s::%s/%s", name, actual_version, interface_name,
+                       actual_instance);
+    }
+    const char *kind = matrix ? "VINTF_HAL_REQUIREMENT" : "VINTF_HAL_INSTANCE";
+    char id[65];
+    hash_id(ctx->workspace->workspace_id, kind, qn, id);
+    char detail[256];
+    (void)snprintf(detail, sizeof(detail), "format=%s;version=%s;transport=%s;optional=%s",
+                   format ? format : "hidl", actual_version, transport ? transport : "",
+                   optional ? "true" : "false");
+    char *properties =
+        pg_structured_properties(aidl ? "aidl" : "hidl", matrix ? "requirement" : "instance", qn,
+                                 actual_instance, "unresolved", detail);
+    int rc = properties
+                 ? insert_protocol_node_properties(ctx, id, repo->repo_id, kind, interface_name, qn,
+                                                   rel_path, NULL, properties)
+                 : -1;
+    if (rc == 0) {
+        rc = insert_protocol_edge_properties(ctx, root_id, id,
+                                             matrix ? "REQUIRES_HAL" : "DECLARES_HAL", 1.0,
+                                             "vintf_xml", properties);
+    }
+    free(properties);
+    free(qn);
+    return rc;
+}
+
+static int insert_vintf_fqname(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *root_id,
+                               const char *rel_path, bool matrix, const char *hal_name,
+                               const char *fqname, const char *hal_version, const char *format,
+                               const char *transport, bool optional) {
+    if (!hal_name || !fqname)
+        return 0;
+    if (format && strcmp(format, "aidl") == 0) {
+        const char *slash = strchr(fqname, '/');
+        if (!slash)
+            return 0;
+        char *interface_name = pg_span_trim_dup(fqname, slash);
+        char *instance = pg_span_trim_dup(slash + 1, fqname + strlen(fqname));
+        int rc =
+            interface_name && instance
+                ? insert_vintf_entry(ctx, repo, root_id, rel_path, matrix, hal_name, hal_version,
+                                     interface_name, instance, format, transport, optional)
+                : -1;
+        free(interface_name);
+        free(instance);
+        return rc;
+    }
+    const char *at = strchr(fqname, '@');
+    const char *scope = strstr(fqname, "::");
+    const char *slash = scope ? strchr(scope + 2, '/') : NULL;
+    if (!at || !scope || !slash || at >= scope || scope >= slash)
+        return 0;
+    char *version = pg_span_trim_dup(at + 1, scope);
+    char *interface_name = pg_span_trim_dup(scope + 2, slash);
+    char *instance = pg_span_trim_dup(slash + 1, fqname + strlen(fqname));
+    int rc = version && interface_name && instance
+                 ? insert_vintf_entry(ctx, repo, root_id, rel_path, matrix, hal_name, version,
+                                      interface_name, instance, format, transport, optional)
+                 : -1;
+    free(version);
+    free(interface_name);
+    free(instance);
+    return rc;
+}
+
+static int link_vintf_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_path,
+                           const char *rel_path) {
+    size_t length = 0;
+    char *source = pg_read_file(abs_path, &length);
+    if (!source)
+        return -1;
+    bool matrix = strstr(source, "<compatibility-matrix") != NULL;
+    if (!matrix && !strstr(source, "<manifest")) {
+        free(source);
+        return 0;
+    }
+    const char *first_hal = strstr(source, "<hal");
+    if (!first_hal) {
+        free(source);
+        return 0;
+    }
+    const char *root_kind = matrix ? "VINTF_MATRIX" : "VINTF_MANIFEST";
+    char root_id[65];
+    hash_id(ctx->workspace->workspace_id, root_kind, rel_path, root_id);
+    char *root_props = pg_structured_properties("vintf", matrix ? "matrix" : "manifest", rel_path,
+                                                NULL, "resolved", NULL);
+    int rc = root_props
+                 ? insert_protocol_node_properties(ctx, root_id, repo->repo_id, root_kind, rel_path,
+                                                   rel_path, rel_path, NULL, root_props)
+                 : -1;
+    free(root_props);
+    const char *cursor = first_hal;
+    while (rc == 0 && cursor && cursor < source + length) {
+        const char *hal_end = strstr(cursor, "</hal>");
+        if (!hal_end)
+            break;
+        hal_end += strlen("</hal>");
+        const char *open_end = strchr(cursor, '>');
+        char *format = open_end ? pg_xml_attr_value(cursor, open_end, "format") : NULL;
+        char *name = pg_xml_tag_value(cursor, hal_end, "name");
+        char *version = pg_xml_tag_value(cursor, hal_end, "version");
+        char *transport = pg_xml_tag_value(cursor, hal_end, "transport");
+        bool optional = open_end && pg_xml_attr_true(cursor, open_end, "optional");
+        const char *fq_cursor = cursor;
+        while (rc == 0 && (fq_cursor = strstr(fq_cursor, "<fqname>")) != NULL &&
+               fq_cursor < hal_end) {
+            char *fqname = pg_xml_tag_value(fq_cursor, hal_end, "fqname");
+            if (fqname) {
+                rc = insert_vintf_fqname(ctx, repo, root_id, rel_path, matrix, name, fqname,
+                                         version, format, transport, optional);
+            }
+            free(fqname);
+            fq_cursor += strlen("<fqname>");
+        }
+        const char *iface = strstr(cursor, "<interface");
+        if (iface && iface < hal_end) {
+            const char *iface_end = strstr(iface, "</interface>");
+            if (iface_end && iface_end < hal_end) {
+                iface_end += strlen("</interface>");
+                char *interface_name = pg_xml_tag_value(iface, iface_end, "name");
+                const char *instance_cursor = iface;
+                bool inserted = false;
+                while ((instance_cursor = strstr(instance_cursor, "<instance>")) != NULL &&
+                       instance_cursor < iface_end) {
+                    char *instance = pg_xml_tag_value(instance_cursor, iface_end, "instance");
+                    if (instance) {
+                        rc = insert_vintf_entry(ctx, repo, root_id, rel_path, matrix, name, version,
+                                                interface_name, instance, format, transport,
+                                                optional);
+                        inserted = true;
+                    }
+                    free(instance);
+                    instance_cursor += strlen("<instance>");
+                    if (rc != 0)
+                        break;
+                }
+                if (rc == 0 && !inserted) {
+                    rc = insert_vintf_entry(ctx, repo, root_id, rel_path, matrix, name, version,
+                                            interface_name, "default", format, transport, optional);
+                }
+                free(interface_name);
+            }
+        }
+        free(format);
+        free(name);
+        free(version);
+        free(transport);
+        cursor = strstr(hal_end, "<hal");
+    }
+    free(source);
+    return rc;
+}
+
+static int link_init_rc_file(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_path,
+                             const char *rel_path) {
+    size_t length = 0;
+    char *source = pg_read_file(abs_path, &length);
+    if (!source)
+        return -1;
+    char *save = NULL;
+    char *line = strtok_r(source, "\n", &save);
+    char current_service[65] = {0};
+    char current_trigger[65] = {0};
+    int line_number = 0;
+    int rc = 0;
+    while (line && rc == 0) {
+        line_number++;
+        char *trim = line;
+        while (*trim && isspace((unsigned char)*trim))
+            trim++;
+        if (strncmp(trim, "service ", 8) == 0) {
+            char name[256] = {0};
+            char binary[PG_PATH_MAX] = {0};
+            if (sscanf(trim + 8, "%255s %4095s", name, binary) == 2) {
+                char qn[PG_PATH_MAX + 320];
+                (void)snprintf(qn, sizeof(qn), "%s::service:%s", rel_path, name);
+                hash_id(ctx->workspace->workspace_id, "INIT_SERVICE", qn, current_service);
+                current_trigger[0] = '\0';
+                char *props =
+                    pg_structured_properties("init", "service", binary, NULL, "resolved", name);
+                rc = props ? insert_protocol_node_properties(ctx, current_service, repo->repo_id,
+                                                             "INIT_SERVICE", name, qn, rel_path,
+                                                             NULL, props)
+                           : -1;
+                char binary_id[65];
+                hash_id(ctx->workspace->workspace_id, "INIT_BINARY", binary, binary_id);
+                if (rc == 0)
+                    rc = insert_protocol_node_properties(ctx, binary_id, repo->repo_id,
+                                                         "INIT_BINARY", binary, binary, rel_path,
+                                                         NULL, props);
+                if (rc == 0)
+                    rc = insert_protocol_edge_properties(ctx, current_service, binary_id,
+                                                         "INIT_SERVICE_BINARY", 1.0,
+                                                         "init_rc_service", props);
+                free(props);
+            }
+        } else if (strncmp(trim, "on ", 3) == 0) {
+            const char *trigger_name = trim + 3;
+            char qn[PG_PATH_MAX + 320];
+            (void)snprintf(qn, sizeof(qn), "%s::trigger:%s", rel_path, trigger_name);
+            hash_id(ctx->workspace->workspace_id, "INIT_TRIGGER", qn, current_trigger);
+            current_service[0] = '\0';
+            char *props =
+                pg_structured_properties("init", "trigger", trigger_name, NULL, "resolved", NULL);
+            rc = props ? insert_protocol_node_properties(ctx, current_trigger, repo->repo_id,
+                                                         "INIT_TRIGGER", trigger_name, qn, rel_path,
+                                                         NULL, props)
+                       : -1;
+            free(props);
+        } else if (current_service[0] && strncmp(trim, "class ", 6) == 0) {
+            const char *class_name = trim + 6;
+            while (*class_name && isspace((unsigned char)*class_name))
+                class_name++;
+            const char *end = pg_find_identifier_end(class_name);
+            char *name = pg_span_trim_dup(class_name, end);
+            if (name) {
+                char class_id[65];
+                hash_id(ctx->workspace->workspace_id, "INIT_CLASS", name, class_id);
+                char *props =
+                    pg_structured_properties("init", "class", name, NULL, "resolved", NULL);
+                rc = props ? insert_protocol_node_properties(ctx, class_id, repo->repo_id,
+                                                             "INIT_CLASS", name, name, rel_path,
+                                                             NULL, props)
+                           : -1;
+                if (rc == 0)
+                    rc = insert_protocol_edge_properties(ctx, current_service, class_id,
+                                                         "INIT_SERVICE_CLASS", 1.0, "init_rc_class",
+                                                         props);
+                free(props);
+            }
+            free(name);
+        } else if (current_service[0] && strncmp(trim, "interface ", 10) == 0) {
+            char transport[64] = {0};
+            char interface_name[768] = {0};
+            char instance[256] = "default";
+            int fields = sscanf(trim + 10, "%63s %767s %255s", transport, interface_name, instance);
+            if (fields >= 2) {
+                size_t qn_size = strlen(rel_path) + strlen(interface_name) + strlen(instance) + 48;
+                char *qn = malloc(qn_size);
+                char *props = pg_structured_properties(
+                    strcmp(transport, "hidl") == 0 ? "hidl" : "aidl", "init_interface",
+                    interface_name, instance, "unresolved", transport);
+                if (!qn || !props) {
+                    free(qn);
+                    free(props);
+                    rc = -1;
+                } else {
+                    (void)snprintf(qn, qn_size, "%s:%d:%s/%s", rel_path, line_number,
+                                   interface_name, instance);
+                    char ref_id[65];
+                    hash_id(ctx->workspace->workspace_id, "INIT_INTERFACE_REFERENCE", qn, ref_id);
+                    rc = insert_protocol_node_properties(ctx, ref_id, repo->repo_id,
+                                                         "INIT_INTERFACE_REFERENCE", interface_name,
+                                                         qn, rel_path, NULL, props);
+                    if (rc == 0)
+                        rc = insert_protocol_edge_properties(ctx, current_service, ref_id,
+                                                             "INIT_DECLARES_INTERFACE", 1.0,
+                                                             "init_rc_interface", props);
+                    free(qn);
+                    free(props);
+                }
+            }
+        } else if (current_trigger[0] && strncmp(trim, "class_start ", 12) == 0) {
+            const char *class_name = trim + 12;
+            while (*class_name && isspace((unsigned char)*class_name))
+                class_name++;
+            const char *end = pg_find_identifier_end(class_name);
+            char *name = pg_span_trim_dup(class_name, end);
+            if (name) {
+                size_t qn_size = strlen(rel_path) + strlen(name) + 56;
+                char *qn = malloc(qn_size);
+                char *props =
+                    pg_structured_properties("init", "class_start", name, NULL, "unresolved", NULL);
+                if (!qn || !props) {
+                    free(qn);
+                    free(props);
+                    rc = -1;
+                } else {
+                    (void)snprintf(qn, qn_size, "%s:%d:class_start:%s", rel_path, line_number,
+                                   name);
+                    char ref_id[65];
+                    hash_id(ctx->workspace->workspace_id, "INIT_CLASS_REFERENCE", qn, ref_id);
+                    rc = insert_protocol_node_properties(ctx, ref_id, repo->repo_id,
+                                                         "INIT_CLASS_REFERENCE", name, qn, rel_path,
+                                                         NULL, props);
+                    if (rc == 0)
+                        rc = insert_protocol_edge_properties(ctx, current_trigger, ref_id,
+                                                             "INIT_CLASS_START_ACTION", 1.0,
+                                                             "init_rc_trigger", props);
+                    free(qn);
+                    free(props);
+                }
+            }
+            free(name);
+        } else if (current_trigger[0] && strncmp(trim, "start ", 6) == 0) {
+            const char *service_name = trim + 6;
+            while (*service_name && isspace((unsigned char)*service_name))
+                service_name++;
+            const char *end = pg_find_identifier_end(service_name);
+            char *name = pg_span_trim_dup(service_name, end);
+            if (name) {
+                size_t qn_size = strlen(rel_path) + strlen(name) + 48;
+                char *qn = malloc(qn_size);
+                char *props =
+                    pg_structured_properties("init", "start", name, NULL, "unresolved", NULL);
+                if (!qn || !props) {
+                    free(qn);
+                    free(props);
+                    rc = -1;
+                } else {
+                    (void)snprintf(qn, qn_size, "%s:%d:start:%s", rel_path, line_number, name);
+                    char ref_id[65];
+                    hash_id(ctx->workspace->workspace_id, "INIT_SERVICE_REFERENCE", qn, ref_id);
+                    rc = insert_protocol_node_properties(ctx, ref_id, repo->repo_id,
+                                                         "INIT_SERVICE_REFERENCE", name, qn,
+                                                         rel_path, NULL, props);
+                    if (rc == 0)
+                        rc = insert_protocol_edge_properties(ctx, current_trigger, ref_id,
+                                                             "INIT_START_ACTION", 1.0,
+                                                             "init_rc_trigger", props);
+                    free(qn);
+                    free(props);
+                }
+            }
+            free(name);
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(source);
+    return rc;
+}
+
+static int parse_binder_directionality(link_ctx_t *ctx, const cbm_aosp_repo_t *repo,
+                                       const char *rel_path, const char *source) {
+    const char *apis[] = {"linkToDeath",   "AIBinder_linkToDeath",
+                          "unlinkToDeath", "AIBinder_unlinkToDeath",
+                          "binderDied",    "onBinderDied"};
+    for (int i = 0; i < 6; i++) {
+        const char *cursor = source;
+        while ((cursor = strstr(cursor, apis[i])) != NULL) {
+            if (cursor > source && (isalnum((unsigned char)cursor[-1]) || cursor[-1] == '_')) {
+                cursor += strlen(apis[i]);
+                continue;
+            }
+            int line = service_source_line(source, (size_t)(cursor - source));
+            char qn[PG_PATH_MAX + 128];
+            (void)snprintf(qn, sizeof(qn), "%s:%d:%s", rel_path, line, apis[i]);
+            const char *kind = i < 4 ? "BINDER_DEATH_REGISTRATION" : "BINDER_DEATH_CALLBACK";
+            char id[65];
+            hash_id(ctx->workspace->workspace_id, kind, qn, id);
+            char *props =
+                pg_structured_properties("binder", i < 4 ? "death_registration" : "death_callback",
+                                         apis[i], NULL, "resolved", "service_to_client");
+            int rc = props ? insert_protocol_node_properties(ctx, id, repo->repo_id, kind, apis[i],
+                                                             qn, rel_path, NULL, props)
+                           : -1;
+            binder_symbol_t caller = {0};
+            int found = rc == 0 ? service_find_caller(ctx, repo, rel_path, line, &caller) : -1;
+            if (found > 0) {
+                rc = add_binder_symbol_endpoint(ctx, &caller, "BINDER_CALLER");
+                if (rc == 0)
+                    rc = insert_protocol_edge_properties(ctx, caller.global_id, id,
+                                                         i < 4 ? "REGISTERS_DEATH_RECIPIENT"
+                                                               : "HANDLES_BINDER_DEATH",
+                                                         1.0, "binder_death_api", props);
+            }
+            binder_symbol_free(&caller);
+            free(props);
+            if (rc != 0 || found < 0)
+                return -1;
+            cursor += strlen(apis[i]);
+        }
+    }
+    return 0;
+}
+
 static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const char *abs_dir,
                           const char *rel_dir, int depth) {
     if (depth > PG_MAX_DEPTH) return -1;
@@ -2360,13 +3077,24 @@ static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
         }
         size_t name_len = strlen(entry->name);
         bool aidl = name_len > 5 && strcmp(entry->name + name_len - 5, ".aidl") == 0;
+        bool hidl = name_len > 4 && strcmp(entry->name + name_len - 4, ".hal") == 0;
+        bool xml = name_len > 4 && strcmp(entry->name + name_len - 4, ".xml") == 0;
+        bool init_rc = name_len > 3 && strcmp(entry->name + name_len - 3, ".rc") == 0;
         bool native = (name_len > 2 && strcmp(entry->name + name_len - 2, ".c") == 0) ||
                       (name_len > 3 && strcmp(entry->name + name_len - 3, ".cc") == 0) ||
-                      (name_len > 4 && strcmp(entry->name + name_len - 4, ".cpp") == 0);
+                      (name_len > 4 && strcmp(entry->name + name_len - 4, ".cpp") == 0) ||
+                      (name_len > 2 && strcmp(entry->name + name_len - 2, ".h") == 0) ||
+                      (name_len > 4 && strcmp(entry->name + name_len - 4, ".hpp") == 0);
         bool managed = (name_len > 5 && strcmp(entry->name + name_len - 5, ".java") == 0) ||
                        (name_len > 3 && strcmp(entry->name + name_len - 3, ".kt") == 0);
         if (aidl) {
             rc = link_aidl_file(ctx, repo, abs_path, rel_path);
+        } else if (hidl) {
+            rc = link_hidl_file(ctx, repo, abs_path, rel_path);
+        } else if (xml) {
+            rc = link_vintf_file(ctx, repo, abs_path, rel_path);
+        } else if (init_rc) {
+            rc = link_init_rc_file(ctx, repo, abs_path, rel_path);
         } else if (native || managed) {
             size_t length = 0;
             char *source = pg_read_file(abs_path, &length);
@@ -2382,6 +3110,14 @@ static int scan_repo_tree(link_ctx_t *ctx, const cbm_aosp_repo_t *repo, const ch
                                 strstr(source, "waitForService") ||
                                 strstr(source, "publishBinderService"))) {
                     rc = parse_service_manager_calls(ctx, repo, rel_path, source);
+                }
+                if (rc == 0 && (strstr(source, "getService") || strstr(source, "tryGetService") ||
+                                strstr(source, "registerAsService"))) {
+                    rc = parse_hidl_operations(ctx, repo, rel_path, source);
+                }
+                if (rc == 0 && (strstr(source, "linkToDeath") || strstr(source, "unlinkToDeath") ||
+                                strstr(source, "binderDied") || strstr(source, "onBinderDied"))) {
+                    rc = parse_binder_directionality(ctx, repo, rel_path, source);
                 }
                 free(source);
             }
@@ -2702,6 +3438,198 @@ static int resolve_binder_services(link_ctx_t *ctx) {
     }
     sqlite3_free(sql_error);
     return rc;
+}
+
+static int exec_protocol_resolution(link_ctx_t *ctx, const char *sql, const char *message) {
+    char *sql_error = NULL;
+    int sqlite_rc = sqlite3_exec(ctx->db, sql, NULL, NULL, &sql_error);
+    if (sqlite_rc != SQLITE_OK) {
+        pg_error(ctx->err, ctx->err_size, message, sql_error ? sql_error : sqlite3_errmsg(ctx->db));
+        sqlite3_free(sql_error);
+        return -1;
+    }
+    sqlite3_free(sql_error);
+    return 0;
+}
+
+static int resolve_android_boundaries(link_ctx_t *ctx) {
+    char sql[32768];
+    const char *workspace_id = ctx->workspace->workspace_id;
+    (void)snprintf(
+        sql, sizeof(sql),
+        "UPDATE protocol_nodes AS op SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=op.workspace_id AND target.kind='HIDL_INTERFACE' "
+        "AND (target.qualified_name=json_extract(op.properties,'$.target') "
+        "OR target.name=json_extract(op.properties,'$.target'))),"
+        "'$.resolution',CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=op.workspace_id AND target.kind='HIDL_INTERFACE' "
+        "AND (target.qualified_name=json_extract(op.properties,'$.target') "
+        "OR target.name=json_extract(op.properties,'$.target'))) "
+        "WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) "
+        "WHERE op.workspace_id='%s' AND op.kind IN('HIDL_CLIENT_LOOKUP',"
+        "'HIDL_SERVICE_REGISTRATION');"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT op.protocol_id,target.protocol_id,"
+        "CASE op.kind WHEN 'HIDL_CLIENT_LOOKUP' THEN 'HWBINDER_CLIENT_INTERFACE' "
+        "ELSE 'HWBINDER_SERVICE_INTERFACE' END,1.0,'hidl_service_api',op.properties "
+        "FROM protocol_nodes op JOIN protocol_nodes target ON target.workspace_id=op.workspace_id "
+        "AND target.kind='HIDL_INTERFACE' AND "
+        "(target.qualified_name=json_extract(op.properties,'$.target') "
+        "OR target.name=json_extract(op.properties,'$.target')) "
+        "WHERE op.workspace_id='%s' AND op.kind IN('HIDL_CLIENT_LOOKUP',"
+        "'HIDL_SERVICE_REGISTRATION') AND json_extract(op.properties,'$.resolution')='resolved';",
+        workspace_id, workspace_id);
+    if (exec_protocol_resolution(ctx, sql, "cannot resolve HIDL operations") != 0)
+        return -1;
+
+    (void)snprintf(
+        sql, sizeof(sql),
+        "UPDATE protocol_nodes AS ref SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND target.qualified_name=substr(json_extract(ref.properties,'$.target'),1,"
+        "instr(json_extract(ref.properties,'$.target'),'/')-1)),"
+        "'$.resolution',CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND target.qualified_name=substr(json_extract(ref.properties,'$.target'),1,"
+        "instr(json_extract(ref.properties,'$.target'),'/')-1)) "
+        "WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) "
+        "WHERE ref.workspace_id='%s' AND ref.kind IN('VINTF_HAL_INSTANCE',"
+        "'VINTF_HAL_REQUIREMENT');"
+        "UPDATE protocol_edges SET properties=(SELECT ref.properties FROM protocol_nodes ref "
+        "WHERE ref.protocol_id=protocol_edges.target_id) WHERE type IN('DECLARES_HAL',"
+        "'REQUIRES_HAL') AND target_id IN(SELECT protocol_id FROM protocol_nodes "
+        "WHERE workspace_id='%s' AND kind IN('VINTF_HAL_INSTANCE',"
+        "'VINTF_HAL_REQUIREMENT'));"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT ref.protocol_id,target.protocol_id,'VINTF_INSTANCE_INTERFACE',1.0,"
+        "'vintf_fqname',ref.properties FROM protocol_nodes ref JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND target.qualified_name=substr(json_extract(ref.properties,'$.target'),1,"
+        "instr(json_extract(ref.properties,'$.target'),'/')-1) "
+        "WHERE ref.workspace_id='%s' AND ref.kind IN('VINTF_HAL_INSTANCE',"
+        "'VINTF_HAL_REQUIREMENT') AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT op.protocol_id,ref.protocol_id,CASE op.kind WHEN 'HIDL_CLIENT_LOOKUP' "
+        "THEN 'HWBINDER_LOOKS_UP_INSTANCE' ELSE 'HWBINDER_REGISTERS_INSTANCE' END,0.98,"
+        "'hidl_vintf_instance',json_object('instance',json_extract(op.properties,'$.instance')) "
+        "FROM protocol_nodes op JOIN protocol_edges iface_edge ON "
+        "iface_edge.source_id=op.protocol_id "
+        "AND iface_edge.type IN('HWBINDER_CLIENT_INTERFACE','HWBINDER_SERVICE_INTERFACE') "
+        "JOIN protocol_nodes iface ON iface.protocol_id=iface_edge.target_id "
+        "JOIN protocol_nodes ref ON ref.workspace_id=op.workspace_id "
+        "AND ref.kind='VINTF_HAL_INSTANCE' "
+        "AND substr(json_extract(ref.properties,'$.target'),1,"
+        "instr(json_extract(ref.properties,'$.target'),'/')-1)=iface.qualified_name "
+        "AND json_extract(ref.properties,'$.instance')=json_extract(op.properties,'$.instance') "
+        "WHERE op.workspace_id='%s';",
+        workspace_id, workspace_id, workspace_id, workspace_id);
+    if (exec_protocol_resolution(ctx, sql, "cannot resolve VINTF HAL instances") != 0)
+        return -1;
+
+    (void)snprintf(
+        sql, sizeof(sql),
+        "UPDATE protocol_nodes AS ref SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND (target.qualified_name=json_extract(ref.properties,'$.target') "
+        "OR target.name=json_extract(ref.properties,'$.target'))),"
+        "'$.resolution',CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND (target.qualified_name=json_extract(ref.properties,'$.target') "
+        "OR target.name=json_extract(ref.properties,'$.target'))) "
+        "WHEN 0 THEN 'not_found' WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) "
+        "WHERE ref.workspace_id='%s' AND ref.kind='INIT_INTERFACE_REFERENCE';"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'INIT_SERVICE_INTERFACE',1.0,"
+        "'init_rc_interface',ref.properties FROM protocol_nodes ref "
+        "JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='INIT_DECLARES_INTERFACE' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id "
+        "AND target.kind IN('HIDL_INTERFACE','AIDL_INTERFACE') "
+        "AND (target.qualified_name=json_extract(ref.properties,'$.target') "
+        "OR target.name=json_extract(ref.properties,'$.target')) "
+        "WHERE ref.workspace_id='%s' AND ref.kind='INIT_INTERFACE_REFERENCE' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "UPDATE protocol_nodes AS ref SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id AND target.kind='INIT_SERVICE' "
+        "AND target.name=json_extract(ref.properties,'$.target')),'$.resolution',"
+        "CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id AND target.kind='INIT_SERVICE' "
+        "AND target.name=json_extract(ref.properties,'$.target')) WHEN 0 THEN 'not_found' "
+        "WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) WHERE ref.workspace_id='%s' "
+        "AND ref.kind='INIT_SERVICE_REFERENCE';"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'INIT_STARTS_SERVICE',1.0,"
+        "'init_rc_trigger',ref.properties FROM protocol_nodes ref "
+        "JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='INIT_START_ACTION' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id AND target.kind='INIT_SERVICE' "
+        "AND target.name=json_extract(ref.properties,'$.target') "
+        "WHERE ref.workspace_id='%s' AND ref.kind='INIT_SERVICE_REFERENCE' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "UPDATE protocol_nodes AS ref SET properties=json_set(properties,"
+        "'$.candidate_count',(SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id AND target.kind='INIT_CLASS' "
+        "AND target.name=json_extract(ref.properties,'$.target')),'$.resolution',"
+        "CASE (SELECT count(*) FROM protocol_nodes target "
+        "WHERE target.workspace_id=ref.workspace_id AND target.kind='INIT_CLASS' "
+        "AND target.name=json_extract(ref.properties,'$.target')) WHEN 0 THEN 'not_found' "
+        "WHEN 1 THEN 'resolved' ELSE 'ambiguous' END) WHERE ref.workspace_id='%s' "
+        "AND ref.kind='INIT_CLASS_REFERENCE';"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT owner.source_id,target.protocol_id,'INIT_STARTS_CLASS',1.0,"
+        "'init_rc_trigger',ref.properties FROM protocol_nodes ref "
+        "JOIN protocol_edges owner ON owner.target_id=ref.protocol_id "
+        "AND owner.type='INIT_CLASS_START_ACTION' JOIN protocol_nodes target "
+        "ON target.workspace_id=ref.workspace_id AND target.kind='INIT_CLASS' "
+        "AND target.name=json_extract(ref.properties,'$.target') "
+        "WHERE ref.workspace_id='%s' AND ref.kind='INIT_CLASS_REFERENCE' "
+        "AND json_extract(ref.properties,'$.resolution')='resolved';"
+        "UPDATE protocol_edges SET properties=(SELECT ref.properties FROM protocol_nodes ref "
+        "WHERE ref.protocol_id=protocol_edges.target_id) WHERE type IN("
+        "'INIT_DECLARES_INTERFACE','INIT_START_ACTION','INIT_CLASS_START_ACTION') "
+        "AND target_id IN(SELECT protocol_id FROM protocol_nodes WHERE workspace_id='%s' "
+        "AND kind IN('INIT_INTERFACE_REFERENCE','INIT_SERVICE_REFERENCE',"
+        "'INIT_CLASS_REFERENCE'));",
+        workspace_id, workspace_id, workspace_id, workspace_id, workspace_id, workspace_id,
+        workspace_id);
+    if (exec_protocol_resolution(ctx, sql, "cannot resolve init service boundaries") != 0) {
+        return -1;
+    }
+
+    (void)snprintf(
+        sql, sizeof(sql),
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT callback.target_id,callback.source_id,'BINDER_CALLBACK_FLOW',1.0,"
+        "'aidl_callback_direction',json_object('direction','service_to_client',"
+        "'request_edge','USES_CALLBACK') FROM protocol_edges callback "
+        "JOIN protocol_nodes source ON source.protocol_id=callback.source_id "
+        "WHERE source.workspace_id='%s' AND callback.type='USES_CALLBACK';"
+        "INSERT OR REPLACE INTO "
+        "protocol_edges(source_id,target_id,type,confidence,evidence,properties) "
+        "SELECT declaration.source_id,method.protocol_id,'BINDER_ASYNC_CALL',1.0,"
+        "'aidl_oneway',json_object('direction','client_to_service','reply','none') "
+        "FROM protocol_nodes method JOIN protocol_edges declaration "
+        "ON declaration.target_id=method.protocol_id AND declaration.type='DECLARES_METHOD' "
+        "WHERE method.workspace_id='%s' AND method.kind='AIDL_METHOD' "
+        "AND json_extract(method.properties,'$.oneway')=1;",
+        workspace_id, workspace_id);
+    return exec_protocol_resolution(ctx, sql, "cannot resolve Binder directionality");
 }
 
 static bool binder_generated_server(const char *qualified_name, const char *bn_name,
@@ -3065,6 +3993,113 @@ int cbm_aosp_protocol_stats(const cbm_aosp_workspace_t *workspace,
         pg_error(err, err_size, "cannot read AOSP protocol graph", sqlite3_errmsg(db));
     }
     sqlite3_finalize(stmt);
+    stmt = NULL;
+    const char *boundary_sql =
+        "SELECT "
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='HIDL_INTERFACE'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='HIDL_METHOD'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='HIDL_CLIENT_LOOKUP'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND "
+        "kind='HIDL_SERVICE_REGISTRATION'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='VINTF_HAL_INSTANCE' "
+        "AND json_extract(properties,'$.protocol')='hidl'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='VINTF_MANIFEST'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='VINTF_MATRIX'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('VINTF_HAL_INSTANCE','VINTF_HAL_REQUIREMENT')),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id "
+        "WHERE n.workspace_id=?1 AND e.type='VINTF_INSTANCE_INTERFACE'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='INIT_SERVICE'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='INIT_BINARY'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind='INIT_TRIGGER'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id "
+        "WHERE n.workspace_id=?1 AND e.type='INIT_SERVICE_INTERFACE'),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id "
+        "WHERE n.workspace_id=?1 AND e.type='BINDER_CALLBACK_FLOW'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('BINDER_DEATH_REGISTRATION','BINDER_DEATH_CALLBACK')),"
+        "(SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n ON n.protocol_id=e.source_id "
+        "WHERE n.workspace_id=?1 AND e.type "
+        "IN('BINDER_ASYNC_CALL','HWBINDER_ASYNC_CALL','BINDER_CALLBACK_FLOW')),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('AIDL_IMPORT','AIDL_TYPE_REFERENCE') AND "
+        "json_extract(properties,'$.resolution')='resolved'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('AIDL_IMPORT','AIDL_TYPE_REFERENCE') AND "
+        "json_extract(properties,'$.resolution')='ambiguous'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('AIDL_IMPORT','AIDL_TYPE_REFERENCE') AND "
+        "coalesce(json_extract(properties,'$.resolution'),'unresolved') NOT "
+        "IN('resolved','ambiguous')),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('HIDL_CLIENT_LOOKUP','HIDL_SERVICE_REGISTRATION') AND "
+        "json_extract(properties,'$.resolution')='resolved'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('HIDL_CLIENT_LOOKUP','HIDL_SERVICE_REGISTRATION') AND "
+        "json_extract(properties,'$.resolution')='ambiguous'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('HIDL_CLIENT_LOOKUP','HIDL_SERVICE_REGISTRATION') AND "
+        "coalesce(json_extract(properties,'$.resolution'),'unresolved') NOT "
+        "IN('resolved','ambiguous')),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('VINTF_HAL_INSTANCE','VINTF_HAL_REQUIREMENT') AND "
+        "json_extract(properties,'$.resolution')='resolved'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('VINTF_HAL_INSTANCE','VINTF_HAL_REQUIREMENT') AND "
+        "json_extract(properties,'$.resolution')='ambiguous'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('VINTF_HAL_INSTANCE','VINTF_HAL_REQUIREMENT') AND "
+        "coalesce(json_extract(properties,'$.resolution'),'unresolved') NOT "
+        "IN('resolved','ambiguous')),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('INIT_INTERFACE_REFERENCE','INIT_SERVICE_REFERENCE','INIT_CLASS_REFERENCE') AND "
+        "json_extract(properties,'$.resolution')='resolved'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('INIT_INTERFACE_REFERENCE','INIT_SERVICE_REFERENCE','INIT_CLASS_REFERENCE') AND "
+        "json_extract(properties,'$.resolution')='ambiguous'),"
+        "(SELECT count(*) FROM protocol_nodes WHERE workspace_id=?1 AND kind "
+        "IN('INIT_INTERFACE_REFERENCE','INIT_SERVICE_REFERENCE','INIT_CLASS_REFERENCE') AND "
+        "coalesce(json_extract(properties,'$.resolution'),'unresolved') NOT "
+        "IN('resolved','ambiguous'));";
+    if (rc == 0 && sqlite3_prepare_v2(db, boundary_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, workspace->workspace_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            stats->hidl_interfaces = sqlite3_column_int(stmt, 0);
+            stats->hidl_methods = sqlite3_column_int(stmt, 1);
+            stats->hidl_clients = sqlite3_column_int(stmt, 2);
+            stats->hidl_services = sqlite3_column_int(stmt, 3);
+            stats->hidl_instances = sqlite3_column_int(stmt, 4);
+            stats->vintf_manifests = sqlite3_column_int(stmt, 5);
+            stats->vintf_matrices = sqlite3_column_int(stmt, 6);
+            stats->vintf_hal_instances = sqlite3_column_int(stmt, 7);
+            stats->vintf_interface_links = sqlite3_column_int(stmt, 8);
+            stats->init_services = sqlite3_column_int(stmt, 9);
+            stats->init_binaries = sqlite3_column_int(stmt, 10);
+            stats->init_triggers = sqlite3_column_int(stmt, 11);
+            stats->init_interface_links = sqlite3_column_int(stmt, 12);
+            stats->binder_callbacks = sqlite3_column_int(stmt, 13);
+            stats->binder_death_recipients = sqlite3_column_int(stmt, 14);
+            stats->binder_async_edges = sqlite3_column_int(stmt, 15);
+            stats->aidl_resolved = sqlite3_column_int(stmt, 16);
+            stats->aidl_ambiguous = sqlite3_column_int(stmt, 17);
+            stats->aidl_unresolved = sqlite3_column_int(stmt, 18);
+            stats->hidl_resolved = sqlite3_column_int(stmt, 19);
+            stats->hidl_ambiguous = sqlite3_column_int(stmt, 20);
+            stats->hidl_unresolved = sqlite3_column_int(stmt, 21);
+            stats->vintf_resolved = sqlite3_column_int(stmt, 22);
+            stats->vintf_ambiguous = sqlite3_column_int(stmt, 23);
+            stats->vintf_unresolved = sqlite3_column_int(stmt, 24);
+            stats->init_resolved = sqlite3_column_int(stmt, 25);
+            stats->init_ambiguous = sqlite3_column_int(stmt, 26);
+            stats->init_unresolved = sqlite3_column_int(stmt, 27);
+        } else {
+            rc = -1;
+        }
+    } else if (rc == 0) {
+        pg_error(err, err_size, "cannot read AOSP protocol coverage", sqlite3_errmsg(db));
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
     sqlite3_close(db);
     return rc;
 }
@@ -3133,6 +4168,8 @@ int cbm_aosp_protocol_link(const cbm_aosp_workspace_t *workspace,
     }
     if (rc == 0) rc = resolve_aidl_references(&ctx);
     if (rc == 0) rc = resolve_binder_services(&ctx);
+    if (rc == 0)
+        rc = resolve_android_boundaries(&ctx);
     if (rc == 0) rc = link_static_jni(&ctx);
     sqlite3_finalize(ctx.insert_node);
     sqlite3_finalize(ctx.insert_edge);

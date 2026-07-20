@@ -373,6 +373,14 @@ declared reference spellings, output tags, visibility evidence, and direct or
 defaults-inherited provenance. Module properties and literal file declarations
 are returned with the same structured provenance and B9 link state.
 
+A1 adds the actual reverse edges rather than only an incoming count. Each selected
+module returns a bounded `reverse_dependencies` array containing the dependent
+module ID, repository, name, edge type, original declared target, and the same
+provenance object stored on the forward declaration. CLI detail output emits the
+equivalent `reverse_dependency` rows. Forward dependencies, reverse dependencies,
+files, and coverage gaps use independent detail budgets so a dense direction does
+not silently consume another direction's evidence.
+
 The query also materializes workspace coverage-gap rows from unsupported Android.mk
 expressions, Bazel artifact/target provider gaps, unresolved Bazel targets, and
 unresolved Bazel dependencies. Results are deterministically ordered. Dependency,
@@ -615,6 +623,66 @@ decoded class, method, signature, signature-resolution mode, overload state, and
 registration helper. `aosp link` and `aosp_trace_protocol` report
 `jni_overload_edges` and `jni_registration_helper_edges` alongside the existing
 static and dynamic JNI totals. Refresh remains atomic and idempotent.
+
+## HIDL And HwBinder
+
+P6 parses `.hal` package, interface, method, and `oneway` declarations into
+`HIDL_INTERFACE` and `HIDL_METHOD` nodes. Generated `BnHw*`, `BpHw*`, and `IHw*`
+symbols become server, client, and interface endpoints when the workspace symbol
+catalog contains the exact generated name. Static `getService`, `tryGetService`,
+and `registerAsService` calls are accepted only when their owner is an `I*`
+interface, preventing Binder `ServiceManager.getService` calls from being counted
+as HIDL operations.
+
+Client and service calls retain the literal instance, exact interface reference,
+API, resolution state, and candidate count. A unique interface creates
+`HWBINDER_CLIENT_INTERFACE` or `HWBINDER_SERVICE_INTERFACE`; missing and ambiguous
+owners remain queryable without speculative links. HIDL `oneway` methods create
+`HWBINDER_ASYNC_CALL` edges with no-reply evidence.
+
+## VINTF HAL Instances
+
+P7 scans VINTF device manifests and framework/device compatibility matrices. Both
+the expanded `<interface><name>...<instance>...` representation and canonical
+`<fqname>` representation are normalized to the same HAL identity. HIDL
+`@version::interface/instance` entries resolve to HIDL declarations, while AIDL
+`interface/instance` entries resolve to versioned AIDL declarations. Manifest
+instances and matrix requirements retain format, version, transport, optionality,
+source file, resolution state, and candidate count.
+
+A unique HIDL or AIDL declaration creates `VINTF_INSTANCE_INTERFACE`. Literal HIDL
+client and service instances are then linked to matching manifest instances with
+`HWBINDER_LOOKS_UP_INSTANCE` and `HWBINDER_REGISTERS_INSTANCE`. A missing
+declaration or unmatched instance remains visible in per-protocol coverage.
+
+## Init Service Boundaries
+
+P8 parses service blocks and `on` actions from Android `*.rc` files. Services are
+linked to stable binary nodes, declared service classes, and AIDL/HIDL interface
+references. Direct `start` actions resolve to exact service names, while
+`class_start` actions resolve through shared class nodes. The resulting graph uses
+`INIT_SERVICE_BINARY`, `INIT_SERVICE_CLASS`, `INIT_SERVICE_INTERFACE`,
+`INIT_STARTS_SERVICE`, and `INIT_STARTS_CLASS` edges.
+
+Every interface, service, and class reference retains resolved, ambiguous, or
+not-found state. This makes incomplete vendor workspaces distinguishable from an
+init service that is known not to expose the requested interface.
+
+## Binder Direction And Protocol Coverage
+
+P9 adds reverse `BINDER_CALLBACK_FLOW` edges for resolved AIDL interface
+parameters, `BINDER_ASYNC_CALL` edges for AIDL `oneway` methods, and source-located
+death registration/callback nodes for Java, native, and NDK death APIs. Indexed
+enclosing callers are linked with `REGISTERS_DEATH_RECIPIENT` or
+`HANDLES_BINDER_DEATH`; edge properties state the client-to-service or
+service-to-client direction.
+
+P10 publishes resolved, ambiguous, and unresolved totals independently for AIDL,
+HIDL, VINTF, and init references. `aosp link` prints the coverage tuple for every
+protocol, while `aosp_trace_protocol` returns the same counts as structured JSON.
+The referenced nodes retain their target, instance, role, candidate count, source
+file, and resolution value, so CLI and MCP callers can retrieve concrete
+unresolved evidence rather than only aggregate loss counts.
 
 ## Schema Compatibility
 

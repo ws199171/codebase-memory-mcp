@@ -70,6 +70,9 @@ typedef struct {
 } cbm_aosp_build_stats_t;
 
 typedef struct {
+    char *source_module_id;
+    char *source_repo_path;
+    char *source_module_name;
     char *target_name;
     char *dependency_type;
     char *target_module_id;
@@ -100,6 +103,8 @@ typedef struct {
     int incoming_dependencies;
     cbm_aosp_module_dependency_t *dependencies;
     int dependency_count;
+    cbm_aosp_module_dependency_t *reverse_dependencies;
+    int reverse_dependency_count;
     cbm_aosp_module_file_t *files;
     int file_count;
     int details_truncated;

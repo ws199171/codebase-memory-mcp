@@ -3677,6 +3677,13 @@ int cbm_cmd_aosp(int argc, char **argv) {
                            dependency->target_repo_path, dependency->target_module_name,
                            dependency->properties);
                 }
+                for (int d = 0; d < modules[i].reverse_dependency_count; d++) {
+                    cbm_aosp_module_dependency_t *dependency = &modules[i].reverse_dependencies[d];
+                    printf("reverse_dependency\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", modules[i].repo_path,
+                           modules[i].name, dependency->dependency_type,
+                           dependency->source_repo_path, dependency->source_module_name,
+                           dependency->target_name, dependency->properties);
+                }
                 for (int f = 0; f < modules[i].file_count; f++) {
                     cbm_aosp_module_file_t *file = &modules[i].files[f];
                     printf("file\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -3731,6 +3738,26 @@ int cbm_cmd_aosp(int argc, char **argv) {
             printf("  JNI: %d static, %d dynamic, %d overload, %d helper edges\n",
                    stats.jni_static_edges, stats.jni_dynamic_edges,
                    stats.jni_overload_edges, stats.jni_registration_helper_edges);
+            printf("  HIDL/HwBinder: %d interfaces, %d methods, %d clients, "
+                   "%d services, %d instances\n",
+                   stats.hidl_interfaces, stats.hidl_methods, stats.hidl_clients,
+                   stats.hidl_services, stats.hidl_instances);
+            printf("  VINTF: %d manifests, %d matrices, %d HAL entries, "
+                   "%d interface links\n",
+                   stats.vintf_manifests, stats.vintf_matrices, stats.vintf_hal_instances,
+                   stats.vintf_interface_links);
+            printf("  init: %d services, %d binaries, %d triggers, %d interface links\n",
+                   stats.init_services, stats.init_binaries, stats.init_triggers,
+                   stats.init_interface_links);
+            printf("  Binder direction: %d callbacks, %d death recipients, "
+                   "%d asynchronous edges\n",
+                   stats.binder_callbacks, stats.binder_death_recipients, stats.binder_async_edges);
+            printf("  coverage: AIDL %d/%d/%d, HIDL %d/%d/%d, "
+                   "VINTF %d/%d/%d, init %d/%d/%d (resolved/ambiguous/unresolved)\n",
+                   stats.aidl_resolved, stats.aidl_ambiguous, stats.aidl_unresolved,
+                   stats.hidl_resolved, stats.hidl_ambiguous, stats.hidl_unresolved,
+                   stats.vintf_resolved, stats.vintf_ambiguous, stats.vintf_unresolved,
+                   stats.init_resolved, stats.init_ambiguous, stats.init_unresolved);
             printf("  total: %d nodes, %d edges\n", stats.node_count, stats.edge_count);
         }
     } else if (strcmp(action, "federate") == 0) {

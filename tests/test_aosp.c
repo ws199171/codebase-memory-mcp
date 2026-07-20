@@ -875,6 +875,75 @@ static int create_service_manager_workspace_fixture(char **root_out) {
     return 0;
 }
 
+static int create_android_boundaries_workspace_fixture(char **root_out) {
+    static unsigned fixture_sequence = 0;
+    char prefix[64];
+    (void)snprintf(prefix, sizeof(prefix), "cbm_aosp_protocol_p6_p10_%u", ++fixture_sequence);
+    const char *temp_root = th_mktempdir(prefix);
+    if (!temp_root)
+        return -1;
+    char *root = strdup(temp_root);
+    if (!root)
+        return -1;
+    if (make_dir(root, ".repo") != 0 || make_dir(root, "hal/android/hardware/foo/1.0") != 0 ||
+        make_dir(root, "hal/vintf") != 0 || make_dir(root, "hal/init") != 0 ||
+        make_dir(root, "hal/src") != 0 || make_dir(root, "hal/aidl") != 0 ||
+        write_relative(root, ".repo/manifest.xml",
+                       "<manifest><project name=\"platform/hardware/interfaces/foo\" path=\"hal\"/>"
+                       "</manifest>") != 0 ||
+        write_relative(root, "hal/android/hardware/foo/1.0/IFoo.hal",
+                       "package android.hardware.foo@1.0;\n"
+                       "interface IFoo extends IBase {\n"
+                       "  ping() generates (int32_t result);\n"
+                       "  oneway notify(int32_t value);\n"
+                       "};\n") != 0 ||
+        write_relative(root, "hal/aidl/ICallback.aidl",
+                       "package android.hardware.foo;\n"
+                       "oneway interface ICallback { void changed(int value); }\n") != 0 ||
+        write_relative(root, "hal/aidl/IControl.aidl",
+                       "package android.hardware.foo;\n"
+                       "import android.hardware.foo.ICallback;\n"
+                       "interface IControl { oneway void subscribe(in ICallback callback); }\n") !=
+            0 ||
+        write_relative(
+            root, "hal/src/Foo.cpp",
+            "void connectFoo() { auto foo = IFoo::getService(\"default\"); "
+            "foo->linkToDeath(recipient, 0); }\n"
+            "void publishFoo() { IFoo::registerAsService(\"default\"); }\n"
+            "void Recipient::binderDied() {}\n"
+            "void connectMissing() { auto missing = IMissing::getService(\"ghost\"); }\n") != 0 ||
+        write_relative(root, "hal/vintf/manifest.xml",
+                       "<manifest version=\"1.0\" type=\"device\">"
+                       "<hal format=\"hidl\"><name>android.hardware.foo</name>"
+                       "<transport>hwbinder</transport><version>1.0</version>"
+                       "<interface><name>IFoo</name><instance>default</instance></interface>"
+                       "</hal>"
+                       "<hal format=\"aidl\"><name>android.hardware.foo</name><version>1</version>"
+                       "<fqname>IControl/default</fqname></hal>"
+                       "</manifest>") != 0 ||
+        write_relative(root, "hal/vintf/compatibility_matrix.xml",
+                       "<compatibility-matrix version=\"1.0\" type=\"framework\">"
+                       "<hal format=\"hidl\" optional=\"false\"><name>android.hardware.foo</name>"
+                       "<fqname>@1.0::IFoo/default</fqname>"
+                       "</hal></compatibility-matrix>") != 0 ||
+        write_relative(root, "hal/init/foo.rc",
+                       "service vendor.foo-hal /vendor/bin/hw/android.hardware.foo@1.0-service\n"
+                       "    class hal\n"
+                       "    interface hidl android.hardware.foo@1.0::IFoo default\n"
+                       "\n"
+                       "on boot\n"
+                       "    class_start hal\n"
+                       "\n"
+                       "on property:vendor.foo.ready=1\n"
+                       "    start vendor.foo-hal\n") != 0) {
+        th_rmtree(root);
+        free(root);
+        return -1;
+    }
+    *root_out = root;
+    return 0;
+}
+
 TEST(aosp_manifest_include_and_local_override) {
     char *root = NULL;
     ASSERT_EQ(create_workspace_fixture(&root), 0);
@@ -1685,8 +1754,8 @@ static int create_q7_shard(const char *path, int repo_index) {
         "(2,'Duplicate','q7.beta.Duplicate','Function','src/Beta.c',5,7,'{}'),"
         "(3,'Q7BetaLocal','q7.beta.Q7BetaLocal','Function','src/Beta.c',9,11,'{}');"
         "INSERT INTO edges VALUES(1,1,3,'CALLS','{}');",
-        "INSERT INTO nodes VALUES"
-        "(1,'Q7End','q7.gamma.Q7End','Function','src/Gamma.c',1,3,'{}');",
+        ("INSERT INTO nodes VALUES"
+         "(1,'Q7End','q7.gamma.Q7End','Function','src/Gamma.c',1,3,'{}');"),
     };
     int rc = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
              repo_index >= 0 && repo_index < 3 &&
@@ -3454,6 +3523,31 @@ TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance) {
     modules = NULL;
     count = 0;
     truncated = false;
+    ASSERT_EQ(cbm_aosp_search_modules(&workspace, "libfromdefaults", 10, &modules, &count, err,
+                                      sizeof(err)),
+              0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(
+        cbm_aosp_load_module_details(&workspace, modules, count, 100, &truncated, err, sizeof(err)),
+        0);
+    ASSERT_FALSE(truncated);
+    ASSERT_TRUE(modules[0].reverse_dependency_count >= 1);
+    bool found_reverse_variant = false;
+    for (int i = 0; i < modules[0].reverse_dependency_count; i++) {
+        cbm_aosp_module_dependency_t *dependency = &modules[0].reverse_dependencies[i];
+        if (strcmp(dependency->source_module_name, "libvariant_consumer") != 0)
+            continue;
+        ASSERT_STR_EQ(dependency->source_repo_path, "project");
+        ASSERT_STR_EQ(dependency->target_name, "libfromdefaults");
+        ASSERT_NOT_NULL(strstr(dependency->properties, "\"origin\":\"defaults\""));
+        found_reverse_variant = true;
+    }
+    ASSERT_TRUE(found_reverse_variant);
+    cbm_aosp_modules_free(modules, count);
+
+    modules = NULL;
+    count = 0;
+    truncated = false;
     ASSERT_EQ(cbm_aosp_search_modules(&workspace, "libvariant_consumer", 10,
                                       &modules, &count, err, sizeof(err)), 0);
     ASSERT_EQ(cbm_aosp_load_module_details(&workspace, modules, count, 1,
@@ -3473,6 +3567,17 @@ TEST(aosp_build_queries_expose_edges_variants_gaps_and_provenance) {
     ASSERT_NOT_NULL(strstr(response, "\"dependencies\""));
     ASSERT_NOT_NULL(strstr(response, "target.android&arch.arm64"));
     ASSERT_NOT_NULL(strstr(response, "\"origin\":\"defaults\""));
+    free(response);
+
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"libfromdefaults\","
+                   "\"detail_limit\":100}",
+                   root);
+    response = cbm_mcp_handle_tool(NULL, "aosp_get_architecture", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"reverse_dependencies\""));
+    ASSERT_NOT_NULL(strstr(response, "\"name\":\"libvariant_consumer\""));
+    ASSERT_NOT_NULL(strstr(response, "\"declared_target\":\"libfromdefaults\""));
     free(response);
 
     cbm_aosp_workspace_free(&workspace);
@@ -4193,6 +4298,120 @@ TEST(aosp_protocol_graph_decodes_jni_overloads_and_registration_helpers) {
     ASSERT_EQ(stats.edge_count, edge_count);
     ASSERT_EQ(stats.jni_static_edges, 4);
     ASSERT_EQ(stats.jni_dynamic_edges, 2);
+
+    cbm_aosp_workspace_free(&workspace);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
+TEST(aosp_protocol_graph_models_android_system_boundaries_and_coverage) {
+    char *root = NULL;
+    ASSERT_EQ(create_android_boundaries_workspace_fixture(&root), 0);
+    cbm_aosp_workspace_t workspace;
+    char err[512] = {0};
+    ASSERT_EQ(cbm_aosp_discover(root, &workspace, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_aosp_master_sync(&workspace, err, sizeof(err)), 0);
+
+    char shard_path[4096];
+    (void)snprintf(shard_path, sizeof(shard_path), "%s/boundaries-shard.db", root);
+    sqlite3 *shard = NULL;
+    ASSERT_EQ(sqlite3_open(shard_path, &shard), SQLITE_OK);
+    ASSERT_EQ(
+        sqlite3_exec(
+            shard,
+            "CREATE TABLE nodes(id INTEGER PRIMARY KEY,name TEXT,qualified_name TEXT,label TEXT,"
+            "file_path TEXT,start_line INTEGER,end_line INTEGER,properties TEXT);"
+            "INSERT INTO nodes VALUES"
+            "(1,'BnHwFoo','android.hardware.foo.V1_0.BnHwFoo','Class',"
+            "'android/hardware/foo/1.0/BnHwFoo.h',1,20,'{}'),"
+            "(2,'BpHwFoo','android.hardware.foo.V1_0.BpHwFoo','Class',"
+            "'android/hardware/foo/1.0/BpHwFoo.h',1,20,'{}'),"
+            "(3,'IHwFoo','android.hardware.foo.V1_0.IHwFoo','Class',"
+            "'android/hardware/foo/1.0/IHwFoo.h',1,20,'{}'),"
+            "(4,'connectFoo','connectFoo','Function','src/Foo.cpp',1,1,'{}'),"
+            "(5,'publishFoo','publishFoo','Function','src/Foo.cpp',2,2,'{}'),"
+            "(6,'binderDied','Recipient.binderDied','Method','src/Foo.cpp',3,3,'{}'),"
+            "(7,'connectMissing','connectMissing','Function','src/Foo.cpp',4,4,'{}');",
+            NULL, NULL, NULL),
+        SQLITE_OK);
+    sqlite3_close(shard);
+    ASSERT_EQ(
+        cbm_aosp_catalog_repo_db(&workspace, &workspace.repos[0], shard_path, err, sizeof(err)), 0);
+
+    cbm_aosp_protocol_stats_t stats;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.hidl_interfaces, 1);
+    ASSERT_EQ(stats.hidl_methods, 2);
+    ASSERT_EQ(stats.hidl_clients, 2);
+    ASSERT_EQ(stats.hidl_services, 1);
+    ASSERT_EQ(stats.hidl_resolved, 2);
+    ASSERT_EQ(stats.hidl_unresolved, 1);
+    ASSERT_EQ(stats.binder_services, 0);
+    ASSERT_EQ(stats.vintf_manifests, 1);
+    ASSERT_EQ(stats.vintf_matrices, 1);
+    ASSERT_EQ(stats.vintf_hal_instances, 3);
+    ASSERT_EQ(stats.vintf_interface_links, 3);
+    ASSERT_EQ(stats.vintf_resolved, 3);
+    ASSERT_EQ(stats.init_services, 1);
+    ASSERT_EQ(stats.init_binaries, 1);
+    ASSERT_EQ(stats.init_triggers, 2);
+    ASSERT_EQ(stats.init_interface_links, 1);
+    ASSERT_EQ(stats.init_resolved, 3);
+    ASSERT(stats.binder_death_recipients >= 2);
+    ASSERT(stats.binder_callbacks >= 1);
+    ASSERT(stats.binder_async_edges >= 3);
+
+    char master_path[4096];
+    ASSERT_EQ(cbm_aosp_master_path(&workspace, master_path, sizeof(master_path), false), 0);
+    sqlite3 *master = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(master_path, &master), SQLITE_OK);
+    ASSERT_EQ(
+        sqlite3_prepare_v2(master,
+                           "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n "
+                           "ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type IN("
+                           "'HWBINDER_REGISTERS_INSTANCE','HWBINDER_LOOKS_UP_INSTANCE',"
+                           "'INIT_STARTS_SERVICE','INIT_STARTS_CLASS','INIT_SERVICE_INTERFACE',"
+                           "'BINDER_CALLBACK_FLOW');",
+                           -1, &stmt, NULL),
+        SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT(sqlite3_column_int(stmt, 0) >= 6);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(
+        sqlite3_prepare_v2(master,
+                           "SELECT count(*) FROM protocol_edges e JOIN protocol_nodes n "
+                           "ON n.protocol_id=e.source_id WHERE n.workspace_id=?1 AND e.type IN("
+                           "'DECLARES_HAL','REQUIRES_HAL','INIT_DECLARES_INTERFACE',"
+                           "'INIT_START_ACTION','INIT_CLASS_START_ACTION') "
+                           "AND json_extract(e.properties,'$.resolution')!='resolved';",
+                           -1, &stmt, NULL),
+        SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, workspace.workspace_id, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(master);
+
+    char args[8192];
+    (void)snprintf(args, sizeof(args),
+                   "{\"workspace_root\":\"%s\",\"query\":\"Foo\",\"limit\":100}", root);
+    char *response = cbm_mcp_handle_tool(NULL, "aosp_trace_protocol", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"hidl_interfaces\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"vintf_hal_instances\":3"));
+    ASSERT_NOT_NULL(strstr(response, "\"init_services\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\"binder_death_recipients\":"));
+    ASSERT_NOT_NULL(strstr(response, "\"coverage\":"));
+    ASSERT_NOT_NULL(strstr(response, "HWBINDER_ASYNC_CALL"));
+    free(response);
+
+    int edge_count = stats.edge_count;
+    ASSERT_EQ(cbm_aosp_protocol_link(&workspace, &stats, err, sizeof(err)), 0);
+    ASSERT_EQ(stats.edge_count, edge_count);
+    ASSERT_EQ(stats.hidl_unresolved, 1);
 
     cbm_aosp_workspace_free(&workspace);
     th_rmtree(root);
@@ -5277,6 +5496,7 @@ SUITE(aosp) {
     RUN_TEST(aosp_protocol_graph_links_service_manager_paths);
     RUN_TEST(aosp_protocol_graph_links_binder_and_jni_evidence);
     RUN_TEST(aosp_protocol_graph_decodes_jni_overloads_and_registration_helpers);
+    RUN_TEST(aosp_protocol_graph_models_android_system_boundaries_and_coverage);
     RUN_TEST(aosp_cross_edges_are_deterministic_and_refresh_per_source_repo);
     RUN_TEST(aosp_cross_edges_enforce_workspace_and_repository_boundaries);
     RUN_TEST(aosp_cross_edges_migrate_v3_schema_without_losing_resolved_edges);

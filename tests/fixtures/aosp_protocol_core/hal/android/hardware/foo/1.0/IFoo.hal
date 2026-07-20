@@ -1,0 +1,6 @@
+package android.hardware.foo@1.0;
+
+interface IFoo extends IBase {
+    ping() generates (int32_t result);
+    oneway notify(int32_t value);
+};

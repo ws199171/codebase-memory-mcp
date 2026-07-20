@@ -36,6 +36,34 @@ typedef struct {
     int jni_dynamic_edges;
     int jni_overload_edges;
     int jni_registration_helper_edges;
+    int hidl_interfaces;
+    int hidl_methods;
+    int hidl_clients;
+    int hidl_services;
+    int hidl_instances;
+    int vintf_manifests;
+    int vintf_matrices;
+    int vintf_hal_instances;
+    int vintf_interface_links;
+    int init_services;
+    int init_binaries;
+    int init_triggers;
+    int init_interface_links;
+    int binder_callbacks;
+    int binder_death_recipients;
+    int binder_async_edges;
+    int aidl_resolved;
+    int aidl_ambiguous;
+    int aidl_unresolved;
+    int hidl_resolved;
+    int hidl_ambiguous;
+    int hidl_unresolved;
+    int vintf_resolved;
+    int vintf_ambiguous;
+    int vintf_unresolved;
+    int init_resolved;
+    int init_ambiguous;
+    int init_unresolved;
 } cbm_aosp_protocol_stats_t;
 
 typedef struct {

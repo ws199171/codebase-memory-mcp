@@ -1,0 +1,3 @@
+<manifest>
+  <project name="platform/hardware/interfaces/foo" path="hal"/>
+</manifest>

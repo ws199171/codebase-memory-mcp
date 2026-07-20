@@ -1,0 +1,6 @@
+<compatibility-matrix version="1.0" type="framework">
+  <hal format="hidl" optional="false">
+    <name>android.hardware.foo</name>
+    <fqname>@1.0::IFoo/default</fqname>
+  </hal>
+</compatibility-matrix>

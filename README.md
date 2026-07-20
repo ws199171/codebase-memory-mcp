@@ -625,10 +625,17 @@ overload parameter signatures. Dynamic table signatures and common Android
 registration helpers are retained as edge evidence; overloads require an exact
 Java parameter-signature match, while ambiguous short names are not linked. Each
 protocol edge records its confidence and evidence; ambiguous name-only candidates
-are not linked.
+are not linked. Legacy HIDL `.hal` declarations are linked to generated HwBinder
+endpoints and literal `getService`/`registerAsService` paths. VINTF manifests and
+compatibility matrices contribute normalized HAL instances from both interface
+blocks and `fqname` entries. Android `init.rc` service blocks connect binaries,
+declared AIDL/HIDL interfaces, service classes, and `start`/`class_start` triggers.
+Binder callback, death-recipient, and one-way flow edges retain their direction.
+CLI and MCP protocol results publish resolved, ambiguous, and unresolved coverage
+separately for AIDL, HIDL, VINTF, and init evidence.
 
-`aosp modules --details` exposes bounded outgoing dependency records and file
-declarations for matching modules. Each record retains structured variant,
+`aosp modules --details` exposes bounded outgoing and reverse dependency records
+plus file declarations for matching modules. Each record retains structured variant,
 defaults-inheritance, resolution, visibility, declared-reference, and output-tag
 evidence. The same query reports concrete unsupported Make expressions and Bazel
 coverage gaps; `--detail-limit` controls each detail class and reports truncation.
@@ -666,8 +673,8 @@ implementation, annotation, call, and usage relationships.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `aosp_get_status` | Report repository indexing and federated edge coverage, staleness, and refresh failures for an AOSP workspace. |
 | `aosp_search_symbols` | Search definition symbols across all indexed repositories in an AOSP workspace. |
-| `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, bounded dependency/file details with variants and provenance, concrete coverage gaps, products, BoardConfig and partition ownership, and namespace/package boundaries. |
-| `aosp_trace_protocol` | Query complete AIDL declarations and metadata plus Binder/JNI protocol nodes and link coverage across AOSP repositories. |
+| `aosp_get_architecture` | Query AOSP Soong/Make/Bazel/AIDL modules, bounded outgoing/reverse dependency and file details with variants and provenance, concrete coverage gaps, products, BoardConfig and partition ownership, and namespace/package boundaries. |
+| `aosp_trace_protocol` | Query AIDL, Binder/JNI, HIDL/HwBinder, VINTF, and init protocol nodes, directional edges, per-protocol coverage, and unresolved evidence across AOSP repositories. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |

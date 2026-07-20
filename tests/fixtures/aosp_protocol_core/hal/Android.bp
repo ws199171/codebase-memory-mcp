@@ -1,0 +1,9 @@
+cc_library {
+    name: "libfoo_core",
+    srcs: ["src/Foo.cpp"],
+}
+
+cc_binary {
+    name: "foo_service",
+    shared_libs: ["libfoo_core", "libmissing"],
+}

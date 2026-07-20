@@ -612,7 +612,8 @@ static const tool_def_t TOOLS[] = {
      "catalog. Ambiguous best-tier matches are returned explicitly and are never auto-selected.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
-     "\"reference\":{\"type\":\"string\",\"description\":\"Global ID, qualified name, suffix, or exact name\"}},"
+     "\"reference\":{\"type\":\"string\",\"description\":\"Global ID, qualified name, suffix, or "
+     "exact name\"}},"
      "\"required\":[\"workspace_root\",\"reference\"]}"},
 
     {"aosp_get_source_snippet", "Get AOSP source snippet",
@@ -621,7 +622,8 @@ static const tool_def_t TOOLS[] = {
      "the repository are returned as errors.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
-     "\"global_id\":{\"type\":\"string\",\"description\":\"Exact global_id returned by AOSP search or resolution\"}},"
+     "\"global_id\":{\"type\":\"string\",\"description\":\"Exact global_id returned by AOSP search "
+     "or resolution\"}},"
      "\"required\":[\"workspace_root\",\"global_id\"]}"},
 
     {"aosp_trace_path", "Trace AOSP path",
@@ -629,9 +631,11 @@ static const tool_def_t TOOLS[] = {
      "repository, source location, edge type, confidence, and evidence for each hop.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
-     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol reference\"},"
+     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol "
+     "reference\"},"
      "\"max_depth\":{\"type\":\"integer\",\"default\":3,\"minimum\":0,\"maximum\":1000},"
-     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":\"outgoing\"},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":"
+     "\"outgoing\"},"
      "\"result_budget\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":10000}},"
      "\"required\":[\"workspace_root\",\"start\"]}"},
 
@@ -640,18 +644,21 @@ static const tool_def_t TOOLS[] = {
      "nodes without changing the existing single-project query_graph contract.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
-     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol reference\"},"
+     "\"start\":{\"type\":\"string\",\"description\":\"Global ID or unambiguous symbol "
+     "reference\"},"
      "\"hops\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":64,\"items\":{"
      "\"type\":\"object\",\"properties\":{"
      "\"kind\":{\"type\":\"string\",\"enum\":[\"symbol\",\"module\",\"protocol\"]},"
-     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":\"outgoing\"},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"outgoing\",\"incoming\",\"both\"],\"default\":"
+     "\"outgoing\"},"
      "\"edge_type\":{\"type\":\"string\"}},\"required\":[\"kind\"]}},"
      "\"max_results\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":10000}},"
      "\"required\":[\"workspace_root\",\"start\",\"hops\"]}"},
 
     {"aosp_get_architecture", "Get AOSP architecture",
-     "Read the AOSP workspace build-module graph, including resolved and unresolved dependency "
-     "edges with variant/provenance evidence, unresolved Make/Bazel coverage gaps, Soong "
+     "Read the AOSP workspace build-module graph, including outgoing, reverse, and unresolved "
+     "dependency edges with variant/provenance evidence, unresolved Make/Bazel coverage gaps, "
+     "Soong "
      "namespaces, package visibility boundaries, products, BoardConfig and partition ownership, "
      "and matching Soong/Android.mk/AIDL modules. Run the CLI aosp build command first.",
      "{\"type\":\"object\",\"properties\":{"
@@ -668,7 +675,8 @@ static const tool_def_t TOOLS[] = {
      "after shard indexing to refresh protocol evidence.",
      "{\"type\":\"object\",\"properties\":{"
      "\"workspace_root\":{\"type\":\"string\",\"description\":\"Absolute AOSP checkout root\"},"
-     "\"query\":{\"type\":\"string\",\"description\":\"Optional interface, method, class, or kind filter\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Optional interface, method, class, or kind "
+     "filter\"},"
      "\"limit\":{\"type\":\"integer\",\"default\":50,\"maximum\":500}},"
      "\"required\":[\"workspace_root\"]}"},
 
@@ -8615,6 +8623,22 @@ static char *handle_aosp_get_architecture(const char *args) {
                 yyjson_mut_arr_add_val(dependencies, dependency);
             }
             yyjson_mut_obj_add_val(doc, item, "dependencies", dependencies);
+            yyjson_mut_val *reverse_dependencies = yyjson_mut_arr(doc);
+            for (int d = 0; d < modules[i].reverse_dependency_count; d++) {
+                cbm_aosp_module_dependency_t *edge = &modules[i].reverse_dependencies[d];
+                yyjson_mut_val *dependency = yyjson_mut_obj(doc);
+                yyjson_mut_val *source = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, source, "module_id", edge->source_module_id);
+                yyjson_mut_obj_add_strcpy(doc, source, "repo", edge->source_repo_path);
+                yyjson_mut_obj_add_strcpy(doc, source, "name", edge->source_module_name);
+                yyjson_mut_obj_add_val(doc, dependency, "source", source);
+                yyjson_mut_obj_add_strcpy(doc, dependency, "type", edge->dependency_type);
+                yyjson_mut_obj_add_strcpy(doc, dependency, "declared_target", edge->target_name);
+                yyjson_mut_obj_add_val(doc, dependency, "properties",
+                                       aosp_copy_json(doc, edge->properties, false));
+                yyjson_mut_arr_add_val(reverse_dependencies, dependency);
+            }
+            yyjson_mut_obj_add_val(doc, item, "reverse_dependencies", reverse_dependencies);
             yyjson_mut_val *files = yyjson_mut_arr(doc);
             for (int f = 0; f < modules[i].file_count; f++) {
                 cbm_aosp_module_file_t *declaration = &modules[i].files[f];
@@ -8746,6 +8770,44 @@ static char *handle_aosp_trace_protocol(const char *args) {
     yyjson_mut_obj_add_int(doc, root, "jni_overload_edges", stats.jni_overload_edges);
     yyjson_mut_obj_add_int(doc, root, "jni_registration_helper_edges",
                            stats.jni_registration_helper_edges);
+    yyjson_mut_obj_add_int(doc, root, "hidl_interfaces", stats.hidl_interfaces);
+    yyjson_mut_obj_add_int(doc, root, "hidl_methods", stats.hidl_methods);
+    yyjson_mut_obj_add_int(doc, root, "hidl_clients", stats.hidl_clients);
+    yyjson_mut_obj_add_int(doc, root, "hidl_services", stats.hidl_services);
+    yyjson_mut_obj_add_int(doc, root, "hidl_instances", stats.hidl_instances);
+    yyjson_mut_obj_add_int(doc, root, "vintf_manifests", stats.vintf_manifests);
+    yyjson_mut_obj_add_int(doc, root, "vintf_matrices", stats.vintf_matrices);
+    yyjson_mut_obj_add_int(doc, root, "vintf_hal_instances", stats.vintf_hal_instances);
+    yyjson_mut_obj_add_int(doc, root, "vintf_interface_links", stats.vintf_interface_links);
+    yyjson_mut_obj_add_int(doc, root, "init_services", stats.init_services);
+    yyjson_mut_obj_add_int(doc, root, "init_binaries", stats.init_binaries);
+    yyjson_mut_obj_add_int(doc, root, "init_triggers", stats.init_triggers);
+    yyjson_mut_obj_add_int(doc, root, "init_interface_links", stats.init_interface_links);
+    yyjson_mut_obj_add_int(doc, root, "binder_callbacks", stats.binder_callbacks);
+    yyjson_mut_obj_add_int(doc, root, "binder_death_recipients", stats.binder_death_recipients);
+    yyjson_mut_obj_add_int(doc, root, "binder_async_edges", stats.binder_async_edges);
+    yyjson_mut_val *coverage = yyjson_mut_obj(doc);
+    yyjson_mut_val *aidl_coverage = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, aidl_coverage, "resolved", stats.aidl_resolved);
+    yyjson_mut_obj_add_int(doc, aidl_coverage, "ambiguous", stats.aidl_ambiguous);
+    yyjson_mut_obj_add_int(doc, aidl_coverage, "unresolved", stats.aidl_unresolved);
+    yyjson_mut_obj_add_val(doc, coverage, "aidl", aidl_coverage);
+    yyjson_mut_val *hidl_coverage = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, hidl_coverage, "resolved", stats.hidl_resolved);
+    yyjson_mut_obj_add_int(doc, hidl_coverage, "ambiguous", stats.hidl_ambiguous);
+    yyjson_mut_obj_add_int(doc, hidl_coverage, "unresolved", stats.hidl_unresolved);
+    yyjson_mut_obj_add_val(doc, coverage, "hidl", hidl_coverage);
+    yyjson_mut_val *vintf_coverage = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, vintf_coverage, "resolved", stats.vintf_resolved);
+    yyjson_mut_obj_add_int(doc, vintf_coverage, "ambiguous", stats.vintf_ambiguous);
+    yyjson_mut_obj_add_int(doc, vintf_coverage, "unresolved", stats.vintf_unresolved);
+    yyjson_mut_obj_add_val(doc, coverage, "vintf", vintf_coverage);
+    yyjson_mut_val *init_coverage = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, init_coverage, "resolved", stats.init_resolved);
+    yyjson_mut_obj_add_int(doc, init_coverage, "ambiguous", stats.init_ambiguous);
+    yyjson_mut_obj_add_int(doc, init_coverage, "unresolved", stats.init_unresolved);
+    yyjson_mut_obj_add_val(doc, coverage, "init", init_coverage);
+    yyjson_mut_obj_add_val(doc, root, "coverage", coverage);
     yyjson_mut_obj_add_int(doc, root, "count", count);
     yyjson_mut_val *items = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {

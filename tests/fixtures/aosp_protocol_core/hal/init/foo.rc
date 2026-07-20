@@ -1,0 +1,9 @@
+service vendor.foo-hal /vendor/bin/hw/android.hardware.foo@1.0-service
+    class hal
+    interface hidl android.hardware.foo@1.0::IFoo default
+
+on boot
+    class_start hal
+
+on property:vendor.foo.ready=1
+    start vendor.foo-hal
