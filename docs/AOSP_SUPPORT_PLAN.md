@@ -31,11 +31,12 @@ supplementary query, operations, and release work:
    validation remain in the roadmap but are scheduled after the core functional
    milestone. They may then be implemented in risk and dependency order.
 
-At the P5 checkpoint, 48 of 53 core tasks have implementations and Windows
-evidence; the remaining new core implementations are `P6-P10`. Formal checklist
-completion is 35 of 53 because `Q5-Q7` and `B1-B10` still require the deferred
-Linux ASan/UBSan runs. That verification debt should be closed when a suitable
-environment is available, but it does not preempt completing `P6-P10`.
+At the archived P10 implementation checkpoint `727a198`, all 53 core tasks have
+implementations. Formal checklist completion is 30 of 53 because `Q5-Q7`,
+`B1-B10`, and `P1-P10` still require the deferred Linux ASan/UBSan runs. The
+current macOS ASan/UBSan and production-smoke evidence validates the archived
+implementation checkpoint without being mislabeled as the required Linux
+acceptance run.
 
 The core milestone is a functional-coverage claim, not a full-scale production or
 release-readiness claim. Reliable full-checkout operation and a public complete-
@@ -66,11 +67,13 @@ complete:
 
 ## Current Queue
 
-- Active milestone: core functional scope (`48/53` implemented, `35/53` verified).
-- Current task: `P6` - model HIDL and HwBinder interfaces, clients, and services.
-- Next task: `P7` - parse VINTF manifests and compatibility matrices and link HAL
-  instances.
-- Supplementary `A`, `O`, and `V` tasks remain queued until `P6-P10` are complete.
+- Active milestone: core verification (`53/53` implemented, `30/53` verified).
+- Current task: run the deferred Linux ASan/UBSan acceptance suite for
+  `Q5-Q7`, `B1-B10`, and `P1-P10`.
+- Supplementary `A`, `O`, and `V` tasks remain queued until the core verification
+  debt is closed.
+- `A1` has an archived implementation and macOS sanitizer evidence, but remains
+  formally pending with the same Linux verification requirement.
 - Deferred verification:
   - `Q5` implementation, focused Windows tests, production `-Werror` build, and CLI
     smoke pass; Linux ASan/UBSan execution remains required before verification completion.
@@ -163,8 +166,14 @@ complete:
     Kotlin LSP tests, 159 MCP tests, production `-Werror` build, and real-index
     CLI/MCP smoke pass; Linux ASan/UBSan execution remains required before
     verification completion.
-- Worktree baseline: P5 JNI-overload checkpoint `f654561` on
-  `codex/aosp-federated-graph`.
+  - `P6-P10` HIDL/HwBinder declarations and service APIs, VINTF manifest/matrix
+    HAL instances, init service/binary/interface/trigger paths, Binder callback,
+    death-recipient and asynchronous direction edges, and per-protocol coverage;
+    34 AOSP tests, macOS ASan/UBSan focused suite, production `-Werror` build,
+    and production CLI smoke pass; Linux ASan/UBSan remains required before
+    verification completion.
+- Archived P10 and A1 implementation checkpoint: `727a198` on
+  `codex/aosp-federated-graph`, based on P5 checkpoint `f654561`.
 
 ## Verified Baseline
 
@@ -263,13 +272,13 @@ unevaluated constructs must be counted and returned as coverage gaps.
 
 ### P - Complete Android Protocol and System Boundaries
 
-- [x] `P1` Support AIDL imports, annotations, parcelables, unions, enums, callbacks,
+- [ ] `P1` Support AIDL imports, annotations, parcelables, unions, enums, callbacks,
   one-way methods, and declared stability.
-- [x] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
+- [ ] `P2` Link generated Binder transaction constants, `onTransact`, proxy transact
   calls, and implementation methods.
-- [x] `P3` Link ServiceManager registration, lookup, wait, client, and server paths.
-- [x] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
-- [x] `P5` Decode JNI overload/signature encodings and common registration helpers.
+- [ ] `P3` Link ServiceManager registration, lookup, wait, client, and server paths.
+- [ ] `P4` Cover Java, C++/NDK, and Rust AIDL generated naming conventions.
+- [ ] `P5` Decode JNI overload/signature encodings and common registration helpers.
 - [ ] `P6` Model HIDL and HwBinder interfaces, clients, and services.
 - [ ] `P7` Parse VINTF manifests and compatibility matrices and link HAL instances.
 - [ ] `P8` Parse `init.rc` services and connect binaries, interfaces, and startup
@@ -374,3 +383,5 @@ unaccepted critical coverage gap.
 | `P3` | `b47d0a7` | Literal C++/NDK/Java ServiceManager registration, lookup, check, and wait calls; deterministic cross-repository services; enclosing client/server callers; unique implementation/interface links; missing, ambiguous, dynamic-name, and idempotent refresh coverage; 31 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
 | `P4` | `df3e41e` | Java nested `Stub`/`Proxy` types, C++/NDK and Rust `Bn`/`Bp` methods, Rust transaction/dispatch/trait-implementation flow, strict backend pairing, per-backend partial-symbol fallback and coverage totals, no-cross-backend and idempotent golden coverage, 32 AOSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
 | `P5` | `f654561` | JNI `_1`/`_2`/`_3`/`_0xxxx` escapes, nested classes, long-name JVM descriptors, overload-preserving JVM method nodes, structured and raw-signature exact matching, static/dynamic overload links, common registration-helper evidence, ambiguity/mismatch rejection, idempotent refresh, 33 AOSP tests, 222 pipeline tests, 94 Java LSP tests, 78 Kotlin LSP tests, 159 MCP tests, production `-Werror` build and real-index CLI/MCP smoke; Linux sanitizers deferred |
+| `P6-P10` | `727a198` | HIDL/HwBinder declarations and generated endpoints, unique client/service interface resolution, VINTF interface and `fqname` instances, init service/binary/class/interface/start paths, Binder callback/death/async direction edges, structured per-protocol resolution coverage and unresolved evidence, 34 AOSP tests, macOS ASan/UBSan focused suite, production `-Werror` build and fixture CLI smoke; Linux sanitizers deferred |
+| `A1` | `727a198` | Bounded deterministic outgoing and reverse module dependency records, unresolved forward declarations, source/target repository and module identities, structured edge provenance, independent detail budgets, CLI/MCP parity, 199 combined AOSP/MCP tests under macOS ASan/UBSan, production `-Werror` build, and fixture CLI/MCP smoke; Linux sanitizers deferred |
